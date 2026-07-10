@@ -839,13 +839,80 @@ static void expert_prefetch(Model *m, int layer, int eid){
     }
 }
 
+/* RoPE parziale NON-interleaved (NeoX/rotate_half) su UNA testa: ruota i primi rd dim,
+ * il resto passa intatto. Coppie (j, j+half) con half=rd/2; inv_freq_j = theta^(-2j/rd). */
+static void rope_neox(float *v, int pos, int rd, float theta){
+    int half=rd/2;
+    for(int j=0;j<half;j++){
+        float ang=(float)pos*powf(theta,-2.f*(float)j/(float)rd);
+        float cs=cosf(ang), sn=sinf(ang);
+        float a=v[j], b=v[half+j];
+        v[j]=a*cs-b*sn; v[half+j]=b*cs+a*sn;
+    }
+}
+
 /* attenzione ibrida MiMo (full/SWA, GQA su qkv fuso, RoPE parziale non-interleaved a doppia
  * theta, sink bias, V*v_scale) su token nuovi x[S,hidden], pos_base = pos del primo.
- * STUB (Task 4): il corpo arriva col Task 5. La KV per-layer (m->K/m->V) e' gia' allocata. */
+ * Ordine del reference (_forward_attention + eager_attention_forward):
+ *   qkv fuso -> v*v_scale (PRIMA della cache) -> RoPE su q/k -> append KV -> score/softmax
+ *   (con eventuale colonna sink: entra nel denominatore, la sua massa viene scartata)
+ *   -> ctx -> o_proj. Layer SWA: finestra causale [pos-window+1, pos] (include se stesso). */
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out){
-    (void)m;(void)l;(void)layer;(void)x;(void)S;(void)pos_base;(void)out;
-    fprintf(stderr,"attention: TODO (Task 5)\n");
-    exit(1);
+    Cfg *c=&m->c; int H=c->n_heads;
+    int kvh=lyr_kvh(c,layer), hd=lyr_hd(c,layer), vd=lyr_vd(c,layer);
+    int group=H/kvh, qs=H*hd, ks=kvh*hd, vs=kvh*vd, rowsz=qs+ks+vs;
+    int swa=c->is_swa[layer];
+    float theta = swa ? c->theta_swa : c->theta_full;
+    /* rope_dim e scala dipendono dal TIPO di layer: derivati da hd, non dai campi full-only
+     * di Cfg (rope_dim fu calcolato da head_dim*prf: qui lo riscaliamo in interi, esatto) */
+    int rd=(int)((int64_t)hd*c->rope_dim/c->head_dim);
+    float scale=1.f/sqrtf((float)hd);
+    double ta0=now_s();
+    /* 1) proiezione fusa qkv [q|k|v] per tutti i token nuovi */
+    float *qkv=falloc((int64_t)S*rowsz);
+    matmul_qt(qkv, x, &l->qkv, S);
+    /* 2) per token: v*v_scale prima della cache, RoPE su q (in place) e k, append in KV */
+    for(int s=0;s<S;s++){
+        int pos=pos_base+s; float *r=qkv+(int64_t)s*rowsz;
+        float *Kd=m->K[layer]+(int64_t)pos*ks, *Vd=m->V[layer]+(int64_t)pos*vs;
+        memcpy(Kd, r+qs, ks*sizeof(float));
+        for(int i=0;i<vs;i++) Vd[i]=r[qs+ks+i]*c->v_scale;
+        for(int h=0;h<H;h++)   rope_neox(r+(int64_t)h*hd, pos, rd, theta);
+        for(int g=0;g<kvh;g++) rope_neox(Kd+(int64_t)g*hd, pos, rd, theta);
+    }
+    /* 3) attenzione causale per (s,h): GQA, testa kv g=h/group */
+    float *ctx=falloc((int64_t)S*H*vd);
+    const float *Kc=m->K[layer], *Vc=m->V[layer];
+    #pragma omp parallel for collapse(2) schedule(static)
+    for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+        int pos=pos_base+s, g=h/group;
+        int lo = (swa && c->sliding_window>0) ? pos-c->sliding_window+1 : 0;
+        if(lo<0) lo=0;
+        int nt=pos+1-lo;
+        float scb[4096]; float *sc = nt<=4096 ? scb : falloc(nt);
+        const float *q=qkv+(int64_t)s*rowsz+(int64_t)h*hd;
+        float mx=-1e30f;
+        for(int j=0;j<nt;j++){
+            const float *kt=Kc+(int64_t)(lo+j)*ks+(int64_t)g*hd;
+            float a=0; for(int d=0;d<hd;d++) a+=q[d]*kt[d];
+            a*=scale; sc[j]=a; if(a>mx) mx=a;
+        }
+        float den=0;
+        if(l->sink){ float sk=l->sink[h]; if(sk>mx) mx=sk; den=expf(sk-mx); }
+        for(int j=0;j<nt;j++){ sc[j]=expf(sc[j]-mx); den+=sc[j]; }
+        float inv=1.f/den;
+        float *cx=ctx+((int64_t)s*H+h)*vd;
+        for(int d=0;d<vd;d++) cx[d]=0;
+        for(int j=0;j<nt;j++){
+            const float *vt=Vc+(int64_t)(lo+j)*vs+(int64_t)g*vd;
+            float a=sc[j]*inv; for(int d=0;d<vd;d++) cx[d]+=a*vt[d];
+        }
+        if(sc!=scb) free(sc);
+    }
+    /* 4) concat teste [S, H*vd] -> o_proj */
+    matmul_qt(out, ctx, &l->o, S);
+    free(ctx); free(qkv);
+    m->t_attn += now_s()-ta0;
 }
 
 /* MoE MiMo su x[S,hidden] -> out (router sigmoid/noaux_tc, n_group=1, NIENTE shared expert).
