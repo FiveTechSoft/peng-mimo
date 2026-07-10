@@ -102,12 +102,30 @@ referencia (`transformers` + `modeling_mimo_v2.py` oficial):
 - [x] Medir el disco con el patrón de acceso del motor
 - [x] Elegir modelo objetivo y verificar su arquitectura contra el código oficial
 - [x] Spec de diseño aprobado
-- [ ] Fase 1 — oráculo tiny (`tools/make_mimo_oracle.py`) + validación del tokenizer
-- [ ] Fase 2 — `c/mimo.c`: forward denso f32 sobre el oráculo → TF 32/32
-- [ ] Fase 3 — streaming de experts + cuantización → TF/greedy exactos a int8/int4
-- [ ] Fase 4 — suite completa + fixture de rendimiento (~300M)
-- [ ] Fase 5 — converter `--arch mimo` (FP8 316 GB → int4 ~165 GB, resumible)
-- [ ] Fase 6 — descarga real, conversión y primer chat con 311B en 32 GB de RAM
+- [x] Fase 1 — oráculo tiny (`tools/make_mimo_oracle.py`) + validación del tokenizer
+- [x] Fase 2 — `c/mimo.c`: atención GQA híbrida → **TF 32/32, greedy 20/20**
+- [x] Fase 3 — streaming de experts + cuantización (int8 token-exacto; packing lossless)
+- [x] Fase 4 — suite completa verde (C 3/3, Python 32/32) + fixture 396M (**TF 20/20**)
+- [x] Fase 5 — converter `--arch mimo` (container ≡ runtime-quant, token a token)
+- [ ] Fase 6 — descarga real (316 GB), conversión y primer chat con 311B en 32 GB de RAM
+
+### Resultados de validación (2026-07-10)
+
+| Gate | Resultado |
+|---|---|
+| Tokenizer C vs HF AutoTokenizer | 6+4 casos unicode, ids idénticos |
+| Tiny oracle (6 capas, patrón híbrido real) TF / greedy, f32 | **32/32 · 20/20** |
+| Tiny, experts int8 | 32/32 · 20/20 (sin un solo flip) |
+| Tiny, experts int4 packed vs sin packing | byte-idéntico (packing lossless) |
+| Kernels enteros IDOT vs dequant exacto (int8) | tokens idénticos |
+| LRU con evicción forzada (`CAP_RAISE=0`, cap=2) | 20/20 exacto, hit 88%→81% |
+| Fixture 396M (formas reales) TF / greedy, f32 | **20/20 · 8/8** |
+| Container convertido vs cuantización runtime (tiny y fixture) | tokens idénticos, también bajo evicción |
+| ASan/UBSan (TF, greedy, spec-decode, evicción) | limpio |
+
+Pendiente para la Fase 6, además del disco: sustituir el chat template heredado de GLM
+por el oficial de MiMo (marcado como TODO bloqueante en `mimo.c`) y ajustar los defaults
+de sampling al `generation_config` de MiMo.
 
 ## Licencia
 

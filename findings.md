@@ -123,6 +123,35 @@ unicode + 4 adversariales (emoji ZWJ, run de 13 dígitos…): ids idénticos.
 > espera, entiende otra cosa. Nota pendiente: la detección es una búsqueda de texto
 > simple — endurecer antes de soportar una tercera familia.
 
+## Converter (FP8 → contenedor int4/int8)
+
+### 8b. El converter valida contra sí mismo: container ≡ cuantización runtime
+
+El gate del converter no es "se parece": el contenedor pre-cuantizado debe producir
+EXACTAMENTE los mismos tokens que el motor cuantizando al vuelo los mismos pesos —
+misma aritmética (`np.rint` ≡ `lrintf`), mismas escalas por fila. Verificado en tiny y
+en el fixture de 396M, también bajo evicción de cache. Además: el path GLM quedó
+probado byte-idéntico antes/después del refactor con un harness A/B sobre shards
+sintéticos.
+
+### 8c. Trampas del checkpoint real anotadas para la conversión de 316 GB
+
+- Los shards de MiMo llegan hasta **34.4 GB** (GLM ~5 GB): el guardarraíl
+  `--min-free-gb` por defecto (20) es INSUFICIENTE — subirlo al lanzar.
+- `save_file` no es atómico: un corte durante la escritura final deja un shard de
+  salida truncado que el resume saltará; si pasa, borrar el último `out-*` y relanzar.
+- Con ~4 MB/s medidos en esta línea, la descarga sola ≈ 22 h (resumible en cualquier
+  punto; los shards de visión/audio/MTP nunca se descargan gracias al filtro sobre
+  el weight_map).
+- `--io-bits 16` estaba silenciosamente roto en el upstream (overflow de astype int8);
+  ahora bits≥16 → f32 explícito. Los defaults de `--arch mimo` (dense int8, experts
+  int4, io f32) reproducen el punto de operación validado del motor.
+
+> **En cristiano:** convertir 316 GB llevará un día entero de descarga. Todo el
+> esfuerzo de esta fase fue asegurar que, cuando ese día termine, el resultado sea
+> correcto a la primera — cada pieza del pipeline demuestra producir bits idénticos
+> a la referencia antes de tocar el modelo real.
+
 ## Entorno / herramientas
 
 ### 9. Benchmark de disco con ceros = mentira
