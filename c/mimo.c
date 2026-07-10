@@ -1,8 +1,8 @@
 /* Motore MiMo-V2.5 (architettura mimo_v2) in C puro. Derivato da glm.c (donatore).
- * SKELETON (Task 4): config + strutture + caricamento denso + streaming MoE.
- * L'attenzione (ibrida full/SWA con pattern per-layer, GQA con qkv FUSO, RoPE parziale
- * NON-interleaved a doppia theta, sink bias per-testa, V*attention_value_scale) arriva
- * col Task 5: qui e' uno stub che stampa TODO ed esce.
+ * Attenzione ibrida full/SWA con pattern per-layer, GQA con qkv FUSO, RoPE parziale
+ * NON-interleaved a doppia theta, sink bias per-testa sui layer SWA,
+ * V*attention_value_scale prima della cache. Validato token-exact contro l'oracolo
+ * transformers: tiny TF 32/32 + greedy 20/20, fixture 396M TF 20/20 + greedy 8/8.
  *   - router sigmoid + noaux_tc (n_group=1) con routed_scaling_factor: IDENTICO a GLM
  *   - expert routed in streaming dal disco (per-expert); NIENTE shared expert
  *   - niente MLA/DSA/MTP: MiMo-V2.5 non li ha
@@ -60,7 +60,7 @@ typedef struct {
     int8_t is_swa[128];                          /* hybrid_layer_pattern: 1=SWA */
     int8_t is_moe[128];                          /* moe_layer_freq: 1=MoE */
     int8_t has_sink_full, has_sink_swa;
-    float eps, theta_full, theta_swa, attn_scale, v_scale, routed_scale;
+    float eps, theta_full, theta_swa, v_scale, routed_scale;
 } Cfg;
 
 /* tensore [O,I] in uno di tre formati:
@@ -97,8 +97,8 @@ typedef struct {
 
 /* slot di un expert: pesi quantizzati + scale. Nel container pre-quantizzato g/u/d sono
  * VISTE dentro `slab` (una sola pread coalescente); nel fallback hanno buffer propri.
- * slab_cap/fslab_cap: capienza allocata — gli slot ws[] sono riusati TRA layer e gli
- * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
+ * slab_cap/fslab_cap: capienza allocata — gli slot ws[] sono riusati TRA layer
+ * (in MiMo tutti gli expert hanno la stessa taglia; il buffer resta dimensionato al max). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                  int64_t slab_cap, fslab_cap; uint64_t used; } ESlot;
 
@@ -526,7 +526,8 @@ static int g_direct=0;   /* DIRECT=1 -> O_DIRECT sugli slab expert. Default OFF:
                           * liscio e' risultato il migliore; su NVMe veri DIRECT=1 rende di piu'. */
 static float g_temp=-1;  /* TEMP: temperatura di sampling sui TOKEN. <0 = auto (1.0 in chat/testo,
                           * 0=greedy in validazione). 0 = greedy puro. */
-static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default dal generation_config GLM-5.2) */
+static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default ereditato dal donatore GLM;
+                          * TODO gate Task 11: verificare il generation_config di MiMo-V2.5) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
@@ -615,7 +616,6 @@ static void load_cfg(Cfg *c, const char *snap){
     if(eo){ if(eo->t==J_NUM) c->stop_ids[c->n_stop++]=(int)eo->num;
             else if(eo->t==J_ARR) for(int i=0;i<eo->len && c->n_stop<8;i++)
                 c->stop_ids[c->n_stop++]=(int)eo->kids[i]->num; }
-    c->attn_scale = 1.f / sqrtf((float)c->head_dim);
     if(c->n_group!=1){ fprintf(stderr,"questo motore assume n_group=1 (MiMo-V2.5)\n"); exit(1); }
     /* VALIDAZIONE (report PR #25): il config.json arriva da mirror non fidati — dimensioni
      * ostili non devono superare questo punto. Un solo choke point protegge ogni alloc a valle. */
@@ -634,6 +634,13 @@ static void load_cfg(Cfg *c, const char *snap){
     #undef CKR
     if(c->n_heads % c->kv_heads_full){ fprintf(stderr,"config: num_key_value_heads=%d non divide num_attention_heads=%d\n",c->kv_heads_full,c->n_heads); exit(1); }
     if(c->n_heads % c->kv_heads_swa){ fprintf(stderr,"config: swa_num_key_value_heads=%d non divide num_attention_heads=%d\n",c->kv_heads_swa,c->n_heads); exit(1); }
+    /* un layer marcato SWA con finestra 0 degraderebbe SILENZIOSAMENTE a full attention:
+     * meglio un errore di config che risultati sbagliati senza avviso */
+    for(int i=0;i<c->n_layers;i++) if(c->is_swa[i] && c->sliding_window<=0){
+        fprintf(stderr,"config: hybrid_layer_pattern marca il layer %d SWA ma sliding_window=%d\n",i,c->sliding_window); exit(1); }
+    /* rope_dim derivato per tipo di layer (riscala intera da head_dim): rope_neox assume coppie */
+    { int rd_full=c->rope_dim, rd_swa=(int)((int64_t)c->swa_head_dim*c->rope_dim/c->head_dim);
+      if(rd_full%2 || rd_swa%2){ fprintf(stderr,"config: rope_dim derivato dispari (full=%d swa=%d)\n",rd_full,rd_swa); exit(1); } }
     free(ar);
 }
 
@@ -704,8 +711,12 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
               i, c->is_swa[i]?"SWA":"full", (long long)got,(long long)want, qs,ks,vs,D); exit(1); } }
         l->qkv = qt_load(m,P("self_attn.qkv_proj.weight"), qs+ks+vs, D, dbits);
         l->o   = qt_load(m,P("self_attn.o_proj.weight"), D, c->n_heads*vd, dbits);
-        l->sink = (c->is_swa[i] ? c->has_sink_swa : c->has_sink_full)
-                ? ld(m,P("self_attn.attention_sink_bias")) : NULL;
+        if(c->is_swa[i] ? c->has_sink_swa : c->has_sink_full){
+            int64_t sn=st_numel(&m->S,P("self_attn.attention_sink_bias"));
+            if(sn!=c->n_heads){ fprintf(stderr,"layer %d: attention_sink_bias ha %lld elementi, attesi %d\n",
+                i,(long long)sn,c->n_heads); exit(1); }
+            l->sink = ld(m,P("self_attn.attention_sink_bias"));
+        } else l->sink = NULL;
         l->sparse = c->is_moe[i];
         if(!l->sparse){
             l->gate_proj = qt_load(m,P("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
@@ -1226,13 +1237,14 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
     layers_forward(m,x,S,0);
     float *lo=falloc(c->vocab);
+    float *row=falloc(D);
     for(int s=0;s<S;s++){
-        float row[8192]; rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
+        rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
         matmul_qt(lo, row, &m->lm_head, 1);
         int best=0; float bv=lo[0]; for(int i=1;i<c->vocab;i++) if(lo[i]>bv){bv=lo[i];best=i;}
         pred[s]=best;
     }
-    free(x); free(lo);
+    free(row); free(x); free(lo);
 }
 
 /* log-prob (log-softmax) del token target dato il vettore di logit; *am=1 se e' l'argmax */
@@ -1484,9 +1496,10 @@ static void run_serve(Model *m, const char *snap){
             g_temp=(float)rt; g_nuc=(float)rp;
         }
         int bl=0, k=0;                           /* costruisce/tokenizza il turno */
-        /* template UFFICIALE GLM-5.2 (chat_template.jinja): niente \n dopo i ruoli, e dopo
-         * <|assistant|> serve SEMPRE il blocco think — <think></think> lo DISATTIVA (nothink):
-         * col template sbagliato il modello farfuglia e non emette mai lo stop. THINK=1 lo abilita. */
+        /* !!! TEMPLATE EREDITATO DA GLM-5.2 — SBAGLIATO per MiMo-V2.5 !!!
+         * TODO (BLOCCANTE per la chat col modello reale, gate Task 11): sostituire col
+         * chat template ufficiale di MiMo (tokenizer_config.json / chat_template.jinja).
+         * La validazione TF/greedy non passa di qui; solo chat/serve lo usano. */
         const char *tk = getenv("THINK")&&atoi(getenv("THINK"))? "<think>" : "<think></think>";
         if(raw_mode){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
@@ -1563,8 +1576,8 @@ static int64_t expert_bytes_probe(Model *m, int ebits){
 }
 
 /* scarica su file l'istogramma d'uso degli expert: righe "layer eid count" (per PIN).
- * Include la riga MTP (layer n_layers). Scrittura atomica (tmp+rename): viene chiamata
- * anche a ogni turno di serve e il processo puo' morire in qualsiasi momento. */
+ * Scrittura atomica (tmp+rename): viene chiamata anche a ogni turno di serve e il
+ * processo puo' morire in qualsiasi momento. */
 static void stats_dump_q(Model *m, const char *path, int quiet){
     char tmp[2100]; snprintf(tmp,sizeof(tmp),"%s.tmp",path);
     FILE *f=fopen(tmp,"w"); if(!f){ if(!quiet) perror(tmp); return; }
