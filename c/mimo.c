@@ -526,8 +526,8 @@ static int g_direct=0;   /* DIRECT=1 -> O_DIRECT sugli slab expert. Default OFF:
                           * liscio e' risultato il migliore; su NVMe veri DIRECT=1 rende di piu'. */
 static float g_temp=-1;  /* TEMP: temperatura di sampling sui TOKEN. <0 = auto (1.0 in chat/testo,
                           * 0=greedy in validazione). 0 = greedy puro. */
-static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default ereditato dal donatore GLM;
-                          * TODO gate Task 11: verificare il generation_config di MiMo-V2.5) */
+static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (0.95 = generation_config di
+                          * MiMo-V2.5, verificato: temperature=1.0, top_p=0.95) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
@@ -1163,12 +1163,19 @@ static int pick_tok(const float *lo, int V, int ban){
 
 /* stop-set attivo (popolato da run_text/run_serve dal config; vuoto in validazione,
  * dove si genera un numero fisso di token da confrontare con l'oracolo) */
-static int g_stop[9], g_nstop=0;
+static int g_stop[10], g_nstop=0;
 static inline int is_stop(int t){ for(int i=0;i<g_nstop;i++) if(t==g_stop[i]) return 1; return 0; }
-static void stops_arm(const Cfg *c, int tok_eos){
+static void stops_add(int t){
+    if(t>=0 && !is_stop(t) && g_nstop<(int)(sizeof g_stop/sizeof g_stop[0])) g_stop[g_nstop++]=t;
+}
+/* MiMo-V2.5 generation_config: eos_token_id=[151643 <|endoftext|>, 151645 <|im_end|>,
+ * 151672 <|mimo_audio_eod|>] ma il config.json ne dichiara solo uno (151645). I due eos
+ * testuali vengono armati per NOME dal tokenizer (robusto anche con config tiny/oracolo);
+ * <|mimo_audio_eod|> e' solo per l'uscita audio, irrilevante per questo motore text-only. */
+static void stops_arm(const Cfg *c, int tok_eos, int tok_eos2){
     g_nstop=0;
-    for(int i=0;i<c->n_stop;i++) g_stop[g_nstop++]=c->stop_ids[i];
-    if(tok_eos>=0 && !is_stop(tok_eos)) g_stop[g_nstop++]=tok_eos;
+    for(int i=0;i<c->n_stop;i++) stops_add(c->stop_ids[i]);
+    stops_add(tok_eos); stops_add(tok_eos2);
     fprintf(stderr,"[stop] %d token di stop:",g_nstop);
     for(int i=0;i<g_nstop;i++) fprintf(stderr," %d",g_stop[i]);
     fprintf(stderr,"\n");
@@ -1331,9 +1338,9 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Cfg *c=&m->c; char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
-    stops_arm(&m->c, eos);
-    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
-                                          * distribuzione int4 e' rumore di quantizzazione */
+    stops_arm(&m->c, eos, tok_id_of(&T,"<|im_end|>"));
+    if(g_temp<0) g_temp=1.0f;            /* auto: 1.0 = generation_config MiMo-V2.5 (top_p 0.95
+                                          * taglia comunque la coda int4 rumorosa; TEMP per stringere) */
     int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
     if(np<1){ fprintf(stderr,"prompt vuoto dopo tokenizzazione\n"); return; }
@@ -1364,10 +1371,33 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     usage_save(m);
 }
 
+/* ---- Chat template ufficiale MiMo-V2.5 (da tokenizer_config.json, subset solo testo) ----
+ * Rendering di riferimento (HF apply_chat_template, add_generation_prompt=True):
+ *   <|im_start|>system\nYou are MiMo, a helpful AI assistant engineered by Xiaomi.<|im_end|>
+ *   <|im_start|>user\n{msg}<|im_end|><|im_start|>assistant\n
+ * NB: NESSUN newline tra <|im_end|> e il <|im_start|> successivo; nessun BOS.
+ * Turni successivi: la risposta del modello resta in KV SENZA <|im_end|> (spec_decode si
+ * ferma PRIMA di emettere lo stop token), quindi il turno n+1 apre chiudendo con <|im_end|>.
+ * THINK: equivalente di enable_thinking del template (default 1 come l'ufficiale).
+ * THINK=0 -> pre-riempie <think></think> e il modello risponde senza ragionamento.
+ * SYSTEM: system prompt custom al posto del default Xiaomi (usato solo al primo turno).
+ * In sync con tests/test_mimo_template.py (confronto eseguibile via TEMPLATE_DUMP=1). */
+static int mimo_turn_render(char *buf, int cap, const char *user, int first){
+    int think = getenv("THINK") ? atoi(getenv("THINK")) : 1;
+    const char *sys = getenv("SYSTEM");
+    if(!sys || !*sys) sys = "You are MiMo, a helpful AI assistant engineered by Xiaomi.";
+    int bl=0;
+    if(first) bl+=snprintf(buf+bl,cap-bl,"<|im_start|>system\n%s<|im_end|>",sys);
+    else      bl+=snprintf(buf+bl,cap-bl,"<|im_end|>");
+    bl+=snprintf(buf+bl,cap-bl,"<|im_start|>user\n%s<|im_end|><|im_start|>assistant\n%s",
+                 user, think ? "" : "<think></think>");
+    return bl;
+}
+
 /* modalita' SERVE (per la CLI 'coli'): carica il modello UNA volta, poi CHAT conversazionale.
  * KV-cache PERSISTENTE tra i turni: la storia resta in cache, si fa il prefill solo dei
  * token NUOVI -> il modello RICORDA la conversazione e non ri-processa il passato (lossless,
- * piu' umano, piu' veloce). Template chat GLM con token speciali (CHAT_TEMPLATE=0 -> grezzo).
+ * piu' umano, piu' veloce). Template chat MiMo-V2.5 con token speciali (CHAT_TEMPLATE=0 -> grezzo).
  * Protocollo: "\x01\x01" "READY" "\x01\x01\n" dopo il load; risposta in streaming; "\x01\x01" "END" "\x01\x01\n" a fine turno.
  * ":reset" (riga "\x02RESET") azzera la memoria. EOF -> esce. */
 /* ---- RFC: RE-PIN A CALDO / LIVE RE-PIN (opt-in, REPIN=n, default OFF) ----
@@ -1440,9 +1470,9 @@ static void run_serve(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
-    stops_arm(&m->c, eos);
-    if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
-                                          * distribuzione int4 e' rumore di quantizzazione */
+    stops_arm(&m->c, eos, tok_id_of(&T,"<|im_end|>"));
+    if(g_temp<0) g_temp=1.0f;            /* auto: 1.0 = generation_config MiMo-V2.5 (top_p 0.95
+                                          * taglia comunque la coda int4 rumorosa; TEMP per stringere) */
     int ngen=getenv("NGEN")?atoi(getenv("NGEN")):256;
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int templ=getenv("CHAT_TEMPLATE")?atoi(getenv("CHAT_TEMPLATE")):1;
@@ -1496,11 +1526,6 @@ static void run_serve(Model *m, const char *snap){
             g_temp=(float)rt; g_nuc=(float)rp;
         }
         int bl=0, k=0;                           /* costruisce/tokenizza il turno */
-        /* !!! TEMPLATE EREDITATO DA GLM-5.2 — SBAGLIATO per MiMo-V2.5 !!!
-         * TODO (BLOCCANTE per la chat col modello reale, gate Task 11): sostituire col
-         * chat template ufficiale di MiMo (tokenizer_config.json / chat_template.jinja).
-         * La validazione TF/greedy non passa di qui; solo chat/serve lo usano. */
-        const char *tk = getenv("THINK")&&atoi(getenv("THINK"))? "<think>" : "<think></think>";
         if(raw_mode){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
             prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8-g_draft);
@@ -1512,12 +1537,11 @@ static void run_serve(Model *m, const char *snap){
             fprintf(stderr,"[API] KV prefix %d/%d token, prefill %d\n",len,prompt_tokens,k);
             free(tmp);
         } else {
-            if(templ){ if(first) bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop>");
-                       bl+=snprintf(buf+bl,(1<<16)-bl,"<|user|>%s<|assistant|>%s",input,tk); }
+            if(templ) bl+=mimo_turn_render(buf,1<<16,input,first);
             else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
             k=tok_encode(&T,buf,bl,hist+len,maxctx-len); prompt_tokens=k;
             if(len+k+8+g_draft>=maxctx){ len=0; first=1;
-                bl=0; if(templ){ bl+=snprintf(buf+bl,(1<<16)-bl,"[gMASK]<sop><|user|>%s<|assistant|>%s",input,tk); }
+                bl=0; if(templ) bl+=mimo_turn_render(buf,1<<16,input,1);
                 else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
                 k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft;
                 prompt_tokens=k;
@@ -1832,6 +1856,23 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
 int main(int argc, char **argv){
     /* i thread OMP non devono girare a vuoto mentre il main aspetta il disco */
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY","passive",1);
+    /* TEMPLATE_DUMP=1: modalita' debug per tests/test_mimo_template.py. Legge da stdin
+     * righe "U <msg>" (turno utente -> renderizzato col template chat) e "A <testo>"
+     * (cio' che il modello AVREBBE generato -> resta in KV cosi' com'e', senza stop token),
+     * stampa il prompt esatto che verrebbe tokenizzato ed esce. Nessun modello caricato:
+     * valida SOLO la costruzione del template (confrontata con HF apply_chat_template). */
+    if(getenv("TEMPLATE_DUMP") && atoi(getenv("TEMPLATE_DUMP"))){
+        char *ln=NULL; size_t cp=0; ssize_t nr; int first=1;
+        char *tbuf=malloc(1<<16); if(!tbuf) return 1;
+        while((nr=getline(&ln,&cp,stdin))>0){
+            if(ln[nr-1]=='\n') ln[--nr]=0;
+            if(nr<2 || ln[1]!=' ') continue;
+            if(ln[0]=='U'){ int bl=mimo_turn_render(tbuf,1<<16,ln+2,first);
+                            fwrite(tbuf,1,bl,stdout); first=0; }
+            else if(ln[0]=='A') fputs(ln+2,stdout);
+        }
+        free(ln); free(tbuf); return 0;
+    }
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
@@ -1845,7 +1886,7 @@ int main(int argc, char **argv){
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
-    g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* piu' stretto dell'ufficiale 0.95: la coda int4 e' rumore */
+    g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.95f;  /* 0.95 = generation_config MiMo-V2.5 */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
     else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }
     if(g_draft<0) g_draft=0;
