@@ -45,6 +45,7 @@ typedef struct {
     Special *sp; int nsp;                       /* added tokens, ordinati per lunghezza decrescente */
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
+    int num_max;   /* lunghezza max della run \p{N}{1,n} del pre_tokenizer (cl100k=3, GPT-2/Qwen=1) */
 } Tok;
 
 /* ---------- UTF-8 ---------- */
@@ -92,6 +93,10 @@ static void tok_load(Tok *T, const char *path){
     memset(T,0,sizeof(*T));
     tk_build_bytemap(T);
     long fn; char *buf=tk_read_file(path,&fn);
+    /* pre_tokenizer: la run numerica e' \p{N}{1,3} (cl100k, es. GLM) oppure \p{N}
+     * singolo (GPT-2/Qwen, es. MiMo). Rilevato via ricerca testuale sul JSON grezzo
+     * per evitare di navigare le varianti Sequence/Split della struttura. */
+    T->num_max = strstr(buf,"p{N}{1,3}") ? 3 : 1;
     char *arena=NULL; jval *root=json_parse(buf,&arena);
     jval *model=json_get(root,"model");
     jval *vocab=json_get(model,"vocab");
@@ -120,8 +125,18 @@ static void tok_load(Tok *T, const char *path){
     hm_init(&T->merges, mc);
     for(int i=0;i<merges->len;i++){
         jval *pr=merges->kids[i];
-        const char *l=pr->kids[0]->str, *r=pr->kids[1]->str;
-        int ll=(int)strlen(l), rl=(int)strlen(r);
+        const char *l, *r; int ll, rl;
+        if(pr->t==J_ARR){
+            /* formato legacy: coppia ["left","right"] */
+            l=pr->kids[0]->str; r=pr->kids[1]->str;
+            ll=(int)strlen(l); rl=(int)strlen(r);
+        } else {
+            /* formato corrente (tokenizers>=0.20): stringa singola "left right".
+             * Lo spazio ASCII 0x20 non compare mai dentro un token byte-level
+             * (mappato su 'Ġ'), quindi il primo spazio e' sempre il separatore. */
+            const char *sep=strchr(pr->str,' ');
+            ll=(int)(sep-pr->str); l=pr->str; r=sep+1; rl=(int)strlen(r);
+        }
         char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
         hm_put(&T->merges, key, ll+1+rl, i);
     }
@@ -202,8 +217,8 @@ static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out,
                 if(is_L(cp[j])){ while(j<n && is_L(cp[j])) j++; i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
             }
         }
-        /* 3) \p{N}{1,3} */
-        if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<3){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
+        /* 3) \p{N}{1,num_max}  (num_max=3 stile cl100k, =1 stile GPT-2/Qwen) */
+        if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<T->num_max){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         /* 4) ' ?[^\s\p{L}\p{N}]+[\r\n]*' */
         {
             int j=i;

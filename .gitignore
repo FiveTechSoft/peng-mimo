@@ -42,3 +42,5 @@ stats*.txt
 /sweep.py
 c/mimo_tiny/
 c/ref_mimo.json
+c/mimo_tok/
+c/tok_mimo_cli
