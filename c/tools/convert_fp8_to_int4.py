@@ -118,27 +118,109 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
                                     "enorm", "hnorm", "shared_head"]): return "skip"
     return _classify_common(name)
 
+# ---------- scale fp8 spezzate sul confine di shard ----------
+# Il writer del checkpoint puo' mettere `nome.weight` in uno shard e la sua
+# `nome.weight_scale_inv` nel SUCCESSIVO (successo su MiMo-V2.5: shard0/shard1).
+# Le scale sono minuscole (ceil(O/128)*ceil(I/128) f32, pochi KB): in repo mode si
+# scarica SOLO quel tensore via HTTP Range, in local mode si cercano gli altri shard.
+# EN: the checkpoint writer may put `name.weight` in one shard and its
+# EN: `name.weight_scale_inv` in the NEXT one (happened on MiMo-V2.5: shard0/shard1).
+# EN: Scales are tiny (a few KB of f32): repo mode Range-fetches JUST that tensor,
+# EN: local mode scans the other shards in the dir.
+def fetch_remote_tensor(repo, shard, name, _hdrs={}):
+    """Scarica UN SOLO tensore da uno shard remoto via HTTP Range: 8 byte little-endian
+    = lunghezza dell'header, header JSON con i data_offsets per-tensore, poi il Range
+    esatto dei byte del tensore. Nessun download dell'intero shard.
+    EN: fetch ONE tensor from a remote shard via HTTP Range: 8 LE bytes = header length,
+    EN: JSON header with per-tensor data_offsets, then the tensor's exact byte span."""
+    import struct, time as _t, urllib.request
+    url = f"https://huggingface.co/{repo}/resolve/main/{shard}"
+    def rng(b0, b1):                     # GET con Range [b0,b1] inclusivo, con retry
+        for att in range(10):            # EN: ranged GET (inclusive), with retries
+            req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert",
+                                                       "Range": f"bytes={b0}-{b1}"})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r: return r.read()
+            except KeyboardInterrupt: raise
+            except Exception as ex:
+                print(f"    [scale-fetch] {type(ex).__name__} su {shard}: "
+                      f"riprovo/retrying (#{att+1})", flush=True)
+                _t.sleep(min(15, 1 + att))
+        raise RuntimeError(f"fetch_remote_tensor: {shard} irraggiungibile/unreachable")
+    if url not in _hdrs:                 # header parsato una volta per shard / parsed once
+        n = struct.unpack("<Q", rng(0, 7))[0]
+        _hdrs[url] = (json.loads(rng(8, 8 + n - 1)), 8 + n)
+    hdr, base = _hdrs[url]
+    meta = hdr[name]
+    if meta["dtype"] != "F32":
+        raise ValueError(f"fetch_remote_tensor: dtype {meta['dtype']} non gestito per {name}")
+    d0, d1 = meta["data_offsets"]
+    return np.frombuffer(rng(base + d0, base + d1 - 1), np.float32).reshape(meta["shape"]).copy()
+
+def make_scale_fetcher(repo=None, weight_map=None, local_shards=None):
+    """Risolutore per una `*_scale_inv` assente dallo shard aperto. Repo mode: weight_map
+    dell'index.json (scaricato pigramente se non fornito) + fetch Range del solo tensore.
+    Local mode: scansiona gli ALTRI shard della dir; errore chiaro se manca ovunque.
+    I risultati sono cache-ati (un confine successivo puo' rivolere la stessa scala).
+    EN: resolver for a *_scale_inv missing from the open shard. Repo mode: index.json
+    EN: weight_map (lazily fetched if not given) + Range-fetch of just that tensor.
+    EN: Local mode: scan the OTHER shards in the dir; clear error if truly absent.
+    EN: Results are cached (a later boundary may need the same scale again)."""
+    cache = {}; state = {"map": weight_map}
+    def fetch(sname):
+        if sname in cache: return cache[sname]
+        if local_shards is not None:
+            from safetensors import safe_open
+            for sp in local_shards:
+                with safe_open(sp, framework="np") as f2:
+                    if sname in f2.keys():
+                        cache[sname] = f2.get_tensor(sname).astype(np.float32)
+                        return cache[sname]
+            raise KeyError(f"{sname}: scala assente da TUTTI gli shard locali / "
+                           f"scale absent from ALL local shards")
+        if state["map"] is None:
+            import urllib.request
+            state["map"] = json.loads(urllib.request.urlopen(
+                f"https://huggingface.co/{repo}/resolve/main/model.safetensors.index.json",
+                timeout=30).read())["weight_map"]
+        shard = state["map"].get(sname)
+        if shard is None:
+            raise KeyError(f"{sname}: assente dal weight_map dell'index / not in index weight_map")
+        print(f"    [scale-fetch] {sname} <- {shard} "
+              f"(coppia peso/scala divisa sul confine di shard / pair split across shards)",
+              flush=True)
+        cache[sname] = fetch_remote_tensor(repo, shard, sname)
+        return cache[sname]
+    return fetch
+
 # ---------- dequant di un tensore (fp8+scale a blocchi / bf16 / f32) ----------
-def dequant(f, name):
+def dequant(f, name, fetch_scale=None):
     import torch
     sl = f.get_slice(name); dt = sl.get_dtype()
     if dt in ("F8_E4M3", "float8_e4m3fn"):
         w = f.get_tensor(name).to(torch.float32)
-        sc = f.get_tensor(name + "_scale_inv").to(torch.float32)   # [ceil(O/128),ceil(I/128)]
+        sname = name + "_scale_inv"
+        try:
+            sc = f.get_tensor(sname).to(torch.float32)   # [ceil(O/128),ceil(I/128)]
+        except Exception:
+            # scala non in questo shard: coppia spezzata sul confine -> risolvi altrove
+            # EN: scale not in this shard: pair split across the boundary -> resolve elsewhere
+            if fetch_scale is None: raise
+            sc = torch.from_numpy(fetch_scale(sname)).to(torch.float32)
         O, I = w.shape
         sc = sc.repeat_interleave(128, 0).repeat_interleave(128, 1)[:O, :I]
         return (w * sc).numpy()
     return f.get_tensor(name).to(torch.float32).numpy()
 
 def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=False, keep_idx=False,
-                  arch="glm"):
+                  arch="glm", fetch_scale=None):
     from safetensors import safe_open
     with safe_open(path, framework="pt") as f:
         for name in f.keys():
             kind = (classify_mimo(name) if arch == "mimo"
                     else classify(name, n_layers, keep_mtp, keep_idx))
             if kind in ("skip", "consumed"): continue
-            w = dequant(f, name)
+            w = dequant(f, name, fetch_scale)
             if kind == "f32":
                 out_dict[name] = w.astype(np.float32)
             else:
@@ -208,8 +290,10 @@ def main():
         if a.arch == "mimo":   # la testa MTP e' uno shard a parte: mai convertirla
             shards = [s for s in shards if "mtp" not in os.path.basename(s)]
         from safetensors.numpy import save_file
+        fetch = make_scale_fetcher(local_shards=shards)   # scale spezzate tra shard locali
         for i, sp in enumerate(shards):
-            out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits, arch=a.arch)
+            out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits, arch=a.arch,
+                                    fetch_scale=fetch)
             save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
         # copia config + tokenizer
         meta = (["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]
@@ -421,6 +505,7 @@ def main():
         except Exception as ex:
             w = min(60, 5*(att+1)); print(f"repo_info KO ({type(ex).__name__}): riprovo tra {w}s", flush=True); _t.sleep(w)
     shards = sorted(s.rfilename for s in info.siblings if s.rfilename.endswith(".safetensors"))
+    wmap = None            # weight_map dell'index: serve al risolutore di scale cross-shard
     if a.arch == "mimo":
         # guida l'iterazione con l'index (weight_map): salta model_mtp.safetensors e ogni shard
         # che contiene SOLO tensori da saltare (vision/audio) -> zero byte scaricati per nulla.
@@ -434,6 +519,7 @@ def main():
         idx = json.loads(urllib.request.urlopen(
             f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json",
             timeout=30).read())["weight_map"]
+        wmap = idx
         shards = sorted(set(v for k, v in idx.items() if classify_mimo(k) != "skip"))
         shards = [s for s in shards if "mtp" not in os.path.basename(s)]
     for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
@@ -447,12 +533,14 @@ def main():
         pref = f"model.layers.{a.n_layers}."
         mtp_shards = sorted(set(v for k, v in idx.items() if k.startswith(pref)))
         print(f"[MTP] testa nel layer {a.n_layers}: {len(mtp_shards)} shard da processare: {mtp_shards}")
+        fetch = make_scale_fetcher(a.repo, idx)
         for i, sh in enumerate(mtp_shards):
             outp = os.path.join(a.outdir, f"out-mtp-{i:05d}.safetensors")
             if os.path.exists(outp): print(f"[MTP] {outp} gia' fatto"); continue
             print(f"[MTP {i+1}/{len(mtp_shards)}] scarico {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
-            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True)
+            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True,
+                                    fetch_scale=fetch)
             save_file(out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
@@ -467,18 +555,21 @@ def main():
                                 if "indexer" in k and 0 <= layer_idx(k) < a.n_layers))
         tot_gb = len(idx_shards) * 5.4
         print(f"[IDX] pesi indexer su {len(idx_shards)} shard (~{tot_gb:.0f} GB di download totale, resumabile)")
+        fetch = make_scale_fetcher(a.repo, idx)
         for i, sh in enumerate(idx_shards):
             outp = os.path.join(a.outdir, f"out-idx-{i:05d}.safetensors")
             if os.path.exists(outp): continue             # gia' fatto -> ripartibile
             print(f"[IDX {i+1}/{len(idx_shards)}] scarico {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
-            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True)
+            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True,
+                                    fetch_scale=fetch)
             if out: save_file(out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
                 if os.path.isfile(blob): os.remove(blob)
             print(f"    -> {os.path.basename(outp)} ({len(out)} tensori)", flush=True)
         shutil.rmtree(tmp, ignore_errors=True); print("[IDX] FATTO."); return
+    fetch = make_scale_fetcher(a.repo, wmap)   # scale spezzate sul confine di shard (Range remoto)
     for i, sh in enumerate(shards):
         if free_gb(a.outdir) < a.min_free_gb:
             print(f"STOP: spazio libero < {a.min_free_gb} GB. Libera spazio e rilancia (riprende)."); break
@@ -486,7 +577,8 @@ def main():
         if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
         print(f"[{i+1}/{len(shards)}] scarico {sh} (libero {free_gb(a.outdir):.0f} GB)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
-        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, arch=a.arch)
+        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, arch=a.arch,
+                                fetch_scale=fetch)
         save_file(out, outp)
         os.remove(p)                                       # <-- cancella subito lo shard fp8
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):

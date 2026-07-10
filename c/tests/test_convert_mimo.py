@@ -10,7 +10,8 @@ HERE = Path(__file__).resolve().parent.parent   # c/
 sys.path.insert(0, str(HERE))
 
 import numpy as np
-from tools.convert_fp8_to_int4 import classify, classify_mimo, convert_shard
+from tools.convert_fp8_to_int4 import (classify, classify_mimo, convert_shard,
+                                       make_scale_fetcher)
 
 try:
     import torch
@@ -118,6 +119,84 @@ class TestConvertShardMimo(unittest.TestCase):
         np.testing.assert_allclose(s, np.maximum(np.abs(w).max(1) / 127.0, 1e-8), rtol=0)
         q = out["model.layers.0.self_attn.qkv_proj.weight"].view(np.int8).reshape(24, 16)
         np.testing.assert_array_equal(q, np.clip(np.rint(w / s[:, None]), -128, 127))
+
+
+@unittest.skipUnless(HAVE_TORCH, "richiede torch")
+class TestScaleCrossShard(unittest.TestCase):
+    """Coppia peso fp8 / scala spezzata sul confine di shard: il writer del checkpoint
+    MiMo-V2.5 ha messo model.layers.43...up_proj.weight in shard0 e la sua _scale_inv
+    in shard1 (crash reale del 2026-07-10). Il fetcher deve risolverla dagli altri shard
+    e la _scale_inv orfana nello shard successivo deve essere saltata senza errori.
+    EN: fp8 weight/scale pair split across a shard boundary: MiMo-V2.5's checkpoint
+    EN: writer put the weight in shard0 and its _scale_inv in shard1 (real crash,
+    EN: 2026-07-10). The fetcher must resolve it from the other shards, and the orphan
+    EN: _scale_inv in the next shard must be skipped without errors."""
+
+    @staticmethod
+    def _fp8_pair(g, O, I, bs=128):
+        """Peso quantizzato fp8 e4m3 a blocchi 128x128 + la sua scale_inv (come nel
+        checkpoint reale). EN: block-quantized fp8 weight + its scale_inv."""
+        import math
+        w = torch.randn(O, I, generator=g) * 0.1
+        Ob, Ib = math.ceil(O / bs), math.ceil(I / bs)
+        sc = torch.zeros(Ob, Ib)
+        for bi in range(Ob):
+            for bj in range(Ib):
+                blk = w[bi*bs:(bi+1)*bs, bj*bs:(bj+1)*bs]
+                sc[bi, bj] = blk.abs().max() / 448.0
+        scexp = sc.repeat_interleave(bs, 0).repeat_interleave(bs, 1)[:O, :I]
+        return (w / scexp).to(torch.float8_e4m3fn), sc
+
+    def test_scala_nello_shard_successivo(self):
+        g = torch.Generator().manual_seed(3)
+        n_a = "model.layers.0.mlp.experts.0.up_proj.weight"   # peso in A, scala in B
+        n_b = "model.layers.0.mlp.experts.1.up_proj.weight"   # coppia completa in B
+        qa, sa = self._fp8_pair(g, 256, 128)
+        qb, sb = self._fp8_pair(g, 128, 128)
+        with tempfile.TemporaryDirectory() as d:
+            pA = str(Path(d) / "model_pp0_ep0_shard0.safetensors")
+            pB = str(Path(d) / "model_pp0_ep0_shard1.safetensors")
+            save_file({n_a: qa}, pA)
+            save_file({n_a + "_scale_inv": sa, n_b: qb, n_b + "_scale_inv": sb}, pB)
+            fetch = make_scale_fetcher(local_shards=[pA, pB])
+            out = {}
+            for p in (pA, pB):
+                convert_shard(p, out, 78, ebits=8, io_bits=16, xbits=4, arch="mimo",
+                              fetch_scale=fetch)
+            # riferimento: gli STESSI dati in un solo shard (nessun confine da attraversare)
+            # EN: reference: the SAME data in a single shard (no boundary to cross)
+            pS = str(Path(d) / "single.safetensors")
+            save_file({n_a: qa, n_a + "_scale_inv": sa,
+                       n_b: qb, n_b + "_scale_inv": sb}, pS)
+            ref = {}
+            convert_shard(pS, ref, 78, ebits=8, io_bits=16, xbits=4, arch="mimo")
+        self.assertEqual(set(out), set(ref))
+        for k in ref:
+            np.testing.assert_array_equal(out[k], ref[k], err_msg=k)
+
+    def test_senza_fetcher_crash_storico(self):
+        # senza fetch_scale il comportamento storico resta: errore, non silenzio
+        # EN: without fetch_scale the historical behavior stays: an error, not silence
+        g = torch.Generator().manual_seed(4)
+        qa, _ = self._fp8_pair(g, 128, 128)
+        with tempfile.TemporaryDirectory() as d:
+            pA = str(Path(d) / "model_pp0_ep0_shard0.safetensors")
+            save_file({"model.layers.0.mlp.experts.0.up_proj.weight": qa}, pA)
+            with self.assertRaises(Exception):
+                convert_shard(pA, {}, 78, ebits=8, io_bits=16, xbits=4, arch="mimo")
+
+    def test_scala_veramente_assente(self):
+        # local mode con scala assente da TUTTI gli shard -> KeyError chiaro
+        # EN: local mode with the scale absent from ALL shards -> clear KeyError
+        g = torch.Generator().manual_seed(5)
+        qa, _ = self._fp8_pair(g, 128, 128)
+        with tempfile.TemporaryDirectory() as d:
+            pA = str(Path(d) / "model_pp0_ep0_shard0.safetensors")
+            save_file({"model.layers.0.mlp.experts.0.up_proj.weight": qa}, pA)
+            fetch = make_scale_fetcher(local_shards=[pA])
+            with self.assertRaises(KeyError):
+                convert_shard(pA, {}, 78, ebits=8, io_bits=16, xbits=4, arch="mimo",
+                              fetch_scale=fetch)
 
 
 if __name__ == "__main__":
