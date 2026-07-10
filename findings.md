@@ -66,6 +66,22 @@ que tratarlos distinto.
 > formatos ligeramente distintos a los de otros modelos. Cada uno es una mina si el
 > motor asume el formato "habitual".
 
+### 6b. La atención C clavó la validación a la primera
+
+Con los hechos verificados de antemano (orden exacto: proyección fusionada → V×0.707 →
+RoPE parcial → cache → ventana p−128+1 → sink en denominador → o_proj), la
+implementación C pasó teacher-forcing 32/32 y greedy 20/20 en el primer intento, sin
+una sola iteración de debugging. Verificado dos veces por un revisor independiente.
+
+> **En cristiano:** cuando inviertes el tiempo en leer el plano original con lupa antes
+> de construir, la pieza encaja a la primera. Todo el trabajo de arqueología del config
+> y el modeling (hallazgos 1–6) se cobró aquí.
+
+Nota de fragilidad anotada: el rope_dim por tipo de capa se deriva por reescala entera
+desde el valor full; si un config futuro tuviera `swa_head_dim ≠ head_dim` con factor
+no exacto, podría diferir en ±1 del cálculo de la referencia. Los configs actuales
+(tiny y real) son inmunes; el oráculo lo detectaría al instante en cualquier caso.
+
 ## Tokenizer
 
 ### 7. Formato moderno de merges: string única, no pares
