@@ -1,4 +1,8 @@
-# Design: `mimo.c` — colibrì engine for MiMo-V2.5 (text-only)
+# Design: peng (鹏) — `mimo.c`, the colibrì engine for MiMo-V2.5 (text-only)
+
+Project name: **peng**, after the mythological Chinese bird of the Zhuangzi — a creature
+of colossal scale that stays aloft riding the whirlwind, as this engine keeps a 311B
+model aloft on a stream of disk reads.
 
 Date: 2026-07-10
 Status: approved by user
