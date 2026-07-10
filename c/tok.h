@@ -134,7 +134,8 @@ static void tok_load(Tok *T, const char *path){
             /* formato corrente (tokenizers>=0.20): stringa singola "left right".
              * Lo spazio ASCII 0x20 non compare mai dentro un token byte-level
              * (mappato su 'Ġ'), quindi il primo spazio e' sempre il separatore. */
-            const char *sep=strchr(pr->str,' ');
+            const char *sep = (pr->t==J_STR && pr->str) ? strchr(pr->str,' ') : NULL;
+            if(!sep){ fprintf(stderr,"tokenizer.json: merge %d senza separatore\n",i); exit(1); }
             ll=(int)(sep-pr->str); l=pr->str; r=sep+1; rl=(int)strlen(r);
         }
         char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
