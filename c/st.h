@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -178,13 +179,27 @@ static void st_prefetch(shards *S, const char *name) {
     if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
 }
 
+/* pread completo: una singola pread() Linux tronca a ~2 GB (0x7ffff000) e puo'
+ * comunque leggere corto senza errore. I tensori f32 residenti di MiMo (embed,
+ * lm_head: 2.5 GB l'uno) superano il limite -> si legge a pezzi fino a completare. */
+static ssize_t pread_full(int fd, void *buf, int64_t count, int64_t off) {
+    int64_t got = 0;
+    while (got < count) {
+        ssize_t r = pread(fd, (char *)buf + got, (size_t)(count - got), off + got);
+        if (r < 0) return -1;
+        if (r == 0) { errno = 0; return got; }   /* EOF prematuro */
+        got += r;
+    }
+    return got;
+}
+
 /* legge un tensore in un buffer float32 fornito dal chiamante (numel float).
  * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "tensore mancante: %s\n", name); exit(1); }
     void *raw = malloc(t->nbytes);
-    if (pread(t->fd, raw, t->nbytes, t->off) != t->nbytes) { perror("pread data"); exit(1); }
+    if (pread_full(t->fd, raw, t->nbytes, t->off) != t->nbytes) { perror("pread data"); exit(1); }
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
@@ -209,7 +224,7 @@ static int64_t st_nbytes(shards *S, const char *name) {
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "tensore mancante: %s\n", name); exit(1); }
-    if (pread(t->fd, out, t->nbytes, t->off) != t->nbytes) { perror("pread raw"); exit(1); }
+    if (pread_full(t->fd, out, t->nbytes, t->off) != t->nbytes) { perror("pread raw"); exit(1); }
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
 
@@ -222,7 +237,7 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     int esz = (t->dtype == 2) ? 4 : 2;
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
-    if (pread(t->fd, raw, nb, boff) != nb) { perror("pread slice"); exit(1); }
+    if (pread_full(t->fd, raw, nb, boff) != nb) { perror("pread slice"); exit(1); }
     if (t->dtype == 2) memcpy(out, raw, nb);
     else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
