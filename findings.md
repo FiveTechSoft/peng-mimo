@@ -152,6 +152,31 @@ sintéticos.
 > correcto a la primera — cada pieza del pipeline demuestra producir bits idénticos
 > a la referencia antes de tocar el modelo real.
 
+### 8d. Chat template de MiMo: ChatML con trampas propias
+
+- Los turnos se unen SIN salto de línea tras `<|im_end|>` (el ChatML de Qwen lleva `\n`
+  — venir de ahí garantiza el error) y sin token BOS.
+- Sistema por defecto: "You are MiMo, a helpful AI assistant engineered by Xiaomi."
+- Thinking viene ACTIVADO por defecto en el template oficial (`<think>` tras
+  `<|im_start|>assistant\n`); con razonamiento largo puede comerse todo el presupuesto
+  de tokens antes de la respuesta visible.
+- Los ids de stop se arman POR NOMBRE del tokenizer (`<|endoftext|>`, `<|im_end|>`),
+  no por id del config — el config del snapshot solo declara uno de los dos.
+- `generation_config` oficial: temperature 1.0, top_p 0.95 (y un `do_sample: false`
+  contradictorio que ignoramos).
+- Validación sin modelo: `TEMPLATE_DUMP=1` vuelca el prompt renderizado antes de
+  tokenizar y un test lo compara contra `apply_chat_template` de HF — 5/5 casos.
+
+> **En cristiano:** cada modelo tiene su "protocolo de conversación" — dónde van las
+> etiquetas de quién habla. Un espacio de más y el modelo balbucea. Lo comprobamos
+> contra la herramienta oficial sin necesitar el modelo descargado.
+
+### 8e. La estimación de descarga era 15× pesimista
+
+Con HF anónimo una prueba corta midió ~4 MB/s → estimamos 22 h. La descarga real
+sostiene **~59 MB/s** con 2 streams: shard de 34.4 GB en 9.7 min → ~2-4 h el total.
+Moraleja: no estimar ancho de banda con una conexión fría y rate-limit de handshake.
+
 ## Entorno / herramientas
 
 ### 9. Benchmark de disco con ceros = mentira
