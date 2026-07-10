@@ -32,20 +32,37 @@ disk, higher with warm LRU/learning cache. Model on disk at int4: ~165 GB (fits)
 
 ## MiMo-V2.5 architecture facts (from official `config.json`)
 
+Verified against the raw `config.json` and the official `modeling_mimo_v2.py`
+(both downloaded 2026-07-10):
+
 | field | value |
 |---|---|
 | architectures | `MiMoV2ForCausalLM` (`model_type: mimo_v2`, trust_remote_code) |
 | hidden_size | 4096 |
-| num_hidden_layers | 48 (1 dense + 47 MoE) |
-| attention | GQA: 64 Q heads, 4 KV heads, head_dim 192, v_head_dim 128 |
-| hybrid pattern | full attention at layer indices 0, 5, 11, 17, 23, 29, 35, 41, 47; sliding-window 128 elsewhere |
-| RoPE | partial_rotary_factor 0.334 (≈64 dims); theta 10,000,000 (full layers) / 10,000 (SWA layers) |
-| MoE | 256 routed experts, top-8, moe_intermediate_size 2048, no shared expert |
-| router | sigmoid scoring, `noaux_tc`, norm_topk_prob=true — identical to GLM-5.2/DeepSeek-V3 style |
-| dense MLP | intermediate_size 16384 (first layer) |
-| vocab | 152,576; byte-level BPE (vocab.json + merges.txt, GPT-2 style) |
-| checkpoint | FP8 e4m3, block scales 128×128 — same container as GLM-5.2-FP8 |
-| shards | 16 files `model_pp0_ep{0..7}-*.safetensors`, 316 GB total, largest 34.4 GB |
+| num_hidden_layers | 48; `moe_layer_freq` marks layer 0 dense (intermediate 16384), layers 1–47 MoE |
+| attention (full layers) | GQA: 64 Q heads, **4 KV heads**, head_dim 192, v_head_dim 128, rope_theta 10,000,000 |
+| attention (SWA layers) | GQA: 64 Q heads, **8 KV heads**, same head dims, window 128, rope_theta 10,000, **attention sink bias per head** (`add_swa_attention_sink_bias: true`) |
+| hybrid pattern | `hybrid_layer_pattern`: 0 (full) at indices 0, 5, 11, 17, 23, 29, 35, 41, 47; 1 (SWA-128) at the other 39 |
+| QKV projection | **fused**: single `qkv_proj` tensor (`attention_projection_layout: "fused_qkv"`), split at q_size=12288 / k_size(full)=768 / k_size(swa)=1536 / v_size(full)=512 / v_size(swa)=1024; `o_proj` separate, no bias anywhere |
+| value scale | `attention_value_scale: 0.707` — V multiplied by 0.707 before attention |
+| RoPE | partial_rotary_factor 0.334 → rope_dim = int(192·0.334) = 64; **non-interleaved** (rotate_half, GPT-NeoX style) applied to the FIRST 64 dims of each 192-dim head; remaining 128 dims pass through |
+| MoE | 256 routed experts, top-8, moe_intermediate_size 2048, no shared expert; n_group = topk_group = 1 (grouping is a no-op) |
+| router | sigmoid scoring, `noaux_tc` (bias-corrected selection, weights from raw sigmoid scores), norm_topk_prob=true, routed_scaling_factor null → 1.0 — same math as GLM-5.2 |
+| norms | RMSNorm, layernorm_epsilon 1e-5; activation silu |
+| vocab | 152,576; byte-level BPE (vocab.json + merges.txt); eos 151645, pad 151643 (Qwen-style ids) |
+| checkpoint | FP8 e4m3, block scales 128×128, **except all `self_attn.o_proj` tensors which stay bf16** (`ignored_layers`) |
+| shards | 16 files `model_pp0_ep{0..7}-*.safetensors`, 316 GB total, largest 34.4 GB; MTP in separate `model_mtp.safetensors` (1.19 GB) |
+
+Engine consequences of the verified facts:
+- The per-layer KV cache differs by layer type in BOTH shape and heads: full layers
+  store 4 KV heads with unbounded length; SWA layers store 8 KV heads in a 128-slot
+  ring. The loader derives per-layer geometry from `hybrid_layer_pattern`.
+- `qkv_proj` is loaded fused and split at inference time by row ranges (cheaper than
+  re-packing at conversion; keeps tensor names 1:1 with the checkpoint).
+- The SWA sink bias adds one virtual logit per head to the softmax denominator
+  (concat → softmax → drop last column, as in the reference `eager_attention_forward`).
+- The 0.707 value scale is folded into the V rows of `qkv_proj` at conversion time
+  (exact: linear scaling commutes), so the C hot path stays untouched.
 
 ## Approach (chosen: sibling engine)
 
