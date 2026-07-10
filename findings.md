@@ -82,6 +82,26 @@ desde el valor full; si un config futuro tuviera `swa_head_dim ≠ head_dim` con
 no exacto, podría diferir en ±1 del cálculo de la referencia. Los configs actuales
 (tiny y real) son inmunes; el oráculo lo detectaría al instante en cualquier caso.
 
+### 6c. Cuantización en el tiny: int8 exacto, int4 voltea un argmax, packing sin pérdidas
+
+Matriz completa en el oráculo tiny: int8 reproduce el f32 **token-exacto** (32/32,
+20/20 — ni un flip); int4 voltea UNA posición de 32 (el resto de la divergencia greedy
+es cascada autoregresiva de ese único flip); int4 empaquetado ≡ int4 sin empaquetar
+byte a byte (packing lossless); kernels enteros IDOT ≡ dequant exacto a int8; todo
+determinista. Verificado independientemente por el controlador.
+
+> **En cristiano:** comprimir los pesos a la mitad (int8) no cambió ni un solo
+> resultado; comprimir a un cuarto (int4) cambió uno de 32 — y en un modelo de pesos
+> aleatorios donde cualquier ruido voltea decisiones al borde. En el modelo real,
+> entrenado, los márgenes son mucho mayores.
+
+### 6d. El cap de cache se auto-sube silenciosamente (gotcha de benchmark)
+
+Pedir `cap=2` por CLI no da cache de 2: el auto-raise del upstream (feature del
+2026-07-10) lo sube hasta llenar el presupuesto de RAM. Para forzar el cap pedido:
+`CAP_RAISE=0`. Con él, la evicción LRU real mantiene tokens exactos (20/20) con
+hit-rate 88%→81% — streaming bajo presión validado.
+
 ## Tokenizer
 
 ### 7. Formato moderno de merges: string única, no pares
