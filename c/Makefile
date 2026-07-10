@@ -52,6 +52,9 @@ all: glm
 glm: glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm $(LDFLAGS)
 
+mimo: mimo.c st.h json.h tok.h tok_unicode.h compat.h
+	$(CC) $(CFLAGS) mimo.c -o mimo $(LDFLAGS)
+
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) -c backend_cuda.cu -o $@
@@ -92,7 +95,7 @@ check:
 	$(MAKE) test
 
 clean:
-	rm -f olmoe glm backend_cuda.o backend_cuda_test $(TEST_BINS)
+	rm -f olmoe glm mimo backend_cuda.o backend_cuda_test $(TEST_BINS)
 	rm -rf tests/__pycache__
 
 .PHONY: all cuda-test portable test-c test-python test check clean
