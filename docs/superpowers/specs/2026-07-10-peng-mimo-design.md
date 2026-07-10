@@ -61,8 +61,12 @@ Engine consequences of the verified facts:
   re-packing at conversion; keeps tensor names 1:1 with the checkpoint).
 - The SWA sink bias adds one virtual logit per head to the softmax denominator
   (concat → softmax → drop last column, as in the reference `eager_attention_forward`).
-- The 0.707 value scale is folded into the V rows of `qkv_proj` at conversion time
-  (exact: linear scaling commutes), so the C hot path stays untouched.
+- The 0.707 value scale is applied at runtime to the projected V vector (S·v_size
+  multiplies per layer — negligible). Runtime beats weight-folding here because the
+  same code path then serves both the f32 tiny oracle and the converted container.
+- v1 allocates linear (full-length) KV for every layer and enforces the SWA window
+  as a mask bound in the attention loop — correctness first. The 128-slot ring
+  buffer for SWA layers is a later, separately-validated memory optimization.
 
 ## Approach (chosen: sibling engine)
 
