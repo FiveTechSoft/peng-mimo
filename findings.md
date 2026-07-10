@@ -177,6 +177,29 @@ Con HF anónimo una prueba corta midió ~4 MB/s → estimamos 22 h. La descarga 
 sostiene **~59 MB/s** con 2 streams: shard de 34.4 GB en 9.7 min → ~2-4 h el total.
 Moraleja: no estimar ancho de banda con una conexión fría y rate-limit de handshake.
 
+### 8f. El checkpoint real corta pares peso/escala en las fronteras de shard
+
+Primer contacto con el checkpoint FP8 de verdad: crash. El shard 0 trae 4096 pesos
+pero 4095 escalas — el escritor del checkpoint partió un par `weight`/`weight_scale_inv`
+justo en el límite del archivo (la escala quedó en el shard siguiente). Ningún test
+podía verlo: nuestras fuentes de prueba eran bf16 (sin escalas separadas). Fix:
+resolver la escala vía el índice del repo y traer solo sus bytes por HTTP Range
+(las escalas son KB). El shard de 34 GB descargado se conserva y se reutiliza.
+
+> **En cristiano:** el modelo viene en 16 "cajas" y el embalador cortó una pieza en
+> dos cajas distintas. Nuestro desembalador asumía piezas completas por caja. Es
+> EXACTAMENTE el tipo de fallo para el que montamos conversión resumible: se arregla
+> el desembalador y se continúa donde iba, sin re-descargar nada.
+
+### 11b. Cuidado con monitores que se buscan a sí mismos
+
+El monitor del convertidor tenía dos bugs de novato: su `$(...)` se expandió una capa
+de shell antes de tiempo (quedó vigilando strings vacíos), y su `pgrep -f convert_fp8`
+se encontraba A SÍ MISMO (el patrón estaba en su propia línea de comando) — reportaba
+"VIVO" con el convertidor muerto. Reglas: scripts de monitor a archivo (no inline con
+anidamiento de comillas), y patrones de pgrep que no aparezcan en el comando del
+propio monitor (`pgrep -f 'python.*convert_fp8'`).
+
 ## Entorno / herramientas
 
 ### 9. Benchmark de disco con ceros = mentira
