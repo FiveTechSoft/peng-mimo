@@ -24,6 +24,14 @@ USO:
   python3 tools/convert_fp8_to_int4.py --selftest
   # reale: scarica+converte+cancella shard per shard
   python3 tools/convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 --outdir /home/vincenzo/glm52_i4
+
+ARCH MIMO (--arch mimo, MiMo-V2.5): stessa pipeline, nomi diversi. qkv fuso (self_attn.qkv_proj),
+o_proj in bf16 puro (ignored_layers del quantization_config: niente scale fp8 -> dequant() lo
+gestisce gia' per dtype), attention_sink_bias tenuto f32, shard ep presi dall'index.json
+(model_pp0_ep*-*.safetensors), model_mtp.safetensors e tensori vision/audio SALTATI.
+Default bit: densa int8, expert int4, embed/lm_head f32 = il punto operativo './mimo <cap> 4 8'.
+  python3 tools/convert_fp8_to_int4.py --arch mimo --src mimo_tiny --out mimo_tiny_i4
+  python3 tools/convert_fp8_to_int4.py --arch mimo --repo XiaomiMiMo/MiMo-V2.5-FP8 --out ~/mimo_i4
 """
 import os, sys, glob, json, shutil, argparse
 import numpy as np
@@ -72,6 +80,27 @@ def layer_idx(name):
         except ValueError: return -1
     return -1
 
+def _classify_common(name):
+    """Coda condivisa glm/mimo: cosa quantizzare e cosa tenere f32.
+    EN: shared glm/mimo tail: what to quantize vs keep f32."""
+    if name.endswith("e_score_correction_bias"): return "f32"
+    if name.endswith("mlp.gate.weight"): return "f32"    # router (NON gate_proj)
+    if name.endswith("norm.weight") or name == "model.norm.weight": return "f32"
+    if name in ("model.embed_tokens.weight", "lm_head.weight"): return "io"
+    if ".mlp.experts." in name and name.endswith(".weight"): return "x"  # expert ROUTED (streaming)
+    if name.endswith(".weight"): return "q"              # attn/dense-mlp/shared (residente)
+    return "f32"                                          # bias 1D (es. attention_sink_bias)
+
+# MiMo-V2.5: niente skip per-layer (la testa MTP vive in uno shard separato model_mtp.safetensors,
+# saltato a monte per nome file); vision/audio non servono al motore testuale.
+# EN: MiMo-V2.5: no per-layer skip (the MTP head lives in a separate model_mtp.safetensors shard,
+# EN: skipped upstream by filename); vision/audio are useless to the text engine.
+MIMO_SKIP_PREFIXES = ("model.vision", "model.audio", "audio_tokenizer", "model.mtp", "mtp.")
+def classify_mimo(name):
+    if name.endswith("_scale_inv"): return "consumed"    # gestito col suo peso fp8
+    if name.startswith(MIMO_SKIP_PREFIXES): return "skip"
+    return _classify_common(name)
+
 def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     if name.endswith("_scale_inv"): return "consumed"   # gestito col suo peso
     li = layer_idx(name)
@@ -87,13 +116,7 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
         if li >= n_layers: return "skip"                 # layer MTP (78)
         if any(k in name for k in ["indexer", "indexers_proj", "eh_proj",
                                     "enorm", "hnorm", "shared_head"]): return "skip"
-    if name.endswith("e_score_correction_bias"): return "f32"
-    if name.endswith("mlp.gate.weight"): return "f32"    # router (NON gate_proj)
-    if name.endswith("norm.weight") or name == "model.norm.weight": return "f32"
-    if name in ("model.embed_tokens.weight", "lm_head.weight"): return "io"
-    if ".mlp.experts." in name and name.endswith(".weight"): return "x"  # expert ROUTED (streaming)
-    if name.endswith(".weight"): return "q"              # attn/dense-mlp/shared (residente)
-    return "f32"
+    return _classify_common(name)
 
 # ---------- dequant di un tensore (fp8+scale a blocchi / bf16 / f32) ----------
 def dequant(f, name):
@@ -107,11 +130,13 @@ def dequant(f, name):
         return (w * sc).numpy()
     return f.get_tensor(name).to(torch.float32).numpy()
 
-def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=False, keep_idx=False):
+def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=False, keep_idx=False,
+                  arch="glm"):
     from safetensors import safe_open
     with safe_open(path, framework="pt") as f:
         for name in f.keys():
-            kind = classify(name, n_layers, keep_mtp, keep_idx)
+            kind = (classify_mimo(name) if arch == "mimo"
+                    else classify(name, n_layers, keep_mtp, keep_idx))
             if kind in ("skip", "consumed"): continue
             w = dequant(f, name)
             if kind == "f32":
@@ -119,6 +144,8 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=Fals
             else:
                 bits = io_bits if kind == "io" else xbits if kind == "x" else ebits
                 if w.ndim != 2:        # es. bias 1D non previsto come 'q' -> tienilo f32
+                    out_dict[name] = w.astype(np.float32); continue
+                if bits >= 16:         # >=16 = niente quantizzazione, come qt_alloc nel C
                     out_dict[name] = w.astype(np.float32); continue
                 q, s = (quant_int2(w, bits) if bits <= 2 else
                         quant_int4(w, bits) if bits <= 4 else quant_int8(w, bits))
@@ -129,12 +156,16 @@ def free_gb(p): return shutil.disk_usage(p).free / 1e9
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--arch", choices=["glm", "mimo"], default="glm",
+        help="glm (default, comportamento storico) | mimo: MiMo-V2.5 (qkv fuso, o_proj bf16, "
+             "shard ep dall'index.json, salta model_mtp/vision/audio). Default bit mimo: "
+             "densa int8, expert int4, embed/lm_head f32 = il punto operativo del motore '4 8'.")
     ap.add_argument("--repo", default=None)
-    ap.add_argument("--indir", default=None)
-    ap.add_argument("--outdir", required=False)
-    ap.add_argument("--ebits", type=int, default=None)   # bit residenti (default 4; 8 per --mtp/--indexer)
-    ap.add_argument("--io-bits", type=int, default=8)    # bit di embed/lm_head
-    ap.add_argument("--xbits", type=int, default=None)   # bit degli expert ROUTED (streaming); default=ebits
+    ap.add_argument("--indir", "--src", default=None)
+    ap.add_argument("--outdir", "--out", required=False)
+    ap.add_argument("--ebits", type=int, default=None)   # bit residenti (default 4 glm / 8 mimo; 8 per --mtp/--indexer)
+    ap.add_argument("--io-bits", type=int, default=None) # bit di embed/lm_head (default 8 glm / 16=f32 mimo)
+    ap.add_argument("--xbits", type=int, default=None)   # bit degli expert ROUTED (streaming); default=ebits (4 per mimo)
     ap.add_argument("--n-layers", type=int, default=78)
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--selftest", action="store_true")
@@ -145,11 +176,15 @@ def main():
              "i tensori indexer sono sparsi su ~tutti gli shard: ri-scarica l'intero repo (~756 GB "
              "di traffico) per tenerne pochi GB. Resumabile shard per shard. Consigliato --ebits 8.")
     a = ap.parse_args()
+    if a.arch == "mimo" and (a.mtp or a.indexer):
+        print("ERRORE: --mtp/--indexer sono modalita' GLM (DSA/MTP nel layer 78)."); return
     if a.ebits is None:
         # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
         # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward.
-        a.ebits = 8 if (a.mtp or a.indexer) else 4
-    if a.xbits is None: a.xbits = a.ebits
+        # mimo: densa int8 = il punto validato del motore ('./mimo <cap> 4 8').
+        a.ebits = 8 if (a.mtp or a.indexer or a.arch == "mimo") else 4
+    if a.xbits is None: a.xbits = 4 if a.arch == "mimo" else a.ebits
+    if a.io_bits is None: a.io_bits = 16 if a.arch == "mimo" else 8   # 16 = embed/lm_head f32
 
     if a.selftest:
         import torch
@@ -170,12 +205,16 @@ def main():
     os.makedirs(a.outdir, exist_ok=True)
     if a.indir:    # conversione locale (test)
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
+        if a.arch == "mimo":   # la testa MTP e' uno shard a parte: mai convertirla
+            shards = [s for s in shards if "mtp" not in os.path.basename(s)]
         from safetensors.numpy import save_file
         for i, sp in enumerate(shards):
-            out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits)
+            out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits, arch=a.arch)
             save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
         # copia config + tokenizer
-        for fn in ["config.json"]:
+        meta = (["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]
+                if a.arch == "mimo" else ["config.json"])
+        for fn in meta:
             src = os.path.join(a.indir, fn)
             if os.path.exists(src): shutil.copy(src, a.outdir)
         print(f"convertito {len(shards)} shard -> {a.outdir}")
@@ -382,6 +421,21 @@ def main():
         except Exception as ex:
             w = min(60, 5*(att+1)); print(f"repo_info KO ({type(ex).__name__}): riprovo tra {w}s", flush=True); _t.sleep(w)
     shards = sorted(s.rfilename for s in info.siblings if s.rfilename.endswith(".safetensors"))
+    if a.arch == "mimo":
+        # guida l'iterazione con l'index (weight_map): salta model_mtp.safetensors e ogni shard
+        # che contiene SOLO tensori da saltare (vision/audio) -> zero byte scaricati per nulla.
+        # Le tre matrici di un expert possono stare su shard ep diversi: ogni shard scrive i
+        # tensori che ha (out-NNNNN keyed sullo shard), st.h del motore li ricuce per nome.
+        # EN: drive iteration from the index (weight_map): skip model_mtp.safetensors and any
+        # EN: shard holding ONLY skippable tensors (vision/audio) -> no wasted download bytes.
+        # EN: An expert's three matrices may live on different ep shards: each shard writes the
+        # EN: tensors it has (out-NNNNN keyed on the shard), the engine's st.h stitches by name.
+        import urllib.request
+        idx = json.loads(urllib.request.urlopen(
+            f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json",
+            timeout=30).read())["weight_map"]
+        shards = sorted(set(v for k, v in idx.items() if classify_mimo(k) != "skip"))
+        shards = [s for s in shards if "mtp" not in os.path.basename(s)]
     for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
         try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
         except Exception: pass
@@ -432,7 +486,7 @@ def main():
         if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
         print(f"[{i+1}/{len(shards)}] scarico {sh} (libero {free_gb(a.outdir):.0f} GB)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
-        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits)
+        out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, arch=a.arch)
         save_file(out, outp)
         os.remove(p)                                       # <-- cancella subito lo shard fp8
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
