@@ -88,6 +88,35 @@ The capital of France is Paris. The capital of Germany
 - Two final bugs only the real model could expose, both documented in [`findings.md`](findings.md): the 2 GB limit of `pread()` and the **range-TP interleaved layout of qkv in the official FP8 checkpoint** (which Xiaomi's own `modeling_mimo_v2.py` doesn't know how to read — only vLLM de-interleaves it)
 - Container published on HF: [`fivetech/MiMo-V2.5-colibri-peng-int4`](https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4)
 
+#### Benchmark — this machine (2026-07-11)
+
+Ran on the WSL2 box against the real 152 GB int4 container (`/root/mimo25_i4`,
+17 shards) on ext4 (`/root`, **not** `/mnt/c`). Prompt `la capital de Francia es`,
+`NGEN=20`, `./mimo 64 4 8`. With only 22 GB of RAM the engine fits ~3
+experts/layer, so it auto-dropped `cap` 64→3 and the run is fully disk-bound
+(every token re-reads its experts) — exactly the regime where PILOT helps.
+
+| Spec | Value |
+|---|---|
+| CPU | Intel Xeon W-2140B @ 3.20 GHz, 8C/16T (AVX2 / AVX512) |
+| RAM | 23 GB total / 22 GB avail |
+| Disk | WSL2 VHDX, ext4 (`/root`), ~2.75 GB/s O_DIRECT measured |
+| Model | MiMo-V2.5 311B (15B active), int4 container 152 GB / 17 shards |
+| Engine | `mimo` (gcc -O3 -march=native -fopenmp -pthread), idot avx2 |
+| `cap` | auto 64→3 (RAM-starved) |
+
+| Mode | tok/s | expert-disk | hit-rate |
+|---|---|---|---|
+| default (no PILOT) | 0.15 | 93.5 s | 15.9% |
+| `PILOT=1` | 0.20 – 0.30 | 44.9 – 27.6 s | 6 – 17% |
+| **speedup** | **~1.3 – 2.0×** | **~2.1 – 3.4×** | — |
+
+The tok/s spread on `PILOT=1` (0.20→0.30) is just cache warm-up
+(the `.coli_usage` PIN replay re-pins 178 experts between runs). Bottom
+line: **more RAM is the lever** — at `cap`→3 the disk is the ceiling and PILOT
+only overlaps it; at 32–64 GB (`cap` 8–64) the README's 0.31–0.43 tok/s
+applies and PILOT's edge shrinks toward ~0% (experts cached, no stall).
+
 ### Validation results (2026-07-10)
 
 | Gate | Result |
