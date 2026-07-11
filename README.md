@@ -1,178 +1,135 @@
-<p align="center"><b>peng (鹏)</b> — motor pequeño, modelo inmenso, viento de disco.</p>
+<p align="center"><b>peng (鹏)</b> — small engine, immense model, disk wind.</p>
 
 # peng
 
-**peng** adapta la tecnología de [colibrì](https://github.com/JustVugg/colibri) (motor de
-inferencia MoE en C puro con streaming de experts desde disco) para ejecutar
-**MiMo-V2.5 de Xiaomi (311B parámetros, 15B activos)** en hardware doméstico.
+**peng** adapts the technology from [colibri](https://github.com/JustVugg/colibri) (pure C MoE inference engine with expert streaming from disk) to run **Xiaomi's MiMo-V2.5 (311B parameters, 15B active)** on consumer hardware.
 
-El nombre viene del pájaro mitológico chino del *Zhuangzi*: una criatura colosal que se
-mantiene en vuelo cabalgando el torbellino — como este motor mantiene "en el aire" un
-modelo de 311B parámetros sobre una corriente continua de lecturas de NVMe, en una
-máquina con 32 GB de RAM.
+The name comes from the mythological bird from the Chinese *Zhuangzi*: a colossal creature that stays in flight by riding a whirlwind — much like this engine keeps "airborne" a 311B parameter model on a continuous stream of NVMe reads, on a machine with 32 GB of RAM.
 
-Proyecto derivado de colibrì (Apache 2.0, © JustVugg). El README original del motor
-upstream está en [`docs/README-colibri-upstream.md`](docs/README-colibri-upstream.md).
+Derived project from colibri (Apache 2.0, © JustVugg). The original upstream engine README is at [`docs/README-colibri-upstream.md`](docs/README-colibri-upstream.md).
 
-## La idea heredada de colibrì
+## The inherited idea from colibri
 
-Un MoE activa pocos parámetros por token. En MiMo-V2.5: de 311B totales solo ~15B
-trabajan en cada token, y la mayor parte son 8 experts (de 256 posibles) por cada una de
-las 47 capas MoE. Entonces:
+A MoE activates few parameters per token. In MiMo-V2.5: of 311B total only ~15B work per token, mostly 8 experts (of 256 possible) per each of the 47 MoE layers. Thus:
 
-- la **parte densa** (atención, embeddings, capa 0 densa) vive **residente en RAM a int4**;
-- los **12.032 experts enrutados** (47 capas × 256, ~12.6 MB cada uno a int4) viven **en
-  disco** (~165 GB) y se leen bajo demanda, con cache LRU por capa + cache de aprendizaje
-  que fija los experts más usados en la RAM sobrante.
+- the **dense part** (attention, embeddings, layer 0 dense) lives **resident in RAM as int4**;
+- the **12,032 routed experts** (47 layers × 256, ~12.6 MB each at int4) live **on disk** (~165 GB) and are read on demand, with LRU cache per layer + learning cache that pins the most-used experts in remaining RAM.
 
-Coste por token frío: 47 × 8 × 12.6 MB ≈ **4.7 GB de lecturas** → en el NVMe de la máquina
-de desarrollo (2.75 GB/s medidos en lecturas aleatorias de 19 MB) el techo físico es
-**~0.6 tok/s**, mejorando con cache caliente. No es rápido: es un modelo de 311B
-respondiendo en una máquina de sobremesa.
+Cost per cold token: 47 × 8 × 12.6 MB ≈ **4.7 GB of reads** → on the NVMe of the dev machine (2.75 GB/s measured on random 19 MB reads) the physical ceiling is **~0.6 tok/s**, improving with warm cache. It's not fast: it's a 311B model responding on a desktop machine.
 
-## Por qué MiMo-V2.5
+## Why MiMo-V2.5
 
-Elegido tras comparar candidatos (GLM-5.2 744B, Hunyuan Hy3 295B, Qwen3.5-122B):
+Chosen after comparing candidates (GLM-5.2 744B, Hunyuan Hy3 295B, Qwen3.5-122B):
 
-| criterio | MiMo-V2.5 | GLM-5.2 | Hy3 | Qwen3.5-122B |
+| criterion | MiMo-V2.5 | GLM-5.2 | Hy3 | Qwen3.5-122B |
 |---|---|---|---|---|
-| disco int4 | **~165 GB** ✓ | ~370 GB ✗ (no cabe) | ~157 GB | ~65 GB |
-| activos/token (→ velocidad en disco) | **15B** | 40B | 21B | 10B |
-| router | **idéntico a colibrì** (sigmoid noaux_tc) | idéntico | distinto | distinto |
-| atención | GQA simple ✓ | MLA+DSA (ya hecho) | GQA, experts heterogéneos | Gated DeltaNet (muy difícil en C) |
-| formato checkpoint | **FP8 128×128, igual que GLM** ✓ | — | distinto | distinto |
+| disk int4 | **~165 GB** ✓ | ~370 GB ✗ (doesn't fit) | ~157 GB | ~65 GB |
+| active/token (→ speed on disk) | **15B** | 40B | 21B | 10B |
+| router | **identical to colibri** (sigmoid noaux_tc) | identical | different | different |
+| attention | simple GQA ✓ | MLA+DSA (already done) | GQA, heterogeneous experts | Gated DeltaNet (very hard in C) |
+| checkpoint format | **FP8 128×128, same as GLM** ✓ | — | different | different |
 
-MiMo-V2.5 maximiza el reuso de colibrì: router, converter FP8→int4, streaming, kernels
-AVX2 int4/int8 — todo se hereda casi intacto. Solo cambia la atención (y es *más simple*
-que la MLA+DSA de GLM).
+MiMo-V2.5 maximizes colibri reuse: router, FP8→int4 converter, streaming, AVX2 int4/int8 kernels — everything is inherited almost intact. Only attention changes (and it's *simpler* than GLM's MLA+DSA).
 
-## Arquitectura de MiMo-V2.5 (verificada contra config.json y modeling oficial)
+## MiMo-V2.5 Architecture (verified against official config.json and modeling)
 
-- 48 capas: capa 0 densa (MLP 16384), capas 1–47 MoE (256 experts top-8, inter. 2048, sin shared expert)
-- Atención híbrida: **9 capas full** (índices 0,5,11,17,23,29,35,41,47; 64Q/4KV heads,
-  theta 10M) y **39 capas sliding-window 128** (64Q/8KV heads, theta 10k, con
-  *attention sink bias* por cabeza)
-- head_dim 192 (K) / 128 (V); RoPE parcial no-interleaved sobre los primeros 64 dims
-- QKV fusionado en un solo tensor; `o_proj` aparte y en bf16 en el checkpoint (resto FP8 e4m3)
-- V escalado ×0.707 antes de atención (se pliega en los pesos al convertir)
-- Vocabulario 152.576, byte-BPE estilo GPT-2/Qwen
+- 48 layers: layer 0 dense (MLP 16384), layers 1–47 MoE (256 experts top-8, inter. 2048, no shared expert)
+- Hybrid attention: **9 full layers** (indices 0,5,11,17,23,29,35,41,47; 64Q/4KV heads, theta 10M) and **39 sliding-window 128 layers** (64Q/8KV heads, theta 10k, with *attention sink bias* per head)
+- head_dim 192 (K) / 128 (V); partial non-interleaved RoPE on first 64 dims
+- QKV fused in single tensor; `o_proj` separate and in bf16 in checkpoint (rest FP8 e4m3)
+- V scaled ×0.707 before attention (folded into weights when converting)
+- Vocabulary 152,576, byte-BPE style GPT-2/Qwen
 
-Consecuencia bonita de la ventana deslizante: 39 de 48 capas necesitan KV-cache de solo
-128 tokens — el contexto largo sale casi gratis en RAM comparado con un modelo full-attention.
+Nice consequence of sliding window: 39 of 48 layers need KV-cache of only 128 tokens — long context comes almost free in RAM compared to a full-attention model.
 
-## Método (el de colibrì): validación token-exacta antes que nada
+## Method (colibri's): token-exact validation first
 
-Nada se da por bueno sin reproducir **bit a bit** los tokens de la implementación de
-referencia (`transformers` + `modeling_mimo_v2.py` oficial):
+Nothing is taken for granted without reproducing **bit for bit** the tokens from the reference implementation (`transformers` + official `modeling_mimo_v2.py`):
 
-1. **Oráculo tiny**: modelo aleatorio minúsculo con la arquitectura real (patrón híbrido,
-   RoPE parcial, sink bias, router) generado con el código oficial → tokens de referencia.
-2. **Motor C** (`c/mimo.c`) debe clavar teacher-forcing 32/32 y greedy 20/20 contra el
-   oráculo, con secuencias que crucen la frontera de la ventana deslizante.
-3. Solo entonces: converter del checkpoint real (316 GB FP8 → ~165 GB int4) y primer chat.
+1. **Tiny oracle**: tiny random model with real architecture (hybrid pattern, partial RoPE, sink bias, router) generated with official code → reference tokens.
+2. **C engine** (`c/mimo.c`) must nail teacher-forcing 32/32 and greedy 20/20 against oracle, with sequences that cross the sliding window boundary.
+3. Only then: converter from real checkpoint (316 GB FP8 → ~165 GB int4) and first chat.
 
-## Estado — bitácora
+## Status — log
 
-### 2026-07-10 — nace el proyecto
+### 2026-07-10 — project born
 
-- **Colibrì validado en la máquina de desarrollo** (Xeon W-2140B 8c/16t, 32 GB RAM,
-  WSL2): compilación limpia, tests C 3/3, tests Python 25/25, y el motor GLM reproduce
-  el oráculo `transformers` token-exacto — teacher-forcing 32/32, greedy 20/20 — tanto
-  en el modelo tiny como en un fixture de 313M parámetros con las formas reales.
-- **Disco medido con el patrón de acceso real** (lecturas aleatorias de 19 MB, 8 hilos,
-  `iobench` del upstream sobre fichero de 22 GiB de datos aleatorios): 1.78 GB/s
-  buffered, **2.75 GB/s O_DIRECT** (satura a 8 hilos). Primer intento con fichero de
-  ceros dio 8.5 GB/s falsos por la cache del host — moraleja: bench siempre con datos
-  aleatorios y caches frías.
-- **GLM-5.2 descartado en esta máquina** (~370 GB int4 > 222 GB libres); evaluados
-  Hy3 y Qwen3.5-122B; **elegido MiMo-V2.5** (tabla arriba).
-- **Hechos de arquitectura verificados** contra `config.json` crudo y
-  `modeling_mimo_v2.py` oficial (85 kB). Cinco sorpresas que el resumen de la model card
-  no contaba: QKV fusionado, sink bias en capas SWA, V×0.707, KV heads distintos por tipo
-  de capa (4 full / 8 SWA), y `o_proj` fuera de la cuantización FP8.
-- **Diseño aprobado y spec escrito**:
+- **Colibri validated on dev machine** (Xeon W-2140B 8c/16t, 32 GB RAM, WSL2): clean compilation, C tests 3/3, Python tests 25/25, and GLM engine reproduces `transformers` oracle token-exact — teacher-forcing 32/32, greedy 20/20 — both on tiny model and on 313M parameter fixture with real shapes.
+- **Disk measured with real access pattern** (random 19 MB reads, 8 threads, upstream `iobench` on 22 GiB random data file): 1.78 GB/s buffered, **2.75 GB/s O_DIRECT** (saturates at 8 threads). First attempt with zero file gave 8.5 GB/s false positive from host cache — lesson: always bench with random data and cold caches.
+- **GLM-5.2 ruled out on this machine** (~370 GB int4 > 222 GB free); evaluated Hy3 and Qwen3.5-122B; **MiMo-V2.5 chosen** (table above).
+- **Architecture facts verified** against raw `config.json` and official `modeling_mimo_v2.py` (85 kB). Five surprises the model card summary didn't tell: QKV fused, sink bias in SWA layers, V×0.707, different KV heads per layer type (4 full / 8 SWA), and `o_proj` outside FP8 quantization.
+- **Design approved and spec written**:
   [`docs/superpowers/specs/2026-07-10-peng-mimo-design.md`](docs/superpowers/specs/2026-07-10-peng-mimo-design.md).
-  Enfoque: motor hermano `c/mimo.c` (precedente: `olmoe.c` del upstream), headers y
-  kernels compartidos intactos, MTP y multimodal fuera del v1.
-- Siguiente: plan de implementación detallado, luego fase 1 (oráculo + tokenizer).
+  Approach: sibling engine `c/mimo.c` (precedent: upstream `olmoe.c`), headers and shared kernels intact, MTP and multimodal out of v1.
+- Next: detailed implementation plan, then phase 1 (oracle + tokenizer).
 
-## Hoja de ruta
+## Roadmap
 
-- [x] Validar el motor colibrì upstream en la máquina de desarrollo
-- [x] Medir el disco con el patrón de acceso del motor
-- [x] Elegir modelo objetivo y verificar su arquitectura contra el código oficial
-- [x] Spec de diseño aprobado
-- [x] Fase 1 — oráculo tiny (`tools/make_mimo_oracle.py`) + validación del tokenizer
-- [x] Fase 2 — `c/mimo.c`: atención GQA híbrida → **TF 32/32, greedy 20/20**
-- [x] Fase 3 — streaming de experts + cuantización (int8 token-exacto; packing lossless)
-- [x] Fase 4 — suite completa verde (C 3/3, Python 32/32) + fixture 396M (**TF 20/20**)
-- [x] Fase 5 — converter `--arch mimo` (container ≡ runtime-quant, token a token)
-- [x] **Fase 6 — MiMo-V2.5 completo (311B) respondiendo en esta máquina** ✓ 2026-07-11
+- [x] Validate upstream colibri engine on dev machine
+- [x] Measure disk with engine access pattern
+- [x] Choose target model and verify its architecture against official code
+- [x] Design spec approved
+- [x] Phase 1 — tiny oracle (`tools/make_mimo_oracle.py`) + tokenizer validation
+- [x] Phase 2 — `c/mimo.c`: hybrid GQA attention → **TF 32/32, greedy 20/20**
+- [x] Phase 3 — expert streaming + quantization (int8 token-exact; lossless packing)
+- [x] Phase 4 — full test suite green (C 3/3, Python 32/32) + 396M fixture (**TF 20/20**)
+- [x] Phase 5 — `--arch mimo` converter (container ≡ runtime-quant, token to token)
+- [x] **Phase 6 — full MiMo-V2.5 (311B) answering on this machine** ✓ 2026-07-11
 
-### Fase 6 — resultado (2026-07-11)
+### Phase 6 — result (2026-07-11)
 
 ```
 $ PROMPT='The capital of France is' TEMP=0 SNAP=~/mimo25_i4 ./mimo 64 4 8
 The capital of France is Paris. The capital of Germany
 ```
 
-- Descarga+conversión: 316 GB FP8 → contenedor de **152 GB** (16 shards) en ~2 h de
-  descarga real (~59 MB/s) + conversión solapada
-- Carga: 20 s · densa residente 9.2 GB · RSS ~13.7 GB · **0.31 tok/s** en frío
-  (hit-rate 44%, exactamente la física predicha: disco 2.75 GB/s / ~4.7 GB por token)
-- Dos bugs finales que solo el modelo real podía exponer, ambos documentados en
-  [`findings.md`](findings.md): el límite de 2 GB de `pread()` y el **layout
-  entrelazado por rangos TP del qkv en el checkpoint FP8 oficial** (que el propio
-  `modeling_mimo_v2.py` de Xiaomi no sabe leer — solo vLLM lo des-entrelaza)
-- Contenedor publicado en HF:
-  [`fivetech/MiMo-V2.5-colibri-peng-int4`](https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4)
+- Download+conversion: 316 GB FP8 → container of **152 GB** (16 shards) in ~2 h of real download (~59 MB/s) + overlapped conversion
+- Load: 20 s · dense resident 9.2 GB · RSS ~13.7 GB · **0.31 tok/s** cold (hit-rate 44%, exactly predicted physics: disk 2.75 GB/s / ~4.7 GB per token)
+- Two final bugs only the real model could expose, both documented in [`findings.md`](findings.md): the 2 GB limit of `pread()` and the **range-TP interleaved layout of qkv in the official FP8 checkpoint** (which Xiaomi's own `modeling_mimo_v2.py` doesn't know how to read — only vLLM de-interleaves it)
+- Container published on HF: [`fivetech/MiMo-V2.5-colibri-peng-int4`](https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4)
 
-### Resultados de validación (2026-07-10)
+### Validation results (2026-07-10)
 
-| Gate | Resultado |
+| Gate | Result |
 |---|---|
-| Tokenizer C vs HF AutoTokenizer | 6+4 casos unicode, ids idénticos |
-| Tiny oracle (6 capas, patrón híbrido real) TF / greedy, f32 | **32/32 · 20/20** |
-| Tiny, experts int8 | 32/32 · 20/20 (sin un solo flip) |
-| Tiny, experts int4 packed vs sin packing | byte-idéntico (packing lossless) |
-| Kernels enteros IDOT vs dequant exacto (int8) | tokens idénticos |
-| LRU con evicción forzada (`CAP_RAISE=0`, cap=2) | 20/20 exacto, hit 88%→81% |
-| Fixture 396M (formas reales) TF / greedy, f32 | **20/20 · 8/8** |
-| Container convertido vs cuantización runtime (tiny y fixture) | tokens idénticos, también bajo evicción |
-| ASan/UBSan (TF, greedy, spec-decode, evicción) | limpio |
+| Tokenizer C vs HF AutoTokenizer | 6+4 unicode cases, identical ids |
+| Tiny oracle (6 layers, real hybrid pattern) TF / greedy, f32 | **32/32 · 20/20** |
+| Tiny, experts int8 | 32/32 · 20/20 (not a single flip) |
+| Tiny, experts int4 packed vs unpacked | byte-identical (lossless packing) |
+| IDOT integer kernels vs exact dequant (int8) | identical tokens |
+| LRU with forced eviction (`CAP_RAISE=0`, cap=2) | 20/20 exact, hit 88%→81% |
+| Fixture 396M (real shapes) TF / greedy, f32 | **20/20 · 8/8** |
+| Converted container vs runtime quantization (tiny and fixture) | identical tokens, also under eviction |
+| ASan/UBSan (TF, greedy, spec-decode, eviction) | clean |
 
-Pendiente para la Fase 6, además del disco: sustituir el chat template heredado de GLM
-por el oficial de MiMo (marcado como TODO bloqueante en `mimo.c`) y ajustar los defaults
-de sampling al `generation_config` de MiMo.
+Pending for Phase 6, beyond disk: replace the GLM-inherited chat template with MiMo's official one (marked as blocking TODO in `mimo.c`) and adjust sampling defaults to MiMo's `generation_config`.
 
-## Cómo usarlo
+## How to use it
 
-### Requisitos
+### Requirements
 
-- Linux o WSL2, gcc con OpenMP, CPU con AVX2
-- ≥16 GB de RAM (32 recomendados)
-- ~160 GB en disco rápido local (NVMe; dentro de WSL usa ext4 — **nunca `/mnt/c`**)
-- Python solo si conviertes tú el modelo o usas el chat wrapper (stdlib)
+- Linux or WSL2, gcc with OpenMP, CPU with AVX2
+- ≥16 GB of RAM (32 recommended)
+- ~160 GB on fast local disk (NVMe; inside WSL use ext4 — **never `/mnt/c`**)
+- Python only if you convert the model yourself or use the chat wrapper (stdlib)
 
-### 1. Compilar el motor
+### 1. Compile the engine
 
 ```bash
 git clone https://github.com/FiveTechSoft/peng-mimo && cd peng-mimo/c
-make mimo          # binario ./mimo, C puro + OpenMP, cero dependencias
+make mimo          # binary ./mimo, pure C + OpenMP, zero dependencies
 ```
 
-### 2. Conseguir el modelo (una de dos)
+### 2. Get the model (one of two)
 
-**A — descargar el contenedor ya convertido** (~152 GB) desde
-[`fivetech/MiMo-V2.5-colibri-peng-int4`](https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4):
+**A — download the already-converted container** (~152 GB) from [`fivetech/MiMo-V2.5-colibri-peng-int4`](https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4):
 
 ```bash
 pip install -U huggingface_hub
 hf download fivetech/MiMo-V2.5-colibri-peng-int4 --local-dir ~/mimo25_i4
 ```
 
-**B — convertir tú desde el checkpoint FP8 oficial** (316 GB de descarga, resumible;
-pico de disco ≈ salida + 35 GB):
+**B — convert it yourself from the official FP8 checkpoint** (316 GB download, resumable; disk peak ≈ output + 35 GB):
 
 ```bash
 pip install torch safetensors numpy huggingface_hub
@@ -180,57 +137,46 @@ python tools/convert_fp8_to_int4.py --arch mimo --repo XiaomiMiMo/MiMo-V2.5 \
     --out ~/mimo25_i4 --min-free-gb 45
 ```
 
-### 3. Chat interactivo
+### 3. Interactive chat
 
 ```bash
-python3 c/chat_peng.py                      # SNAP=~/mimo25_i4 por defecto
-SNAP=/otra/ruta NGEN=150 python3 c/chat_peng.py
+python3 c/chat_peng.py                      # SNAP=~/mimo25_i4 by default
+SNAP=/another/path NGEN=150 python3 c/chat_peng.py
 ```
 
 ```
-tú> Dime tres colores en una linea.
-peng> Rojo, azul y verde.
+you> Tell me three colors on one line.
+peng> Red, blue, and green.
 ```
 
-- La conversación **persiste entre turnos** (KV en RAM); `/reset` la borra,
-  `/mas` continúa una respuesta cortada por NGEN, `/salir` termina
-- `THINK=1` activa el bloque de razonamiento de MiMo (por defecto off: a ~0.3 tok/s
-  el razonamiento consume el presupuesto antes de la respuesta visible)
+- Conversation **persists between turns** (KV in RAM); `/reset` clears it, `/more` continues a response cut off by NGEN, `/exit` quits
+- `THINK=1` activates MiMo's reasoning block (off by default: at ~0.3 tok/s reasoning consumes the budget before the visible response)
 
-### 4. Generación directa y knobs
+### 4. Direct generation and knobs
 
 ```bash
-# one-shot sin template (completación cruda):
+# one-shot without template (raw completion):
 PROMPT='The capital of France is' NGEN=8 TEMP=0 SNAP=~/mimo25_i4 ./mimo 64 4 8
 
-# argumentos: ./mimo <cache-slots/capa> <bits-expert> <bits-densa>
-# (el contenedor ya fija los bits reales; 64 4 8 es el punto validado)
+# arguments: ./mimo <cache-slots/layer> <bits-expert> <bits-dense>
+# (the container already sets the real bits; 64 4 8 is the validated point)
 ```
 
-| Variable | Efecto |
+| Variable | Effect |
 |---|---|
-| `NGEN=n` | tokens máximos por respuesta (chat: 80 por defecto) |
-| `TEMP=t` / `NUC=p` | sampling (defaults del generation_config: 1.0 / 0.95; `TEMP=0` = greedy) |
-| `THINK=1` | razonamiento visible de MiMo |
-| `CTX=n` | contexto máximo del chat (4096 por defecto) |
-| `CAP_RAISE=0` | no auto-crecer la cache de experts hasta llenar la RAM |
-| `PIN=stats.txt PIN_GB=n` | fijar los experts más usados en RAM sobrante (herencia colibrì) |
+| `NGEN=n` | max tokens per response (chat: 80 by default) |
+| `TEMP=t` / `NUC=p` | sampling (generation_config defaults: 1.0 / 0.95; `TEMP=0` = greedy) |
+| `THINK=1` | visible MiMo reasoning |
+| `CTX=n` | max chat context (4096 by default) |
+| `CAP_RAISE=0` | don't auto-grow expert cache to fill RAM |
+| `PIN=stats.txt PIN_GB=n` | pin most-used experts to remaining RAM (colibri inheritance) |
 
-### Qué esperar
+### What to expect
 
-En la máquina de desarrollo (8 núcleos, 32 GB RAM, NVMe 2.75 GB/s): carga 20 s y
-**0.43 tok/s** en frío con los defaults del chat (`TOPP=0.7 DIRECT=1`, medidos 2.15×
-sobre el baseline de 0.20). Es un modelo frontera de 311B en hardware de sobremesa:
-paciencia de telegrama, calidad de frontera.
+On the dev machine (8 cores, 32 GB RAM, 2.75 GB/s NVMe): 20 s load and **0.43 tok/s** cold with chat defaults (`TOPP=0.7 DIRECT=1`, measured 2.15× over baseline 0.20). It's a frontier 311B model on desktop hardware: telegram patience, frontier quality.
 
-La cabeza **MTP nativa** de MiMo está integrada (int8, lossless verificado byte a
-byte, aceptación ~64%) pero por defecto desactivada: en hosts disk-bound el lote de
-verificación carga más experts fríos de los que ahorra en forwards. Actívala con
-`DRAFT=2` si tienes RAM para una cache de experts caliente — ahí es donde rinde.
-Más RAM es la palanca nº 1 (la cache escala sola); ver la tabla de predicciones del
-[README de colibrì](docs/README-colibri-upstream.md).
+The native **MTP head** of MiMo is integrated (int8, lossless verified byte for byte, acceptance ~64%) but off by default: on disk-bound hosts the validation batch loads more cold experts than it saves in forwards. Enable it with `DRAFT=2` if you have RAM for a warm expert cache — that's where it shines. More RAM is lever #1 (cache scales itself); see the prediction table in the [colibri README](docs/README-colibri-upstream.md).
 
-## Licencia
+## License
 
-Apache 2.0, como el colibrì original. Los pesos de MiMo-V2.5 los publica Xiaomi bajo su
-propia licencia en [Hugging Face](https://huggingface.co/XiaomiMiMo/MiMo-V2.5).
+Apache 2.0, like the original colibri. MiMo-V2.5 weights are published by Xiaomi under their own license on [Hugging Face](https://huggingface.co/XiaomiMiMo/MiMo-V2.5).
