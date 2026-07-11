@@ -1,7 +1,7 @@
 # roadmap — GPU (CUDA) acceleration plan
 
 Findings and experiments for GPU offload on the reference box (RTX 3060,
-12 GB VRAM + ~23 GB RAM, disk ~2.75 GB/s). Complements `findings.md` §19–§23.
+12 GB VRAM + ~23 GB RAM, disk ~2.75 GB/s). Complements `findings.md` §19–§24.
 The engine runs with GPU (`COLI_CUDA=1 CUDA_DENSE=1`); the speed dial is expert
 hit-rate + bytes read from disk (not dense FLOPs).
 
@@ -11,75 +11,68 @@ hit-rate + bytes read from disk (not dense FLOPs).
   `touch mimo.c backend_cuda.cu` before `make` when editing from Windows.
 - **Makefile**: `mimo` links `$(CUDA_OBJ)`; `-g -rdynamic` for Linux SEGV
   backtraces.
-- **Eager dense upload** (`cuda_upload_dense_all`): after `model_init` and
-  resolving `DRAFT`, uploads densas to VRAM, **frees host copies**, sets
-  `gpu_only=1`, shrinks `resident_bytes`. Order: **dense → RAM pin → VRAM
-  expert tier**. Measured: **99/99 ok, 4.69 GB host freed in ~3–6 s**.
-- **`embed` / `lm_head` never on VRAM** (CPU gather / one matmul per token).
-- **MTP densas** only when `DRAFT>0`.
-- **Complementary VRAM tier**: slice `r[npin..n)` disjoint from the RAM pin;
-  **443 experts / 5.59 GB** with auto budget on this box.
-- **Backend**: `*tensor` cache-hit before requiring host `weights` (SEGV fix).
-- **`gpu_only` fail-loud**: no silent zeros.
-- **`CUDA_EXPERT_GB` auto**: unset + CUDA → `free - 1.5 GB`; `0`=off; `>0`=cap.
-- **PROFILE-GPU**: `cuda-copy` is H2D+D2H only (sync after kernel).
+- **Eager dense upload** + free host; complementary VRAM expert tier (auto GB).
+- **Speed pack (§24):** fused SwiGLU, fast int4/int8 GEMV, sticky device-x,
+  attention AVX2, SERVE speed defaults, `chat_peng.py --bench/--fast`.
+- **cuda-test**: q8/q4/q2/f32 + fused SwiGLU ok on sm_86.
 
-### Measured on full MiMo (2026-07-11) — `findings` §23
+### Measured on full MiMo — `findings` §23–§24
 
-| run | setup | hit | expert-disk | tok/s / wall | notes |
+| run | setup | hit | expert-disk | tok/s | notes |
 |---|---|---|---|---|---|
-| gpu_ed17 | densas + VRAM=pin duplicate 360 | 39.9% | 50 s / 20 tok | 0.20 / 98 s | pre-complementary |
-| complementary | pin 363 + VRAM 443, host densas kept | 52.5% | 29 s | wall ~4× densas-only | pre-eager free |
-| §20 NGEN=8 | host densas kept, cap=3 | 27% | thrash | 0.14 | motivated free-host |
-| **§23 P0** | eager free densas + complementary + auto GB | **46.3%** | **12.4 s / 24 tok** | **0.50 / 48 s** | chat coherent |
+| §23 P0 PROMPT | eager free + complementary | 46.3% | 12.4 s / 24 tok | **0.50** | baseline |
+| **§24 PROMPT** | + fuse/GEMV/AVX2/headroom | **50.5%** | 11.2 s / 19 tok | **0.43** | no win vs §23 yet |
+| §24 SERVE bench | `--bench --fast`, STAT includes prefill | ~43% | — | **0.21 med** | chat template ~33 tok prefill |
 
-Chat-style SERVE turn also streamed a full Rome sentence after ~26 s load.
+Target **1.0 tok/s**: FAIL on this box (PROMPT ~0.43, SERVE-STAT ~0.21).
 
-Bench helper: `c/scripts/run_chat_bench.sh` (PROMPT + PROFILE).
+Bench helpers:
+
+- `c/scripts/run_chat_bench.sh` — PROMPT + PROFILE
+- `c/scripts/run_speed_bench.sh` — `chat_peng.py --bench --fast`
+- `python3 c/chat_peng.py --bench --fast`
 
 ## Remaining problem
 
-Coverage ~800 distinct experts of 12288. Hit ~46% still leaves half the work
-on disk or cold path. After P0, **expert-matmul + attention (~31 s)** outweigh
-**expert-disk (12 s)** on this prompt — so both **more hits** and **faster GPU
-expert kernels** matter. PCIe copy is only **0.76 s** (honest timer).
+Hit ~50% still leaves half the expert work cold. Matmul wall ~16.5 s flat after
+fuse (structure ready; throughput not yet above §23). Attention improved
+(~15→13 s). Disk ~11 s. Path to 1.0 needs **higher hit** and/or **much faster**
+GPU expert path and/or more RAM / native Linux.
 
-WSL2 still burns host CPU on I/O (`findings` §18 overlap).
+WSL2 still burns host CPU on I/O (`findings` §18).
 
 ## Next experiments (priority order)
 
 ### 1. Re-measure P0 — DONE ✅
-See §23. Commit unblocked on speed/correctness smoke.
+See §23.
 
-### 2. Fuse expert matmul on GPU (P1 speed)
-Today 3× (gate/up/down) = 3 H2D + 3 D2H per expert hit. One kernel
-`down(silu(gate(x))*up(x))` should cut the 15 s cuda-compute when VRAM-hot.
-Later: layer-resident activations; CUDA graphs for S=1.
+### 2. Fuse + fast GEMV — DONE ✅ (measured §24)
+Landed; PROMPT 0.43 tok/s (not above 0.50). Keep fuse as default path.
+- [ ] Restore honest `cuda-copy` timer under async streams.
+- [ ] True single-kernel expert MLP (or CUBLAS/int4 tensor core path).
 
-### 3. Fit more experts (hit-rate)
+### 3. Fit more experts (hit-rate) — NEXT
 - `ebits=2` / int2 experts (half the bytes; validate quality).
 - REPIN over `gpu_pin` (VRAM ranking frozen to `.coli_usage` today).
 - Parallel load of the VRAM tier (today sequential + realloc).
+- SWA ring KV (~1.5 GB host back to expert cap).
 
 ### 4. Residual correctness
 - Finding **#18**: post-MTP/v2 ~31/32 TF / 18/20 greedy on tiny int8.
 - Identity gate DRAFT=0 vs n on GPU runs.
 
-### 5. Cleanup / product
-- [x] Remove `[CUDA-DBG]`.
-- [x] Auto `CUDA_EXPERT_GB`.
-- [x] Bench scripts under `c/scripts/`.
-- [ ] `chat_peng.py`: document `COLI_CUDA=1 CUDA_DENSE=1` opt-in (pass-through env already works).
-- [x] Commit after P0 re-measure.
+### 5. Product / tooling
+- [x] `chat_peng.py`: CUDA/PILOT/REPIN defaults, `--bench`, STAT protocol fix.
+- [x] `c/scripts/run_speed_bench.sh`.
+- [ ] Document QUALITY vs FAST in README briefly.
 
 ### 6. Note on `ds4` (antirez/DwarfStar)
 Confirms VRAM → RAM → NVMe hierarchy; not portable code for MiMo.
 
 ## Metrics to watch (always in `PROFILE` / header)
 
-- `tok/s` and **`expert-disk`**.
-- **expert hit-rate** (complementary tier + densas freed on host).
-- `CUDA complementary VRAM tier: N expert (RAM-pin M)` — N and M **disjoint**.
+- `tok/s` and **`expert-disk`** (PROMPT + PROFILE for kernel work).
+- SERVE STAT tok/s = decode / **(prefill+decode)** — do not mix with PROMPT.
+- **expert hit-rate**; complementary VRAM N vs RAM-pin M (**disjoint**).
 - **RSS** after eager dense; LRU `cap` per layer.
-- PROFILE-GPU: real PCIe `cuda-copy` vs compute.
-- VRAM free leftover ~0–1.5 GB headroom after auto expert fill.
+- Gate: mediana ≥ 1.0 on a defined protocol (not yet met).

@@ -491,3 +491,61 @@ on `gpu_pin`) remains the coverage lever.
 
 **Still open (speed / correctness):** fuse expert GEMM (1 H2D/D2H per expert);
 REPIN for `gpu_pin`; finding #18 oracle ~1-position drift; WSL2 I/O CPU cost.
+
+### 24. Speed pack re-measure (2026-07-11 evening) — fuse + fast GEMV + SERVE bench
+
+**Code landed (same day after §23):**
+
+- `coli_cuda_swiglu`: one H2D of `x`, fused gate+up+silu (int4/int8), down GEMV, one D2H of `y`.
+- Fast GEMV: shared-mem `x`, warp-per-output, shuffle reduce; sticky device-`x` (`REUSE_X`) for decode S=1.
+- Attention Q·K / V-accumulate AVX2 (+FMA when available).
+- SERVE defaults when env unset: `DIRECT=1`, `I4S=1`, `PILOT=1`, `REPIN=32`; VRAM expert headroom 1.5→1.0 GB.
+- `chat_peng.py`: `--bench` / `--fast` / `--quality`, STAT protocol fixed (skip blank line after `END`), CUDA/PILOT/REPIN defaults.
+- Unit test: `make cuda-test` → `q8/q4/q2/f32 + fused SwiGLU ok`.
+
+**PROMPT mode** (same prompt as §23, `NGEN=24`, `COLI_CUDA=1 CUDA_DENSE=1 DIRECT=1 TOPP=0.6 THINK=0 TEMP=0.7`):
+
+| metric | §23 P0 | §24 speed pack |
+|---|---|---|
+| tok/s (engine) | **0.50** (24 tok / 48.1 s) | **0.43** (19 tok / 44.0 s) |
+| hit-rate | 46.3% | **50.5%** |
+| VRAM experts | 443 / 5.59 GB | **483 / 6.09 GB** (tighter headroom) |
+| RAM pin | 361 | 362 |
+| expert-disk | 12.36 s | 11.21 s |
+| expert-matmul | 16.23 s | 16.52 s |
+| attention | 15.25 s | **12.69 s** |
+| cuda-copy (PROFILE) | 0.76 s | 0.00 s† |
+| RSS mid-gen | 13.64 GB | 13.66 GB |
+| load (wall) | ~51 s | ~53 s |
+
+† Async H2D/D2H no longer isolates PCIe in `g_copy_sec` (timer under-counts). Restore honest copy accounting later.
+
+Output coherent: *"Rome is the Eternal Capital of Italy…"*. Exit 0.
+
+**Reading:** attention improved (~2.5 s). Hit and VRAM expert count up slightly. **tok/s did not beat §23** on this box — matmul wall flat (~16.5 s); fuse/GEMV are correctness-preserving structure work but not yet a clear throughput win at 46–50% hit. Ceiling still hit-rate + disk + remaining CPU attention.
+
+**SERVE / `chat_peng.py --bench --fast`** (1 warmup + 3 runs, `/reset` each, NGEN=24, chat template, target 1.0):
+
+| run | tokens | tok/s (STAT) | hit | wall |
+|---|---|---|---|---|
+| warmup | 15 | 0.18 | 41% | 84 s |
+| meas 1 | 18 | 0.21 | 43% | 86 s |
+| meas 2 | 24 | 0.21 | 46% | 117 s |
+| meas 3 | 17 | 0.19 | 43% | 88 s |
+| **median** | — | **0.21** | **43%** | — |
+
+**GATE 1.0 tok/s: FAIL** (shortfall ~0.79). Load READY ~30 s. Prefill each turn ~33 template tokens; STAT = `prod / (prefill+decode)`, so SERVE numbers are **not** comparable to PROMPT decode-only 0.43–0.50. Use PROMPT + `PROFILE=1` for kernel apples-to-apples; use `--bench` for end-to-end chat UX.
+
+**How to reproduce:**
+
+```bash
+# PROMPT profile (findings table)
+SNAP=/root/mimo25_i4 COLI_CUDA=1 CUDA_DENSE=1 DIRECT=1 TOPP=0.6 THINK=0 \
+  NGEN=24 PROFILE=1 PROMPT='Write one short sentence about Rome.' ./c/mimo 64 4 8
+
+# SERVE multi-run gate
+SNAP=/root/mimo25_i4 python3 c/chat_peng.py --bench --fast --runs 3 --warmup 1 --ngen 24
+# or: c/scripts/run_speed_bench.sh
+```
+
+**Still open (speed):** true single-kernel expert MLP; REPIN on `gpu_pin`; int2 experts; SWA ring KV (free ~1.5 GB for cache); honest async PCIe timer; native Linux vs WSL2 I/O; more host RAM. Quality/exactness: finding #18.

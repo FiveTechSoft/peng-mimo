@@ -69,6 +69,33 @@ int main(int argc, char **argv) {
         if (count != 2 || bytes != 22) return 1;
     } else if (count != 4 || bytes != 70) return 1;
 
+    /* Fused SwiGLU: y = down(silu(gate(x))*up(x)). Tiny f32 dims D=2 I=2 S=1. */
+    {
+        const float x1[2] = {1.0f, -1.0f};
+        /* gate rows: [1,0], [0,1]  → gate(x)=x; up same; down identity */
+        const float Wg[4] = {1, 0, 0, 1};
+        const float Wu[4] = {1, 0, 0, 1};
+        const float Wd[4] = {1, 0, 0, 1};
+        float yf[2];
+        ColiCudaTensor *tg = nullptr, *tu = nullptr, *td = nullptr;
+        if (!coli_cuda_swiglu(&tg, &tu, &td, yf, x1,
+                             Wg, nullptr, 0, Wu, nullptr, 0, Wd, nullptr, 0,
+                             1, 2, 2, d0, 0)) return 1;
+        /* silu(1)*1 = 1/(1+e^-1), silu(-1)*(-1) = (-1)/(1+e) * -1 */
+        float s0 = 1.0f / (1.0f + std::exp(-1.0f));
+        float s1 = (-1.0f) / (1.0f + std::exp(1.0f));
+        float want_s[2] = {s0 * 1.0f, s1 * (-1.0f)};
+        if (!close_enough(yf, want_s, 2)) return 1;
+        /* Second call: sticky REUSE_X + null host weights (already on device). */
+        if (!coli_cuda_swiglu(&tg, &tu, &td, yf, x1,
+                             nullptr, nullptr, 0, nullptr, nullptr, 0, nullptr, nullptr, 0,
+                             1, 2, 2, d0, COLI_CUDA_SWIGLU_REUSE_X)) return 1;
+        if (!close_enough(yf, want_s, 2)) return 1;
+        coli_cuda_tensor_free(tg);
+        coli_cuda_tensor_free(tu);
+        coli_cuda_tensor_free(td);
+    }
+
     coli_cuda_tensor_free(t8);
     coli_cuda_tensor_free(t4);
     coli_cuda_tensor_free(t2);
@@ -76,6 +103,6 @@ int main(int argc, char **argv) {
     coli_cuda_stats(-1, &count, &bytes);
     if (count || bytes) return 1;
     coli_cuda_shutdown();
-    std::printf("cuda backend: q8/q4/q2/f32 correctness ok on %d device(s)\n", ndev);
+    std::printf("cuda backend: q8/q4/q2/f32 + fused SwiGLU ok on %d device(s)\n", ndev);
     return 0;
 }

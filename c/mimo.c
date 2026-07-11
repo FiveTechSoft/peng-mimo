@@ -571,6 +571,39 @@ static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const ui
  * EN: the int4 kernel choice is S-dependent; the speculative verify batch must reproduce
  * S=1 numerics bit-exactly or greedy with DRAFT>0 diverges. g_fw1 pins the choice to S=1. */
 static int g_fw1=0;
+static const void *qt_wptr(const QT *w){
+    if(w->fmt==0) return (const void*)w->qf;
+    if(w->fmt==1) return (const void*)w->q8;
+    return (const void*)w->q4;   /* int4 and int2 share q4 packing */
+}
+#ifdef COLI_CUDA
+/* Fused SwiGLU on GPU. flags: COLI_CUDA_SWIGLU_REUSE_X for sticky device-x (decode). */
+static int swiglu_qt(float *y, const float *x, QT *g, QT *u, QT *d, int S, int flags){
+    if(!g_cuda_enabled || S<1) return 0;
+    if(!g->cuda_eligible||!u->cuda_eligible||!d->cuda_eligible) return 0;
+    if(g->cuda_failed||u->cuda_failed||d->cuda_failed) return 0;
+    if(g->cuda_device!=u->cuda_device||g->cuda_device!=d->cuda_device) return 0;
+    if(omp_in_parallel()) return 0;
+    int D=g->I, I=g->O;
+    if(u->I!=D||u->O!=I||d->I!=I||d->O!=D) return 0;
+    if(coli_cuda_swiglu(&g->cuda,&u->cuda,&d->cuda,y,x,
+                        qt_wptr(g),g->s,g->fmt,
+                        qt_wptr(u),u->s,u->fmt,
+                        qt_wptr(d),d->s,d->fmt,
+                        S,D,I,g->cuda_device,flags))
+        return 1;
+    if(g->gpu_only||u->gpu_only||d->gpu_only){
+        fprintf(stderr,"[CUDA] fatal: fused SwiGLU failed on gpu_only expert/dense device %d\n",
+                g->cuda_device);
+        exit(1);
+    }
+    g->cuda_failed=u->cuda_failed=d->cuda_failed=1;
+    coli_cuda_x_invalidate(g->cuda_device);
+    fprintf(stderr,"[CUDA] fused SwiGLU failed device %d; falling back to 3x matmul\n",
+            g->cuda_device);
+    return 0;
+}
+#endif
 static void matmul_qt(float *y, const float *x, QT *w, int S){
 #ifdef COLI_CUDA
     /* VRAM-only tensor (dense freed after eager upload, or complementary expert
@@ -1304,14 +1337,32 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         int pos=pos_base+s, g=h/group;
         int lo = (swa && c->sliding_window>0) ? pos-c->sliding_window+1 : 0;
         if(lo<0) lo=0;
-        if(lo<m->kv_start[layer]) lo=m->kv_start[layer];  /* KV parziale (riga MTP: valida da kv_start) */
+        if(lo<m->kv_start[layer]) lo=m->kv_start[layer];
         int nt=pos+1-lo;
         float scb[4096]; float *sc = nt<=4096 ? scb : falloc(nt);
         const float *q=qkv+(int64_t)s*rowsz+(int64_t)h*hd;
         float mx=-1e30f;
         for(int j=0;j<nt;j++){
             const float *kt=Kc+(int64_t)(lo+j)*ks+(int64_t)g*hd;
-            float a=0; for(int d=0;d<hd;d++) a+=q[d]*kt[d];
+            float a=0; int d=0;
+#if defined(__AVX2__)
+            {
+                __m256 acc=_mm256_setzero_ps();
+                for(; d+8<=hd; d+=8){
+                    __m256 qv=_mm256_loadu_ps(q+d), kv=_mm256_loadu_ps(kt+d);
+#if defined(__FMA__)
+                    acc=_mm256_fmadd_ps(qv,kv,acc);
+#else
+                    acc=_mm256_add_ps(acc,_mm256_mul_ps(qv,kv));
+#endif
+                }
+                __m128 t=_mm_add_ps(_mm256_castps256_ps128(acc),_mm256_extractf128_ps(acc,1));
+                t=_mm_add_ps(t,_mm_movehl_ps(t,t));
+                t=_mm_add_ss(t,_mm_shuffle_ps(t,t,1));
+                a=_mm_cvtss_f32(t);
+            }
+#endif
+            for(;d<hd;d++) a+=q[d]*kt[d];
             a*=scale; sc[j]=a; if(a>mx) mx=a;
         }
         float den=0;
@@ -1322,7 +1373,22 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         for(int d=0;d<vd;d++) cx[d]=0;
         for(int j=0;j<nt;j++){
             const float *vt=Vc+(int64_t)(lo+j)*vs+(int64_t)g*vd;
-            float a=sc[j]*inv; for(int d=0;d<vd;d++) cx[d]+=a*vt[d];
+            float a=sc[j]*inv; int d=0;
+#if defined(__AVX2__)
+            {
+                __m256 av=_mm256_set1_ps(a);
+                for(; d+8<=vd; d+=8){
+                    __m256 c=_mm256_loadu_ps(cx+d), vv=_mm256_loadu_ps(vt+d);
+#if defined(__FMA__)
+                    c=_mm256_fmadd_ps(av,vv,c);
+#else
+                    c=_mm256_add_ps(c,_mm256_mul_ps(av,vv));
+#endif
+                    _mm256_storeu_ps(cx+d,c);
+                }
+            }
+#endif
+            for(;d<vd;d++) cx[d]+=a*vt[d];
         }
         if(sc!=scb) free(sc);
     }
@@ -1402,6 +1468,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
     int *rk=malloc(S*sizeof(int));                            /* slot top-k della riga (per contrib) */
     float *contrib = g_fw1 ? falloc((int64_t)S*K*D) : NULL;   /* verifica: contributi per (pos,k) */
+#ifdef COLI_CUDA
+    /* Decode S=1: all experts pack the same single row → sticky device-x. Prefill
+     * (S>1) may pack different row subsets → always re-H2D. */
+    int cuda_x_live=0;
+    if(g_cuda_enabled && g_cuda_ndev>0) coli_cuda_x_invalidate(g_cuda_devices[0]);
+#endif
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64], jq[64]; int nmiss=0;
@@ -1454,10 +1526,25 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #endif
             for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)rows[r]*D, D*sizeof(float));
             double t0=now_s();
-            matmul_qt(gg, xg, &e->g, nr);
-            matmul_qt(uu, xg, &e->u, nr);
-            for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-            matmul_qt(hh, gg, &e->d, nr);
+#ifdef COLI_CUDA
+            { int fl=0;
+              /* Sticky x only when packing is identical: decode S=1 or full-batch nr==S. */
+              if(cuda_x_live && (S==1 || nr==S)) fl=COLI_CUDA_SWIGLU_REUSE_X;
+              if(swiglu_qt(hh, xg, &e->g, &e->u, &e->d, nr, fl)){
+                  if(S==1 || nr==S) cuda_x_live=1;
+              } else
+#endif
+            { 
+#ifdef COLI_CUDA
+              cuda_x_live=0;
+#endif
+              matmul_qt(gg, xg, &e->g, nr);
+              matmul_qt(uu, xg, &e->u, nr);
+              for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+              matmul_qt(hh, gg, &e->d, nr); }
+#ifdef COLI_CUDA
+            }
+#endif
             for(int r=0;r<nr;r++){ float *hr=hh+(int64_t)r*D;
                 if(contrib) memcpy(contrib+((int64_t)rows[r]*K+rk[r])*D, hr, D*sizeof(float));
                 else { float *os=out+(int64_t)rows[r]*D, wgt=rw[r];
@@ -1489,12 +1576,16 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 }
 
 static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
+#ifdef COLI_CUDA
+    if(swiglu_qt(out, x, &l->gate_proj, &l->up_proj, &l->down_proj, S, 0)) return;
+#endif
     float *g=falloc((int64_t)S*I), *u=falloc((int64_t)S*I);
     matmul_qt(g, x, &l->gate_proj, S);
     matmul_qt(u, x, &l->up_proj,   S);
     for(int64_t i=0;i<(int64_t)S*I;i++) g[i]=siluf(g[i])*u[i];
     matmul_qt(out, g, &l->down_proj, S);
     free(g); free(u);
+    (void)D;
 }
 
 /* forward di UN layer */
@@ -2344,7 +2435,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
         double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
         int placed_n[COLI_CUDA_MAX_DEVICES]={0};
         double safe_total=0;
-        const double headroom=1.5e9;              /* scratch x/y + fragmentation */
+        const double headroom=1.0e9;              /* scratch x/y + frag; tighter → more expert VRAM */
         for(int i=0;i<g_cuda_ndev;i++){
             size_t free_b=0,total_b=0;
             if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
@@ -2548,20 +2639,23 @@ int main(int argc, char **argv){
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* draft per forward; -1 = auto dopo il
                                                            * load (testa MTP presente -> 3, no -> 0) */
-    g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
+    /* SERVE/chat: speed-oriented defaults (override with env). Oracle/TF keep exact path. */
+    int serve_mode = getenv("SERVE") && atoi(getenv("SERVE"));
+    g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):(serve_mode?1:0);
     g_overlap = getenv("OVERLAP")?atoi(getenv("OVERLAP")):1;   /* 0 = load/compute a fasi (A/B) */
     { const char *e=getenv("OVERLAP_T"); if(e){ g_overlap_t=atoi(e);
         if(g_overlap_t<1)g_overlap_t=1; if(g_overlap_t>16)g_overlap_t=16; } }
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
-    { const char *e=getenv("I4S"); if(e) g_i4s=atoi(e); }   /* soglia S per IDOT int4 (doc: 1=anche
-                                                            * decode S=1 su AVX2, 2=default autore).
-                                                            * Nota: a S=1 su AVX2 cambia l'arrotondamento
-                                                            * del decode (non token-exact): solo per chat. */
-    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
+    { const char *e=getenv("I4S");
+      if(e) g_i4s=atoi(e);
+      else if(serve_mode) g_i4s=1;   /* chat: int4 IDOT even at S=1 (faster; not token-exact) */
+    }
+    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):(serve_mode?32:0);
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.95f;  /* 0.95 = generation_config MiMo-V2.5 */
     g_looka = getenv("LOOKA")?1:0;                    /* PILOT accuracy measurement (no prefetch) */
-    g_pilot = getenv("PILOT")?1:0;                   /* router-lookahead async WILLNEED */
+    /* PILOT helps disk-bound cold tokens; default ON in SERVE when not set. */
+    g_pilot = getenv("PILOT")?atoi(getenv("PILOT")):(serve_mode?1:0);
     { const char *e=getenv("PILOT_K"); if(e) g_pilot_k=atoi(e); }
     if(g_looka) atexit(looka_print);                 /* print recall at end of run (any exit) */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
