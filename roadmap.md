@@ -21,10 +21,11 @@ hit-rate + bytes read from disk (not dense FLOPs).
 | run | setup | hit | expert-disk | tok/s | notes |
 |---|---|---|---|---|---|
 | §23 P0 PROMPT | eager free + complementary | 46.3% | 12.4 s / 24 tok | **0.50** | baseline |
-| **§24 PROMPT** | + fuse/GEMV/AVX2/headroom | **50.5%** | 11.2 s / 19 tok | **0.43** | no win vs §23 yet |
-| §24 SERVE bench | `--bench --fast`, STAT includes prefill | ~43% | — | **0.21 med** | chat template ~33 tok prefill |
+| §24 PROMPT | fuse/GEMV/AVX2 | 50.5% | 11.2 s | 0.43 | intermediate |
+| **§25 PROMPT** | **GPU-first + moe_acc + cap11** | **60%** | **8.9 s** | **0.55** | best so far |
+| §24 SERVE bench | `--bench --fast` (prefill in STAT) | ~43% | — | 0.21 med | not comparable |
 
-Target **1.0 tok/s**: FAIL on this box (PROMPT ~0.43, SERVE-STAT ~0.21).
+Target **1.0 tok/s**: FAIL. Best **0.55** PROMPT on 23 GB + RTX 3060 + WSL2.
 
 Bench helpers:
 
@@ -46,16 +47,18 @@ WSL2 still burns host CPU on I/O (`findings` §18).
 ### 1. Re-measure P0 — DONE ✅
 See §23.
 
-### 2. Fuse + fast GEMV — DONE ✅ (measured §24)
-Landed; PROMPT 0.43 tok/s (not above 0.50). Keep fuse as default path.
+### 2. Fuse + fast GEMV + moe_acc + GPU-first — DONE ✅ (§24–§25)
+PROMPT **0.55 tok/s**, hit 60%. Keep as default.
 - [ ] Restore honest `cuda-copy` timer under async streams.
-- [ ] True single-kernel expert MLP (or CUBLAS/int4 tensor core path).
+- [ ] Tensor-core / better tiled int4 GEMV (matmul still ~17 s).
 
-### 3. Fit more experts (hit-rate) — NEXT
+### 3. Fit more experts (hit-rate) — NEXT for 1.0
+- Host **32–64 GB RAM** (biggest lever on this architecture).
 - `ebits=2` / int2 experts (half the bytes; validate quality).
-- REPIN over `gpu_pin` (VRAM ranking frozen to `.coli_usage` today).
-- Parallel load of the VRAM tier (today sequential + realloc).
+- REPIN over `gpu_pin` live ranking.
+- Parallel load of the VRAM tier.
 - SWA ring KV (~1.5 GB host back to expert cap).
+- Native Linux vs WSL2 I/O tax.
 
 ### 4. Residual correctness
 - Finding **#18**: post-MTP/v2 ~31/32 TF / 18/20 greedy on tiny int8.

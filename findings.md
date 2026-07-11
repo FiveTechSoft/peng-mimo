@@ -549,3 +549,43 @@ SNAP=/root/mimo25_i4 python3 c/chat_peng.py --bench --fast --runs 3 --warmup 1 -
 ```
 
 **Still open (speed):** true single-kernel expert MLP; REPIN on `gpu_pin`; int2 experts; SWA ring KV (free ~1.5 GB for cache); honest async PCIe timer; native Linux vs WSL2 I/O; more host RAM. Quality/exactness: finding #18.
+
+### 25. GPU-first hot store + MoE device accumulate (2026-07-11 night) — **0.55 tok/s**
+
+**Code:**
+
+- `coli_cuda_moe_begin/acc/end`: decode S=1 accumulates `y += w*swiglu(x)` on GPU with **one H2D + one D2H per MoE layer** (no per-expert sync/D2H).
+- **GPU-first pin**: hottest experts from `.coli_usage` go to **VRAM first**, then next band to RAM pin (was reversed: hottest on CPU, cooler on GPU).
+- Tighter RAM budget (92% MemAvailable, page-cache reserve 1.5 GB, `PC_GB=` override) → LRU cap ~11.
+- VRAM headroom 0.5 GB → **522 experts / 6.59 GB** on 3060 12 GB.
+- CUDA implies `I4S=1` when unset (CPU int4 decode uses IDOT).
+
+**PROMPT** (`NGEN=24`, Rome sentence, `COLI_CUDA=1 CUDA_DENSE=1 DIRECT=1 TOPP=0.55 TEMP=0.7`):
+
+| metric | §23 | §24 pack | **§25 GPU-first+acc** |
+|---|---|---|---|
+| **tok/s** | 0.50 | 0.43 | **0.55** |
+| hit-rate | 46% | 50% | **60%** |
+| VRAM experts | 443 | 483 | **522** (hottest) |
+| VRAM calls / gen | — | 796 | **1310** |
+| expert-disk | 12.4 s | 11.2 s | **8.9 s** |
+| expert-matmul | 16.2 s | 16.5 s | **16.8 s** |
+| attention | 15.3 s | 12.7 s | **13.4 s** |
+| LRU cap | 7 | — | **11** |
+
+**Gate 1.0 tok/s: still FAIL.** Best measured on this box: **0.55 tok/s** (~1.8 s/token). Physics on 23 GB + 3060 + WSL2:
+
+```text
+~9 s disk + ~17 s matmul + ~13 s attn  over 24 tok  ≈ 0.55 tok/s
+To 1.0 need ≈2× less wall (more hit + faster GEMV/attn and/or more RAM / native Linux)
+```
+
+**Path to 1.0 (ordered):**
+
+1. **More host RAM (32–64 GB)** — raise pin+LRU, hit → 80%+, cut disk toward 0.
+2. **Faster GPU expert GEMV** (tensor-core / better tiling) — matmul is still ~17 s.
+3. **SWA ring KV** — reclaim ~1.5 GB for experts.
+4. **int2 experts** — half disk+VRAM bytes.
+5. **Native Linux** — drop WSL I/O CPU tax (§18).
+
+Reproduce: `TOPP=0.55 COLI_CUDA=1 CUDA_DENSE=1 DIRECT=1 NGEN=24 PROFILE=1 PROMPT='…' ./mimo 64 4 8`

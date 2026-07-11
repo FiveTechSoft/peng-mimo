@@ -29,10 +29,13 @@ typedef struct {
     size_t x_cap, y_cap;
     float *ma, *mb;
     size_t ma_cap, mb_cap;
+    float *yacc;                                 /* MoE accumulate: sum w*swiglu on device */
+    size_t yacc_cap;
     size_t tensor_count, tensor_bytes;
     /* Sticky device-x for decode: many GPU experts share the same packed x. */
     int sticky_S, sticky_D;
     int sticky_valid;
+    int moe_active, moe_S, moe_D;                /* open moe_begin…end window */
     cudaStream_t stream;
 } DeviceContext;
 
@@ -262,6 +265,16 @@ __global__ static void silu_mul_kernel(float *g, const float *u, int n) {
     }
 }
 
+__global__ static void axpy_kernel(float *y, const float *x, float a, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) y[i] += a * x[i];
+}
+
+__global__ static void zero_kernel(float *y, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) y[i] = 0.0f;
+}
+
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) return 1;
     if (*ptr) cudaFree(*ptr);
@@ -384,10 +397,12 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->y) cudaFree(ctx->y);
         if (ctx->ma) cudaFree(ctx->ma);
         if (ctx->mb) cudaFree(ctx->mb);
-        ctx->x = ctx->y = ctx->ma = ctx->mb = nullptr;
-        ctx->x_cap = ctx->y_cap = ctx->ma_cap = ctx->mb_cap = 0;
+        if (ctx->yacc) cudaFree(ctx->yacc);
+        ctx->x = ctx->y = ctx->ma = ctx->mb = ctx->yacc = nullptr;
+        ctx->x_cap = ctx->y_cap = ctx->ma_cap = ctx->mb_cap = ctx->yacc_cap = 0;
         ctx->stream = nullptr;
         ctx->sticky_valid = 0;
+        ctx->moe_active = 0;
     }
     g_nctx = 0;
 }
@@ -473,7 +488,93 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
 
 extern "C" void coli_cuda_x_invalidate(int device) {
     DeviceContext *ctx = find_ctx(device);
-    if (ctx) ctx->sticky_valid = 0;
+    if (ctx) { ctx->sticky_valid = 0; ctx->moe_active = 0; }
+}
+
+/* ---- MoE layer accumulate: 1× H2D x, N× (swiglu + axpy) no sync, 1× D2H ---- */
+
+extern "C" int coli_cuda_moe_begin(int device, const float *x, int S, int D) {
+    if (S < 1 || D < 1 || !x) return 0;
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    size_t xb = (size_t)S * D * sizeof(float);
+    size_t yb = xb;
+    size_t mb = (size_t)S * 16384 * sizeof(float); /* upper bound for dense I; experts use 2048 */
+    if (!reserve(&ctx->x, &ctx->x_cap, xb) ||
+        !reserve(&ctx->y, &ctx->y_cap, yb) ||
+        !reserve(&ctx->yacc, &ctx->yacc_cap, yb) ||
+        !reserve(&ctx->ma, &ctx->ma_cap, mb) ||
+        !reserve(&ctx->mb, &ctx->mb_cap, mb)) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(ctx->x, x, xb, cudaMemcpyHostToDevice, ctx->stream), "moe x H2D"))
+        return 0;
+    {
+        int n = S * D;
+        int block = 256;
+        int grid = (n + block - 1) / block;
+        zero_kernel<<<grid, block, 0, ctx->stream>>>(ctx->yacc, n);
+        if (!cuda_ok(cudaGetLastError(), "moe zero")) return 0;
+    }
+    ctx->sticky_S = S; ctx->sticky_D = D; ctx->sticky_valid = 1;
+    ctx->moe_active = 1; ctx->moe_S = S; ctx->moe_D = D;
+    return 1;
+}
+
+extern "C" int coli_cuda_moe_acc(ColiCudaTensor **gate, ColiCudaTensor **up, ColiCudaTensor **down,
+                                  const void *gw, const float *gs, int gfmt,
+                                  const void *uw, const float *us, int ufmt,
+                                  const void *dw, const float *ds, int dfmt,
+                                  float weight, int S, int D, int I, int device) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx || !ctx->moe_active || ctx->moe_S != S || ctx->moe_D != D) return 0;
+    if (!select_ctx(ctx)) return 0;
+    if (!coli_cuda_tensor_upload(gate, gw, gs, gfmt, D, I, device)) return 0;
+    if (!coli_cuda_tensor_upload(up,   uw, us, ufmt, D, I, device)) return 0;
+    if (!coli_cuda_tensor_upload(down, dw, ds, dfmt, I, D, device)) return 0;
+    ColiCudaTensor *tg = *gate, *tu = *up, *td = *down;
+    if (tg->device != device || tu->device != device || td->device != device) return 0;
+    /* Ensure mid buffer fits I (experts 2048; dense 16384). */
+    size_t mb = (size_t)S * I * sizeof(float);
+    if (!reserve(&ctx->ma, &ctx->ma_cap, mb) || !reserve(&ctx->mb, &ctx->mb_cap, mb)) return 0;
+
+    int fused_gu = launch_gate_up_silu(ctx->ma, ctx->x, tg, tu, S, D, I, ctx->stream);
+    if (!fused_gu) {
+        if (!launch_quant_matmul(ctx->ma, ctx->x, tg, S, D, I, ctx->stream)) return 0;
+        if (!launch_quant_matmul(ctx->mb, ctx->x, tu, S, D, I, ctx->stream)) return 0;
+        int n = S * I;
+        int block = 256;
+        int grid = (n + block - 1) / block;
+        silu_mul_kernel<<<grid, block, 0, ctx->stream>>>(ctx->ma, ctx->mb, n);
+        if (!cuda_ok(cudaGetLastError(), "moe silu")) return 0;
+    }
+    if (!launch_quant_matmul(ctx->y, ctx->ma, td, S, I, D, ctx->stream)) return 0;
+    {
+        int n = S * D;
+        int block = 256;
+        int grid = (n + block - 1) / block;
+        axpy_kernel<<<grid, block, 0, ctx->stream>>>(ctx->yacc, ctx->y, weight, n);
+        if (!cuda_ok(cudaGetLastError(), "moe axpy")) return 0;
+    }
+    /* No stream sync — end() drains once. */
+    return 1;
+}
+
+extern "C" int coli_cuda_moe_end(float *y_host, int S, int D, int device) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx || !ctx->moe_active) return 0;
+    if (!select_ctx(ctx)) return 0;
+    if (ctx->moe_S != S || ctx->moe_D != D) { ctx->moe_active = 0; return 0; }
+    size_t yb = (size_t)S * D * sizeof(float);
+    if (!cuda_ok(cudaMemcpyAsync(y_host, ctx->yacc, yb, cudaMemcpyDeviceToHost, ctx->stream),
+                 "moe y D2H")) {
+        ctx->moe_active = 0;
+        return 0;
+    }
+    if (!cuda_ok(cudaStreamSynchronize(ctx->stream), "moe sync")) {
+        ctx->moe_active = 0;
+        return 0;
+    }
+    ctx->moe_active = 0;
+    return 1;
 }
 
 extern "C" int coli_cuda_swiglu(ColiCudaTensor **gate, ColiCudaTensor **up, ColiCudaTensor **down,

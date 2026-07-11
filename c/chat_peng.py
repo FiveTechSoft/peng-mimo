@@ -48,11 +48,12 @@ def build_env(args) -> dict:
 
     # Speed profile defaults — user/env always wins if already set
     if args.fast:
-        temp_d, nuc_d, topp_d = "0.7", "0.9", "0.65"
+        # TOPP=0.55 trims more experts (speed); quality may soften slightly
+        temp_d, nuc_d, topp_d = "0.7", "0.9", "0.55"
     elif args.quality:
         temp_d, nuc_d, topp_d = "0.4", "0.85", "0.85"
     else:
-        temp_d, nuc_d, topp_d = "0.6", "0.9", "0.7"
+        temp_d, nuc_d, topp_d = "0.6", "0.9", "0.65"
 
     env = dict(os.environ)
     env.update({

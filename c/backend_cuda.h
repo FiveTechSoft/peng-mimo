@@ -55,6 +55,19 @@ int coli_cuda_swiglu(ColiCudaTensor **gate, ColiCudaTensor **up, ColiCudaTensor 
                      const void *dw, const float *ds, int dfmt,
                      int S, int D, int I, int device, int flags);
 
+/*
+ * Decode MoE accumulate path (S=1 typically): one H2D of x, N experts with
+ * y_acc += w * swiglu(x) on device (no per-expert D2H/sync), one D2H of y_acc.
+ * begin → acc* → end. end() is a no-op if begin never succeeded.
+ */
+int coli_cuda_moe_begin(int device, const float *x, int S, int D);
+int coli_cuda_moe_acc(ColiCudaTensor **gate, ColiCudaTensor **up, ColiCudaTensor **down,
+                      const void *gw, const float *gs, int gfmt,
+                      const void *uw, const float *us, int ufmt,
+                      const void *dw, const float *ds, int dfmt,
+                      float weight, int S, int D, int I, int device);
+int coli_cuda_moe_end(float *y_host, int S, int D, int device);
+
 /* Drop sticky device-x (call when host x packing may change). */
 void coli_cuda_x_invalidate(int device);
 
