@@ -4,6 +4,9 @@
 
 **peng** adapts the technology from [colibri](https://github.com/JustVugg/colibri) (pure C MoE inference engine with expert streaming from disk) to run **Xiaomi's MiMo-V2.5 (311B parameters, 15B active)** on consumer hardware.
 
+> 📦 **Ready-to-run model** (no conversion needed, 152 GB, all 16 shards uploaded and validated):
+> **https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4**
+
 The name comes from the mythological bird from the Chinese *Zhuangzi*: a colossal creature that stays in flight by riding a whirlwind — much like this engine keeps "airborne" a 311B parameter model on a continuous stream of NVMe reads, on a machine with 32 GB of RAM.
 
 Derived project from colibri (Apache 2.0, © JustVugg). The original upstream engine README is at [`docs/README-colibri-upstream.md`](docs/README-colibri-upstream.md).
