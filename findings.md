@@ -200,6 +200,54 @@ se encontraba A SÍ MISMO (el patrón estaba en su propia línea de comando) —
 anidamiento de comillas), y patrones de pgrep que no aparezcan en el comando del
 propio monitor (`pgrep -f 'python.*convert_fp8'`).
 
+## El bug final: el checkpoint que ni su propio código sabe leer
+
+### 13. Los qkv del checkpoint FP8 vienen entrelazados por rangos de tensor-parallelism
+
+El hallazgo estrella del proyecto. Con TODO validado (motor token-exacto en dos modelos
+de prueba, converter byte-exacto contra re-derivación, tokenizer exacto), el modelo
+real generaba basura. Bisección capa a capa (referencia numpy construida desde los
+mismos tensores del contenedor): el motor calculaba PERFECTO — 6 dígitos significativos
+de acuerdo en las 48 capas. La divergencia estaba entre lo que el checkpoint significa
+y lo que todos creíamos que significa.
+
+El checkpoint FP8 oficial de Xiaomi guarda cada `qkv_proj` fusionado como **4 bloques
+de rango TP concatenados** `[Q₁|K₁|V₁|Q₂|K₂|V₂|...]`, no el plano `[Q|K|V]` que hace
+`split()` el propio `modeling_mimo_v2.py` publicado junto a los pesos. vLLM lo sabe y
+lo des-entrelaza en código aparte (`_shard_fp8_qkv_proj`). Además las escalas de bloque
+FP8 de esos tensores van POR RANGO (108 filas = 4×27, no ceil(13568/128)=106), así que
+el dequant "plano" corrompía 3 de los 4 rangos en las 9 capas full (las SWA se salvaban
+por divisibilidad casual). Prueba forense: la saturación FP8 por celda es perfecta (448)
+bajo la malla por-rango y rota bajo la plana.
+
+**Por qué ningún test podía verlo**: el oráculo tiny y el fixture los generó el propio
+código de modeling — layout plano coherente consigo mismo. Motor y referencia
+compartían la misma convención; el checkpoint real usa otra. Solo el modelo real,
+con sus 316 GB, podía exponer la discrepancia.
+
+Fix: des-entrelazado en carga (`qkv_degroup`, auto-detectado por procedencia FP8, con
+override por env) + malla de escalas por-rango en el converter + parche in situ de los
+18 tensores afectados del contenedor. Resultado: **"The capital of France is → Paris."**
+
+> **En cristiano:** el fabricante publicó el mueble con las piezas de 4 cajas mezcladas
+> y el manual de OTRA versión del mueble. Su propio manual no puede montarlo; solo un
+> ensamblador de terceros (vLLM) documenta el orden real de las piezas. Tuvimos que
+> descubrirlo midiendo qué ordenación hace que los tornillos (la saturación FP8)
+> encajen perfectos.
+
+### 14. Racha de bugs de infraestructura del día final
+
+- `pread()` de Linux no lee más de 2 GB por llamada y puede quedarse corto sin error:
+  los embed/lm_head f32 de 2.5 GB necesitaron un bucle `pread_full` en `st.h`.
+- "0 warnings" no es "build ok": un grep de warnings tapó un ERROR de compilación y
+  corrimos 20 minutos con un binario viejo. Regla: comprobar exit code del make.
+- Un `inspect.py` de scratch de un subagente sombreó la stdlib de Python (el dir del
+  script entra primero en sys.path) y rompió numpy con un error indescifrable.
+  Regla: jamás nombrar archivos de scratch como módulos estándar.
+- `pkill -f patrón` se mata a sí mismo si el patrón aparece en la propia línea de
+  comando (nos pasó TRES veces, una con el patrón en el comando de relance).
+  Regla: `patró[n]` con clase de caracteres, y kill y relance en llamadas separadas.
+
 ## Entorno / herramientas
 
 ### 9. Benchmark de disco con ceros = mentira

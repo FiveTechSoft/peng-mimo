@@ -107,7 +107,25 @@ referencia (`transformers` + `modeling_mimo_v2.py` oficial):
 - [x] Fase 3 — streaming de experts + cuantización (int8 token-exacto; packing lossless)
 - [x] Fase 4 — suite completa verde (C 3/3, Python 32/32) + fixture 396M (**TF 20/20**)
 - [x] Fase 5 — converter `--arch mimo` (container ≡ runtime-quant, token a token)
-- [ ] Fase 6 — descarga real (316 GB), conversión y primer chat con 311B en 32 GB de RAM
+- [x] **Fase 6 — MiMo-V2.5 completo (311B) respondiendo en esta máquina** ✓ 2026-07-11
+
+### Fase 6 — resultado (2026-07-11)
+
+```
+$ PROMPT='The capital of France is' TEMP=0 SNAP=~/mimo25_i4 ./mimo 64 4 8
+The capital of France is Paris. The capital of Germany
+```
+
+- Descarga+conversión: 316 GB FP8 → contenedor de **152 GB** (16 shards) en ~2 h de
+  descarga real (~59 MB/s) + conversión solapada
+- Carga: 20 s · densa residente 9.2 GB · RSS ~13.7 GB · **0.31 tok/s** en frío
+  (hit-rate 44%, exactamente la física predicha: disco 2.75 GB/s / ~4.7 GB por token)
+- Dos bugs finales que solo el modelo real podía exponer, ambos documentados en
+  [`findings.md`](findings.md): el límite de 2 GB de `pread()` y el **layout
+  entrelazado por rangos TP del qkv en el checkpoint FP8 oficial** (que el propio
+  `modeling_mimo_v2.py` de Xiaomi no sabe leer — solo vLLM lo des-entrelaza)
+- Contenedor publicado en HF:
+  [`fivetech/MiMo-V2.5-colibri-peng-int4`](https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4)
 
 ### Resultados de validación (2026-07-10)
 
