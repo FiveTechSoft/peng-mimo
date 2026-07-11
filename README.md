@@ -145,6 +145,85 @@ Pendiente para la Fase 6, además del disco: sustituir el chat template heredado
 por el oficial de MiMo (marcado como TODO bloqueante en `mimo.c`) y ajustar los defaults
 de sampling al `generation_config` de MiMo.
 
+## Cómo usarlo
+
+### Requisitos
+
+- Linux o WSL2, gcc con OpenMP, CPU con AVX2
+- ≥16 GB de RAM (32 recomendados)
+- ~160 GB en disco rápido local (NVMe; dentro de WSL usa ext4 — **nunca `/mnt/c`**)
+- Python solo si conviertes tú el modelo o usas el chat wrapper (stdlib)
+
+### 1. Compilar el motor
+
+```bash
+git clone https://github.com/FiveTechSoft/peng-mimo && cd peng-mimo/c
+make mimo          # binario ./mimo, C puro + OpenMP, cero dependencias
+```
+
+### 2. Conseguir el modelo (una de dos)
+
+**A — descargar el contenedor ya convertido** (~152 GB) desde
+[`fivetech/MiMo-V2.5-colibri-peng-int4`](https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4):
+
+```bash
+pip install -U huggingface_hub
+hf download fivetech/MiMo-V2.5-colibri-peng-int4 --local-dir ~/mimo25_i4
+```
+
+**B — convertir tú desde el checkpoint FP8 oficial** (316 GB de descarga, resumible;
+pico de disco ≈ salida + 35 GB):
+
+```bash
+pip install torch safetensors numpy huggingface_hub
+python tools/convert_fp8_to_int4.py --arch mimo --repo XiaomiMiMo/MiMo-V2.5 \
+    --out ~/mimo25_i4 --min-free-gb 45
+```
+
+### 3. Chat interactivo
+
+```bash
+python3 c/chat_peng.py                      # SNAP=~/mimo25_i4 por defecto
+SNAP=/otra/ruta NGEN=150 python3 c/chat_peng.py
+```
+
+```
+tú> Dime tres colores en una linea.
+peng> Rojo, azul y verde.
+```
+
+- La conversación **persiste entre turnos** (KV en RAM); `/reset` la borra,
+  `/mas` continúa una respuesta cortada por NGEN, `/salir` termina
+- `THINK=1` activa el bloque de razonamiento de MiMo (por defecto off: a ~0.3 tok/s
+  el razonamiento consume el presupuesto antes de la respuesta visible)
+
+### 4. Generación directa y knobs
+
+```bash
+# one-shot sin template (completación cruda):
+PROMPT='The capital of France is' NGEN=8 TEMP=0 SNAP=~/mimo25_i4 ./mimo 64 4 8
+
+# argumentos: ./mimo <cache-slots/capa> <bits-expert> <bits-densa>
+# (el contenedor ya fija los bits reales; 64 4 8 es el punto validado)
+```
+
+| Variable | Efecto |
+|---|---|
+| `NGEN=n` | tokens máximos por respuesta (chat: 80 por defecto) |
+| `TEMP=t` / `NUC=p` | sampling (defaults del generation_config: 1.0 / 0.95; `TEMP=0` = greedy) |
+| `THINK=1` | razonamiento visible de MiMo |
+| `CTX=n` | contexto máximo del chat (4096 por defecto) |
+| `CAP_RAISE=0` | no auto-crecer la cache de experts hasta llenar la RAM |
+| `PIN=stats.txt PIN_GB=n` | fijar los experts más usados en RAM sobrante (herencia colibrì) |
+
+### Qué esperar
+
+En la máquina de desarrollo (8 núcleos, 32 GB RAM, NVMe 2.75 GB/s): carga 20 s,
+~0.3 tok/s en frío, mejorando con la cache caliente. Es un modelo frontera de 311B
+en hardware de sobremesa: paciencia de telegrama, calidad de frontera. Más RAM
+(la cache de experts escala sola) y mejor NVMe suben el techo — ver la tabla de
+predicciones del [README de colibrì](docs/README-colibri-upstream.md).
+
 ## Licencia
 
 Apache 2.0, como el colibrì original. Los pesos de MiMo-V2.5 los publica Xiaomi bajo su
