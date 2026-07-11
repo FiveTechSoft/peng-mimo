@@ -101,6 +101,17 @@ def classify_mimo(name):
     if name.startswith(MIMO_SKIP_PREFIXES): return "skip"
     return _classify_common(name)
 
+# --arch mimo --mtp: SOLO il layer 0 della testa MTP (model.mtp.layers.0.*). Il checkpoint
+# ne contiene 3 (multi-step DeepSeek-style) ma vLLM ne usa uno solo, incatenandolo
+# (mimo_v2_mtp.py: num_mtp_layers=1, spec_step_idx % 1): il motore fa lo stesso.
+# Norme + attention_sink_bias f32; TUTTI i pesi 2D (qkv/o/eh_proj/mlp denso) a ebits.
+# EN: --arch mimo --mtp: ONLY MTP layer 0 (the checkpoint ships 3, vLLM uses and chains
+# EN: just layer 0 -- so does the engine). Norms + sink bias f32; all 2D weights at ebits.
+def classify_mimo_mtp(name):
+    if name.endswith("_scale_inv"): return "consumed"
+    if not name.startswith("model.mtp.layers.0."): return "skip"
+    return _classify_common(name)
+
 def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     if name.endswith("_scale_inv"): return "consumed"   # gestito col suo peso
     li = layer_idx(name)
@@ -243,7 +254,7 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits, keep_mtp=Fals
     from safetensors import safe_open
     with safe_open(path, framework="pt") as f:
         for name in f.keys():
-            kind = (classify_mimo(name) if arch == "mimo"
+            kind = ((classify_mimo_mtp(name) if keep_mtp else classify_mimo(name)) if arch == "mimo"
                     else classify(name, n_layers, keep_mtp, keep_idx))
             if kind in ("skip", "consumed"): continue
             w = dequant(f, name, fetch_scale)
@@ -278,19 +289,24 @@ def main():
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--mtp", action="store_true",
-        help="scarica/converte SOLO la testa MTP (model.layers.<n_layers>.*) -> out-mtp-*.safetensors")
+        help="scarica/converte SOLO la testa MTP -> out-mtp-*.safetensors nel container. "
+             "GLM: model.layers.<n_layers>.*; mimo: model.mtp.layers.0.* da model_mtp.safetensors")
     ap.add_argument("--indexer", action="store_true",
         help="estrae SOLO i pesi del DSA lightning indexer -> out-idx-*.safetensors. ATTENZIONE: "
              "i tensori indexer sono sparsi su ~tutti gli shard: ri-scarica l'intero repo (~756 GB "
              "di traffico) per tenerne pochi GB. Resumabile shard per shard. Consigliato --ebits 8.")
     a = ap.parse_args()
-    if a.arch == "mimo" and (a.mtp or a.indexer):
-        print("ERRORE: --mtp/--indexer sono modalita' GLM (DSA/MTP nel layer 78)."); return
+    if a.arch == "mimo" and a.indexer:
+        print("ERRORE: --indexer e' una modalita' GLM (DSA nei layer principali)."); return
     if a.ebits is None:
         # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
         # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward.
         # mimo: densa int8 = il punto validato del motore ('./mimo <cap> 4 8').
         a.ebits = 8 if (a.mtp or a.indexer or a.arch == "mimo") else 4
+    if a.mtp and a.ebits < 8:
+        # MAI int4 sulla testa MTP (issue #8: acceptance crolla a 0-4%). / NEVER int4 on MTP.
+        print(f"ERRORE: --mtp richiede ebits>=8 (issue #8: int4 -> acceptance 0-4%), chiesto {a.ebits}.")
+        return
     if a.xbits is None: a.xbits = 4 if a.arch == "mimo" else a.ebits
     if a.io_bits is None: a.io_bits = 16 if a.arch == "mimo" else 8   # 16 = embed/lm_head f32
 
@@ -311,6 +327,22 @@ def main():
         return
 
     os.makedirs(a.outdir, exist_ok=True)
+    if a.indir and a.arch == "mimo" and a.mtp:
+        # locale: converte SOLO model_mtp.safetensors nel container (nuovi tensori, il
+        # resto del container non viene toccato). / local: convert ONLY the MTP shard.
+        from safetensors.numpy import save_file
+        src = os.path.join(a.indir, "model_mtp.safetensors")
+        if not os.path.exists(src):
+            print(f"ERRORE: {src} non esiste."); return
+        fetch = make_scale_fetcher(local_shards=[src])
+        out = {}
+        convert_shard(src, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
+                      keep_mtp=True, arch="mimo", fetch_scale=fetch)
+        outp = os.path.join(a.outdir, "out-mtp-00000.safetensors")
+        save_file(out, outp)
+        print(f"[MTP] {len(out)} tensori (int{a.ebits} + norme f32) -> {outp} "
+              f"({os.path.getsize(outp)/1e9:.2f} GB)")
+        return
     if a.indir:    # conversione locale (test)
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
         if a.arch == "mimo":   # la testa MTP e' uno shard a parte: mai convertirla
@@ -548,17 +580,21 @@ def main():
         wmap = idx
         shards = sorted(set(v for k, v in idx.items() if classify_mimo(k) != "skip"))
         shards = [s for s in shards if "mtp" not in os.path.basename(s)]
-    for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
-        try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
-        except Exception: pass
+    if not a.mtp and not a.indexer:
+        # --mtp/--indexer scrivono in un container GIA' convertito: non sovrascrivere
+        # il suo config.json (potrebbe essere stato patchato in situ).
+        # EN: --mtp/--indexer write into an EXISTING container: don't clobber its config.
+        for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
+            try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
+            except Exception: pass
     tmp = os.path.join(a.outdir, "_inflight"); os.makedirs(tmp, exist_ok=True)
     if a.mtp:
         import urllib.request
-        idx = json.loads(urllib.request.urlopen(
+        idx = wmap or json.loads(urllib.request.urlopen(
             f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
-        pref = f"model.layers.{a.n_layers}."
+        pref = "model.mtp." if a.arch == "mimo" else f"model.layers.{a.n_layers}."
         mtp_shards = sorted(set(v for k, v in idx.items() if k.startswith(pref)))
-        print(f"[MTP] testa nel layer {a.n_layers}: {len(mtp_shards)} shard da processare: {mtp_shards}")
+        print(f"[MTP] testa ({pref}*): {len(mtp_shards)} shard da processare: {mtp_shards}")
         fetch = make_scale_fetcher(a.repo, idx)
         for i, sh in enumerate(mtp_shards):
             outp = os.path.join(a.outdir, f"out-mtp-{i:05d}.safetensors")
@@ -566,7 +602,7 @@ def main():
             print(f"[MTP {i+1}/{len(mtp_shards)}] scarico {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
             out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True,
-                                    fetch_scale=fetch)
+                                    arch=a.arch, fetch_scale=fetch)
             save_file(out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):

@@ -5,7 +5,10 @@
  * transformers: tiny TF 32/32 + greedy 20/20, fixture 396M TF 20/20 + greedy 8/8.
  *   - router sigmoid + noaux_tc (n_group=1) con routed_scaling_factor: IDENTICO a GLM
  *   - expert routed in streaming dal disco (per-expert); NIENTE shared expert
- *   - niente MLA/DSA/MTP: MiMo-V2.5 non li ha
+ *   - niente MLA/DSA: MiMo-V2.5 non li ha
+ *   - MTP NATIVA (model.mtp.layers.0, auto-rilevata): decodifica speculativa LOSSLESS
+ *     con la testa multi-token del checkpoint (layer DENSO in geometria SWA, vedi vLLM
+ *     mimo_v2_mtp.py); fallback n-gram quando la testa non c'e' (tiny/fixture)
  *
  * QUANTIZZAZIONE: gli expert (streaming) e la parte DENSA residente (attenzione, lm_head,
  * embed, mlp densa) sono tenuti in int8/int4 per-riga + scala (dequant-on-use).
@@ -115,6 +118,14 @@ typedef struct {
      * kvh e le dimensioni di testa dipendono dal TIPO di layer (full o SWA).
      * Lineare a tutta lunghezza anche per i layer SWA (il ring buffer arriva dopo). */
     float **K, **V; int max_t;
+    int *kv_start;                               /* prima pos valida nella KV del layer (MTP: parziale) */
+    /* testa MTP nativa (model.mtp.layers.0, convertita con --mtp): layer DENSO con
+     * attenzione in geometria SWA + eh_proj/enorm/hnorm; final_layernorm = norma della
+     * testa condivisa (lm_head del modello). KV alla riga n_layers. */
+    int has_mtp; Layer mtpL; QT eh_proj;
+    float *enorm, *hnorm, *mtp_norm;
+    float *hlast, *h_all;                        /* hidden PRE-norm: ultima pos / batch spec (<=64) */
+    uint64_t mtp_prop, mtp_acc;                  /* statistica acceptance */
     ESlot **ecache; int *ecn; int ecap;          /* LRU expert per-layer */
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
@@ -439,6 +450,16 @@ static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const ui
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
 }
 
+/* LOSSLESS SPEC (bug trovato col gate MTP "DRAFT=0 vs 2 byte-identici"): la scelta del
+ * kernel int4 dipende da S (S>=g_i4s -> IDOT intero, S=1 -> dequant f32 esatto). Il
+ * forward di VERIFICA speculativa e' un batch S=1+g: senza pin le sue logits differiscono
+ * da quelle del decode sequenziale S=1 e un argmax al limite puo' flippare -> il greedy
+ * con DRAFT>0 non era piu' byte-identico. g_fw1=1 (attivo solo durante la verifica)
+ * valuta la soglia come se S=1: ogni riga del batch riproduce ESATTAMENTE il forward
+ * singolo (tutti i kernel sono per-riga indipendenti, quindi basta pareggiare la scelta).
+ * EN: the int4 kernel choice is S-dependent; the speculative verify batch must reproduce
+ * S=1 numerics bit-exactly or greedy with DRAFT>0 diverges. g_fw1 pins the choice to S=1. */
+static int g_fw1=0;
 static void matmul_qt(float *y, const float *x, QT *w, int S){
 #ifdef COLI_CUDA
     /* The CUDA backend owns persistent copies only for model-resident tensors.
@@ -461,7 +482,7 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
      * EN: int8 IDOT always wins (1.4-2.5x). int4 IDOT: on AVX2 the author found S=1 didn't
      * pay (S>=2 gate); on ARM/SDOT single-token DOES pay (see g_i4s / PR #9 for the VNNI
      * twin). Threshold configurable via I4S. */
-    if(g_idot && (w->fmt==1 || (w->fmt==2 && S>=g_i4s))){
+    if(g_idot && (w->fmt==1 || (w->fmt==2 && (g_fw1?1:S)>=g_i4s))){
         int I=w->I;
         int8_t *xq=malloc((size_t)S*I); float sxb[64]; float *sx=S<=64?sxb:falloc(S);
         for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
@@ -535,11 +556,13 @@ static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (0.95 = generation_co
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
-static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
-                          * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
-                          * misurato sul run reale (2026-07-03) acceptance ~5% -> ogni draft
-                          * rifiutato paga comunque i suoi expert dal disco = ~3x piu' lento.
-                          * Opt-in (DRAFT=4) per testi ripetitivi dove l'acceptance e' alta. */
+static int g_draft=0;    /* metodo E: DRAFT=n token speculati per forward (0=off). Con la testa
+                          * MTP nativa nel container il draft e' della testa (acceptance 37-64%
+                          * misurata sul modello reale); senza, n-gram lookup (acceptance ~5%,
+                          * 2026-07-03). LOSSLESS: verifica = output identico al greedy puro
+                          * (gate byte-identico DRAFT=0 vs 2 vs 4). Default OFF: su host
+                          * disk-bound ogni posizione di draft paga i suoi expert dal disco;
+                          * conviene con expert in RAM/NVMe veloce (DRAFT=2). */
 /* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
@@ -757,6 +780,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
     m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
+    m->kv_start=calloc(NR+1,sizeof(int));        /* +1: riga KV del layer MTP */
     for(int i=0;i<c->n_layers;i++){
         Layer *l=&m->L[i];
         int kvh=lyr_kvh(c,i), hd=lyr_hd(c,i), vd=lyr_vd(c,i);
@@ -798,11 +822,70 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         }
         #undef P
     }
+    /* ---- testa MTP nativa (MiMo-V2.5: model.mtp.layers.0.*, dal container --mtp) ----
+     * Struttura (vLLM mimo_v2_mtp.py, il riferimento autorevole per questo checkpoint):
+     * h = eh_proj([enorm(emb(tok)) ; hnorm(h_prev)]) -> blocco decoder DENSO con attenzione
+     * in GEOMETRIA SWA (swa_num_attention_heads/kv/dim, sliding window, sink bias,
+     * swa_rope_theta, v_scale) -> final_layernorm -> lm_head condiviso del modello.
+     * Attiva SOLO se il set di tensori e' completo; MTP=0 la spegne comunque. */
+    {
+        const char *req[]={"eh_proj.weight","enorm.weight","hnorm.weight","final_layernorm.weight",
+            "input_layernorm.weight","pre_mlp_layernorm.weight","self_attn.qkv_proj.weight",
+            "self_attn.o_proj.weight","mlp.gate_proj.weight","mlp.up_proj.weight","mlp.down_proj.weight"};
+        m->has_mtp = c->n_layers<128;            /* is_swa[n_layers] deve esistere */
+        for(unsigned q=0;q<sizeof(req)/sizeof(req[0]) && m->has_mtp;q++){
+            snprintf(nm,sizeof(nm),"model.mtp.layers.0.%s",req[q]);
+            if(!st_has(&m->S,nm)) m->has_mtp=0;
+        }
+        if(getenv("MTP") && atoi(getenv("MTP"))==0) m->has_mtp=0;
+        if(m->has_mtp){
+            int li=c->n_layers; Layer *l=&m->mtpL;
+            c->is_swa[li]=1;                     /* geometria/rope/finestra SWA per la riga MTP */
+            m->kv_start[li]=-1;                  /* KV MTP: parte dalla prima posizione assorbita */
+            int kvh=lyr_kvh(c,li), hd=lyr_hd(c,li), vd=lyr_vd(c,li);
+            int qs=c->n_heads*hd, ks=kvh*hd, vs=kvh*vd;
+            #define PM(s) (snprintf(nm,sizeof(nm),"model.mtp.layers.0." s),nm)
+            l->in_ln  =ld(m,PM("input_layernorm.weight"));
+            l->post_ln=ld(m,PM("pre_mlp_layernorm.weight"));
+            { int64_t want=(int64_t)(qs+ks+vs)*D, got=st_numel(&m->S,PM("self_attn.qkv_proj.weight"));
+              if(got!=want){ fprintf(stderr,"MTP: qkv_proj ha %lld elementi, attesi %lld = (%d+%d+%d)x%d\n",
+                  (long long)got,(long long)want,qs,ks,vs,D); exit(1); } }
+            l->qkv = qt_load(m,PM("self_attn.qkv_proj.weight"), qs+ks+vs, D, dbits);
+            if(c->qkv_grouped){
+                /* stesso layout per-rank dei layer del modello: la griglia di scale fp8
+                 * del qkv MTP nel checkpoint ([116,32]) e' IDENTICA a quella dei layer
+                 * SWA principali, gia' validati con questo de-interleave (NR=4). */
+                int nr = getenv("QKV_RANKS") ? atoi(getenv("QKV_RANKS"))
+                       : (c->kv_heads_full < c->kv_heads_swa ? c->kv_heads_full : c->kv_heads_swa);
+                qkv_degroup(&l->qkv, c->n_heads, kvh, hd, vd, nr);
+            }
+            l->o = qt_load(m,PM("self_attn.o_proj.weight"), D, c->n_heads*vd, dbits);
+            if(c->has_sink_swa){
+                int64_t sn=st_numel(&m->S,PM("self_attn.attention_sink_bias"));
+                if(sn!=c->n_heads){ fprintf(stderr,"MTP: attention_sink_bias ha %lld elementi, attesi %d\n",
+                    (long long)sn,c->n_heads); exit(1); }
+                l->sink=ld(m,PM("self_attn.attention_sink_bias"));
+            } else l->sink=NULL;
+            l->sparse=0;                         /* mlp DENSO (intermediate_size): niente expert */
+            l->gate_proj = qt_load(m,PM("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
+            l->up_proj   = qt_load(m,PM("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
+            l->down_proj = qt_load(m,PM("mlp.down_proj.weight"), D, c->dense_inter, dbits);
+            m->eh_proj = qt_load(m,PM("eh_proj.weight"), D, 2*D, dbits);
+            m->enorm=ld(m,PM("enorm.weight")); m->hnorm=ld(m,PM("hnorm.weight"));
+            m->mtp_norm=ld(m,PM("final_layernorm.weight"));
+            #undef PM
+        }
+    }
+    m->hlast=falloc(D); m->h_all=falloc((int64_t)64*D);
     /* byte della parte DENSA residente (embed+lm_head+attn+mlp densa+norme) */
     int64_t rb=qt_bytes(&m->embed)+qt_bytes(&m->lm_head);
     for(int i=0;i<c->n_layers;i++){ Layer *l=&m->L[i];
         rb+=qt_bytes(&l->qkv)+qt_bytes(&l->o);
         if(!l->sparse) rb+=qt_bytes(&l->gate_proj)+qt_bytes(&l->up_proj)+qt_bytes(&l->down_proj);
+    }
+    if(m->has_mtp){ Layer *l=&m->mtpL;
+        rb+=qt_bytes(&l->qkv)+qt_bytes(&l->o)+qt_bytes(&m->eh_proj);
+        rb+=qt_bytes(&l->gate_proj)+qt_bytes(&l->up_proj)+qt_bytes(&l->down_proj);
     }
     m->resident_bytes=rb;
 }
@@ -965,6 +1048,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         int pos=pos_base+s, g=h/group;
         int lo = (swa && c->sliding_window>0) ? pos-c->sliding_window+1 : 0;
         if(lo<0) lo=0;
+        if(lo<m->kv_start[layer]) lo=m->kv_start[layer];  /* KV parziale (riga MTP: valida da kv_start) */
         int nt=pos+1-lo;
         float scb[4096]; float *sc = nt<=4096 ? scb : falloc(nt);
         const float *q=qkv+(int64_t)s*rowsz+(int64_t)h*hd;
@@ -995,7 +1079,18 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
 /* MoE MiMo su x[S,hidden] -> out (router sigmoid/noaux_tc, n_group=1, NIENTE shared expert).
  * BATCH-UNION: per S>1 (prefill, verifica speculativa) ogni expert UNICO del batch viene
  * caricato una volta sola e moltiplicato per tutte le posizioni che lo usano (pesi letti
- * 1 volta). Per posizione l'accumulo resta nell'ordine di union dei routed. */
+ * 1 volta). Per posizione l'accumulo resta nell'ordine di union dei routed.
+ * LOSSLESS SPEC, parte 2 (secondo bug trovato col gate "DRAFT=0 vs 2 byte-identici" a 32
+ * token): l'ordine di union NON e' l'ordine top-k della singola posizione — a S=1 una
+ * posizione accumula i suoi expert nel SUO ordine, nel batch li accumula nell'ordine di
+ * prima-apparizione tra le righe. La somma float non e' associativa: dopo 48 layer la
+ * deriva sugli ultimi bit flippa argmax al limite e il greedy con DRAFT>0 divergeva.
+ * Con g_fw1 (solo verifica speculativa) i contributi vengono bufferizzati per (pos,k) e
+ * accumulati alla fine nell'ordine top-k della posizione: ogni riga del batch riproduce
+ * bit-esatto il forward S=1. I percorsi validati (prefill, decode) restano invariati.
+ * EN: union order != per-position top-k order; float adds don't commute, so verify
+ * batches drifted from sequential decode. Under g_fw1 contributions are buffered per
+ * (pos,k) and reduced in the position's own top-k order == bit-exact S=1 replay. */
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
     float *logit=falloc(E), *sig=falloc(E), *choice=falloc(E);
@@ -1039,6 +1134,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
+    int *rk=malloc(S*sizeof(int));                            /* slot top-k della riga (per contrib) */
+    float *contrib = g_fw1 ? falloc((int64_t)S*K*D) : NULL;   /* verifica: contributi per (pos,k) */
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int nmiss=0;
@@ -1068,7 +1165,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
             int nr=0;                                 /* righe (posizioni) che usano questo expert */
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
-                if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
+                if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; rk[nr]=kk; nr++; break; }
             if(!nr) continue;
 #ifdef COLI_CUDA
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
@@ -1079,8 +1176,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             matmul_qt(uu, xg, &e->u, nr);
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
             matmul_qt(hh, gg, &e->d, nr);
-            for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
-                for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+            for(int r=0;r<nr;r++){ float *hr=hh+(int64_t)r*D;
+                if(contrib) memcpy(contrib+((int64_t)rows[r]*K+rk[r])*D, hr, D*sizeof(float));
+                else { float *os=out+(int64_t)rows[r]*D, wgt=rw[r];
+                       for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; } }
             m->t_emm += now_s()-t0;
         }
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
@@ -1091,8 +1190,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=++m->eclock; }
         }
     }
+    if(contrib){                                  /* riduzione nell'ordine top-k della posizione */
+        for(int s=0;s<S;s++){ float *os=out+(int64_t)s*D;
+            for(int kk=0;kk<keff[s];kk++){ float wgt=ws[(int64_t)s*K+kk];
+                const float *hr=contrib+((int64_t)s*K+kk)*D;
+                for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; } }
+        free(contrib);
+    }
     free(logit); free(sig); free(choice); free(idxs); free(ws); free(keff); free(uniq);
-    free(xg); free(gg); free(uu); free(hh); free(rows); free(rw);
+    free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(rk);
 }
 
 static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
@@ -1130,21 +1236,26 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
 }
 
 static void kv_alloc(Model *m, int max_t){
-    Cfg *c=&m->c;
-    if(m->K){ for(int i=0;i<c->n_layers;i++){ free(m->K[i]); free(m->V[i]); } free(m->K); free(m->V); }
+    Cfg *c=&m->c; int NR=c->n_layers+1;          /* riga extra: KV del layer MTP (se attivo) */
+    if(m->K){ for(int i=0;i<NR;i++){ free(m->K[i]); free(m->V[i]); } free(m->K); free(m->V); }
     m->max_t=max_t;
-    m->K=calloc(c->n_layers,sizeof(float*)); m->V=calloc(c->n_layers,sizeof(float*));
-    for(int i=0;i<c->n_layers;i++){
+    m->K=calloc(NR,sizeof(float*)); m->V=calloc(NR,sizeof(float*));
+    int rows = m->has_mtp ? NR : c->n_layers;    /* riga MTP solo se la testa esiste */
+    for(int i=0;i<rows;i++){
         m->K[i]=falloc((int64_t)max_t*lyr_kvh(c,i)*lyr_hd(c,i));
         m->V[i]=falloc((int64_t)max_t*lyr_kvh(c,i)*lyr_vd(c,i));
     }
 }
 
+static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
 static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
     layers_forward(m,x,S,pos_base);
+    memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
+    /* prefill della KV MTP: coppie (token@pos+1, hidden@pos) di tutto il batch */
+    if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m, ids+1, x, S-1, pos_base);
     float *last=falloc(D); rmsnorm(last, x+(int64_t)(S-1)*D, m->final_norm, D, c->eps);
     double th0=now_s();
     float *logit=falloc(c->vocab); matmul_qt(logit,last,&m->lm_head,1);
@@ -1158,6 +1269,8 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
     layers_forward(m,x,S,pos_base);
+    if(S<=64) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden di TUTTE le pos (spec) */
+    memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
     for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
         matmul_qt(lo+(int64_t)s*c->vocab, row, &m->lm_head, 1); }
@@ -1180,6 +1293,67 @@ static int ngram_draft(const int *ids, int len, int G, int *draft){
 
 static inline int argmax_v(const float *lo, int V){
     int b=0; float bv=lo[0]; for(int i=1;i<V;i++) if(lo[i]>bv){bv=lo[i];b=i;} return b;
+}
+
+/* METODO MTP: propone fino a G draft con la testa multi-token nativa di MiMo-V2.5.
+ * Input: next_tok (appena emesso, posizione kv) e hlast (hidden PRE-norm della pos kv-1).
+ * Catena vLLM (mimo_v2_mtp.py):
+ *   h' = final_layernorm( Blocco( eh_proj[ enorm(emb(tok)) ; hnorm(h) ] ) )
+ *   draft = argmax(lm_head(h')); il passo successivo incatena h = h' (vLLM ritorna e
+ *   incatena il hidden POST final_layernorm). Il primo h e' il hidden VERO del modello:
+ *   pre-norm in hlast, model.norm applicato qui (convenzione vLLM, come per GLM).
+ * La KV del layer MTP vive alla riga n_layers ed e' valida da kv_start (niente prefill
+ * obbligatorio: la finestra di solo-decode basta per il draft). LOSSLESS comunque:
+ * ogni draft viene verificato dal modello pieno in spec_decode. */
+static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
+    Cfg *c=&m->c; int D=c->hidden, li=c->n_layers, V=c->vocab;
+    int p=kv-1; if(p<0||G<1) return 0;
+    if(m->kv_start[li]<0 || m->kv_start[li]>p) m->kv_start[li]=p;
+    float *x=falloc(D), *cat=falloc(2*D), *hx=falloc(D), *nrm=falloc(D), *tmp=falloc(D);
+    float *row=falloc(D), *logit=falloc(V), *h=falloc(D);
+    memcpy(h, m->hlast, D*sizeof(float));
+    int tok=next_tok, n=0;
+    int prenorm = getenv("MTP_PRENORM")!=NULL;   /* A/B: h senza model.norm (debug) */
+    for(int g=0; g<G; g++){
+        int pos=p+g; if(pos+2>=m->max_t) break;
+        embed_row(m, tok, x);
+        rmsnorm(x, x, m->enorm, D, c->eps);
+        if(g==0 && !prenorm) rmsnorm(h, h, m->final_norm, D, c->eps);  /* h vero: post model.norm */
+        rmsnorm(h, h, m->hnorm, D, c->eps);
+        memcpy(cat, x, D*sizeof(float)); memcpy(cat+D, h, D*sizeof(float));
+        matmul_qt(hx, cat, &m->eh_proj, 1);
+        layer_forward(m, &m->mtpL, li, hx, 1, pos, nrm, tmp);
+        rmsnorm(row, hx, m->mtp_norm, D, c->eps);
+        matmul_qt(logit, row, &m->lm_head, 1);
+        int t2=argmax_v(logit, V);
+        draft[n++]=t2; tok=t2;
+        memcpy(h, row, D*sizeof(float));         /* catena il hidden POST final_layernorm (vLLM) */
+    }
+    free(x); free(cat); free(hx); free(nrm); free(tmp); free(row); free(logit); free(h);
+    return n;
+}
+/* assorbe nella KV della testa MTP le coppie VERIFICATE (emb(token@pos+1), h_vero@pos):
+ * next_ids[i] = token alla posizione pos_base+i+1; x[i] = hidden VERO (pre-norm) a pos_base+i.
+ * Un solo passaggio batch del layer MTP (denso: nessun expert da pagare). */
+static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base){
+    if(!m->has_mtp || S<1) return;
+    Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
+    if(pos_base+S>m->max_t){ S=m->max_t-pos_base; if(S<1) return; }
+    if(m->kv_start[li]<0 || m->kv_start[li]>pos_base) m->kv_start[li]=pos_base;
+    float *hx=falloc((int64_t)S*D), *cat=falloc(2*D), *e=falloc(D), *hn=falloc(D), *hf=falloc(D);
+    int prenorm = getenv("MTP_PRENORM")!=NULL;
+    for(int i=0;i<S;i++){
+        embed_row(m,next_ids[i],e);
+        rmsnorm(e,e,m->enorm,D,c->eps);
+        if(prenorm) rmsnorm(hn,x+(int64_t)i*D,m->hnorm,D,c->eps);
+        else { rmsnorm(hf,x+(int64_t)i*D,m->final_norm,D,c->eps);   /* vLLM: h POST model.norm */
+               rmsnorm(hn,hf,m->hnorm,D,c->eps); }
+        memcpy(cat,e,D*sizeof(float)); memcpy(cat+D,hn,D*sizeof(float));
+        matmul_qt(hx+(int64_t)i*D, cat, &m->eh_proj, 1);
+    }
+    float *nrm=falloc((int64_t)S*D), *tmp=falloc((int64_t)S*D);
+    layer_forward(m,&m->mtpL,li,hx,S,pos_base,nrm,tmp);
+    free(hx); free(cat); free(e); free(hn); free(hf); free(nrm); free(tmp);
 }
 
 /* ---- SAMPLING (temperatura + nucleus) con verifica speculativa LOSSLESS ----
@@ -1264,12 +1438,22 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
         if(emitted>=n_new) break;                       /* l'ultimo token non serve forwardarlo */
         int g = 0;
-        if(g_draft>0) g=ngram_draft(all,kv+1,g_draft,draft);
+        /* auto-off adattivo: draft mai accettati = solo tassa di calcolo per forward */
+        if(g_draft>0 && m->has_mtp && m->mtp_prop>=24 && m->mtp_acc*10 < m->mtp_prop){
+            g_draft=0;
+            fprintf(stderr,"[MTP] acceptance %.0f%% dopo %llu proposte: draft disattivati\n",
+                100.0*m->mtp_acc/m->mtp_prop, (unsigned long long)m->mtp_prop);
+        }
+        if(g_draft>0){
+            if(m->has_mtp){ g=mtp_draft(m,next,kv,g_draft,draft); m->mtp_prop+=g; }
+            else g=ngram_draft(all,kv+1,g_draft,draft);
+        }
         if(g>n_new-emitted) g=n_new-emitted;
         if(kv+1+g+1>m->max_t) g=m->max_t-kv-2;
         if(g<0) g=0;
         int S=1+g; int batch[64]; batch[0]=next; memcpy(batch+1,draft,g*sizeof(int));
-        float *lo=step_all(m,batch,S,kv); m->n_fw++;
+        g_fw1=1;                                        /* verifica ≡ decode S=1, bit-esatto */
+        float *lo=step_all(m,batch,S,kv); g_fw1=0; m->n_fw++;
         int k=0;                                        /* verifica: accetta finche' coincide */
         while(k<g && emitted<n_new){
             int accept;
@@ -1280,6 +1464,12 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
             emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++; k++;
         }
+        if(m->has_mtp){ m->mtp_acc+=k;
+            if(k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
+        }
+        /* hlast deve corrispondere all'ultima posizione ACCETTATA (kv+k), non a fine batch
+         * (per k==S-1 step_all ha gia' copiato la riga giusta) */
+        if(k<S-1) memcpy(m->hlast, m->h_all+(int64_t)k*c->hidden, c->hidden*sizeof(float));
         kv += 1+k;                                      /* KV oltre kv e' stantia: verra' sovrascritta */
         logit=falloc(V); memcpy(logit, lo+(int64_t)k*V, V*sizeof(float)); free(lo);
     }
@@ -1410,7 +1600,8 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     int cap=(int)strlen(prompt)+16; int *pids=malloc(cap*sizeof(int));
     int np=tok_encode(&T,prompt,(int)strlen(prompt),pids,cap);
     if(np<1){ fprintf(stderr,"prompt vuoto dopo tokenizzazione\n"); return; }
-    printf("prompt: %d token | genero fino a %d (stop EOS=%d) | draft n-gram=%d\n", np, ngen, eos, g_draft);
+    printf("prompt: %d token | genero fino a %d (stop EOS=%d) | draft %s=%d\n",
+        np, ngen, eos, m->has_mtp?"MTP":"n-gram", g_draft);
     fputs(prompt,stdout); fflush(stdout);
     kv_alloc(m, np+ngen+g_draft+2);
     int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
@@ -1427,6 +1618,9 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
         produced?(double)m->ereq/produced:0.0, (produced&&nsp)?(double)m->ereq/produced/nsp:0.0, nsp, c->topk, g_topk, g_topp);
     printf("speculazione: %.2f token/forward (%llu fw per %llu tok)\n",
         m->n_fw?(double)m->n_emit/m->n_fw:1.0, (unsigned long long)m->n_fw, (unsigned long long)m->n_emit);
+    if(m->has_mtp||m->mtp_prop) printf("MTP acceptance: %.1f%% (%llu accettati su %llu proposti)\n",
+        m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0,
+        (unsigned long long)m->mtp_acc, (unsigned long long)m->mtp_prop);
 #ifdef COLI_CUDA
     if(m->gpu_expert_count) printf("CUDA expert tier: %d residenti (%.2f GB) | %llu chiamate servite da VRAM\n",
         m->gpu_expert_count,m->gpu_expert_bytes/1e9,(unsigned long long)m->gpu_expert_calls);
@@ -1551,6 +1745,7 @@ static void run_serve(Model *m, const char *snap){
     while((nr=getline(&line,&cap,stdin))>0){
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1;
+            if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;   /* la finestra MTP riparte da sola */
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout); continue; }
         if(!strcmp(line,"\x02MORE")){                /* continua la risposta troncata da NGEN:
             la storia e' gia' in KV, basta ri-forwardare l'ULTIMO token per riavere i logits */
@@ -1597,7 +1792,9 @@ static void run_serve(Model *m, const char *snap){
             prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8-g_draft);
             int old_len=len, prefix=0;
             while(prefix<old_len && prefix<prompt_tokens && hist[prefix]==tmp[prefix]) prefix++;
-            if(prefix<old_len) len=prefix;
+            if(prefix<old_len){ len=prefix;
+                if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;  /* KV MTP oltre il prefisso: stantia */
+            }
             k=prompt_tokens-len;
             if(k>0) memcpy(hist+len,tmp+len,k*sizeof(int));
             fprintf(stderr,"[API] KV prefix %d/%d token, prefill %d\n",len,prompt_tokens,k);
@@ -1607,6 +1804,7 @@ static void run_serve(Model *m, const char *snap){
             else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
             k=tok_encode(&T,buf,bl,hist+len,maxctx-len); prompt_tokens=k;
             if(len+k+8+g_draft>=maxctx){ len=0; first=1;
+                if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;  /* contesto azzerato: KV MTP stantia */
                 bl=0; if(templ) bl+=mimo_turn_render(buf,1<<16,input,1);
                 else bl+=snprintf(buf+bl,(1<<16)-bl,"%s",input);
                 k=tok_encode(&T,buf,bl,hist,maxctx); if(k>maxctx-8-g_draft) k=maxctx-8-g_draft;
@@ -1850,10 +2048,11 @@ static double mem_available_gb(void){
 #endif
 }
 
-/* byte della KV cache GQA a max_ctx (somma per-layer: kvh e dimensioni dipendono dal tipo) */
-static double kv_bytes_at(const Cfg *c, int max_ctx){
-    double b=0;
-    for(int i=0;i<c->n_layers;i++)
+/* byte della KV cache GQA a max_ctx (somma per-layer: kvh e dimensioni dipendono dal tipo;
+ * has_mtp aggiunge la riga della testa MTP, in geometria SWA) */
+static double kv_bytes_at(const Cfg *c, int max_ctx, int has_mtp){
+    double b=0; int rows=c->n_layers+(has_mtp?1:0);
+    for(int i=0;i<rows;i++)
         b += (double)max_ctx*lyr_kvh(c,i)*(lyr_hd(c,i)+lyr_vd(c,i))*4.0;
     return b;
 }
@@ -1861,7 +2060,7 @@ static double kv_bytes_at(const Cfg *c, int max_ctx){
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int64_t eb=expert_bytes_probe(m,ebits);
     if(ram_gb<=0){ ram_gb=g_mem_avail_boot*0.88; if(ram_gb<4) ram_gb=8; }
-    double slack = 1.2e9 + 2.5e9 + 64.0*(double)eb + kv_bytes_at(c,max_ctx);
+    double slack = 1.2e9 + 2.5e9 + 64.0*(double)eb + kv_bytes_at(c,max_ctx,m->has_mtp);
     return ram_gb*1e9 - (double)m->resident_bytes - slack;
 }
 
@@ -1879,7 +2078,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      *  ws[64] slab del working-set (si materializzano TUTTI nel prefill batch-union),
      *  KV cache GQA a max_ctx, attivazioni+logits+overhead ~1.2 GB */
     double ws_b  = 64.0*(double)eb;
-    double kv_b  = kv_bytes_at(c,max_ctx);
+    double kv_b  = kv_bytes_at(c,max_ctx,m->has_mtp);
     /* RISERVA PAGE-CACHE (misurato 2026-07-06): strangolarla fa crollare le pread
      * buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di quanto
      * costino in banda disco persa. 2.5 GB restano SEMPRE al kernel. */
@@ -1947,7 +2146,8 @@ int main(int argc, char **argv){
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
-    g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):0;    /* n-gram draft per forward (0=off) */
+    g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* draft per forward; -1 = auto dopo il
+                                                           * load (testa MTP presente -> 3, no -> 0) */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
@@ -1955,7 +2155,7 @@ int main(int argc, char **argv){
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.95f;  /* 0.95 = generation_config MiMo-V2.5 */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
     else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }
-    if(g_draft<0) g_draft=0;
+    if(g_draft<-1) g_draft=-1;
     if(g_draft>63) g_draft=63;
     int cap  = argc>1?atoi(argv[1]):64;
     int ebits= argc>2?atoi(argv[2]):8;
@@ -1989,8 +2189,21 @@ int main(int argc, char **argv){
     printf("== Motore C MiMo (mimo_v2), cache=%d expert/layer | expert@%d-bit densa@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
     Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
-    printf("caricato in %.2fs | densa residente: %.2f MB | layers=%d experts=%d (draft n-gram=%d)\n",
+    /* DRAFT auto = 0 anche con la testa MTP: misurato sul modello reale (2026-07-11,
+     * 32 token chat, greedy) l'acceptance e' buona (64% a DRAFT=2, 37% a DRAFT=4) e i
+     * forward calano 31->14, ma il tok/s NON migliora (0.16-0.20 vs 0.17-0.19; DRAFT=4
+     * 0.14; con TOPP=0.7 DIRECT=1: 0.45 vs 0.37): su questo host disk-bound ogni
+     * posizione di draft paga i SUOI expert dal disco (batch-union piu' larga, hit-rate
+     * 15-17%->10-12%) e la tassa I/O mangia il guadagno di compute — stesso fenomeno
+     * visto su colibri'/GLM. Con cache calda (expert residenti/pinnati o NVMe veloce)
+     * DRAFT=2 conviene: opt-in esplicito. LOSSLESS in ogni caso (gate byte-identico
+     * DRAFT=0 vs 2 vs 4 verificato). */
+    if(g_draft<0) g_draft = 0;
+    printf("caricato in %.2fs | densa residente: %.2f MB | layers=%d experts=%d (draft=%d)\n",
            now_s()-t0, m.resident_bytes/(1024.0*1024.0), m.c.n_layers, m.c.n_experts, g_draft);
+    fprintf(stderr,"[MTP] %s (draft=%d%s)\n",
+        m.has_mtp?"attiva: decodifica speculativa nativa":"assente (fallback n-gram)", g_draft,
+        (m.has_mtp && g_draft==0)?", DRAFT=2 per attivarla":"");
     if(!strncmp(snap,"/mnt/",5))
         fprintf(stderr,"ATTENZIONE: il modello e' su %s (filesystem 9p/Windows, lento e fadvise inefficace).\n"
                        "            Per RAM e velocita' tienilo su ext4 (es. /home/...).\n", snap);
@@ -2068,8 +2281,11 @@ int main(int argc, char **argv){
     printf("\nMotore C MiMo        : "); for(int i=np;i<nfull;i++){ printf("%d ", out[i]); if(out[i]==full[i])match++; }
     printf("\nToken coincidenti: %d/%d\n", match, n_new);
     double tot=m.hits+m.miss;
-    printf("Speculazione n-gram (DRAFT=%d): %.2f token/forward (%llu fw per %llu tok)\n",
-        g_draft, m.n_fw?(double)m.n_emit/m.n_fw:1.0, (unsigned long long)m.n_fw, (unsigned long long)m.n_emit);
+    printf("Speculazione %s (DRAFT=%d): %.2f token/forward (%llu fw per %llu tok)\n",
+        m.has_mtp?"MTP":"n-gram", g_draft,
+        m.n_fw?(double)m.n_emit/m.n_fw:1.0, (unsigned long long)m.n_fw, (unsigned long long)m.n_emit);
+    if(m.mtp_prop) printf("MTP acceptance: %.1f%% (%llu/%llu)\n",
+        100.0*m.mtp_acc/m.mtp_prop, (unsigned long long)m.mtp_acc, (unsigned long long)m.mtp_prop);
     printf("Hit-rate cache expert: %.1f%% (hit=%llu miss=%llu) | RSS: %.2f GB | %.1f tok/s\n",
            tot?100.0*m.hits/tot:0.0, (unsigned long long)m.hits, (unsigned long long)m.miss, rss_gb(), n_new/dt);
     profile_print(&m,dt);

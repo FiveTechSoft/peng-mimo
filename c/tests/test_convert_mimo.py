@@ -10,8 +10,8 @@ HERE = Path(__file__).resolve().parent.parent   # c/
 sys.path.insert(0, str(HERE))
 
 import numpy as np
-from tools.convert_fp8_to_int4 import (classify, classify_mimo, convert_shard,
-                                       make_scale_fetcher)
+from tools.convert_fp8_to_int4 import (classify, classify_mimo, classify_mimo_mtp,
+                                       convert_shard, make_scale_fetcher)
 
 try:
     import torch
@@ -53,6 +53,32 @@ class TestClassifyMimo(unittest.TestCase):
             self.assertEqual(classify_mimo(n), "skip", n)
         self.assertEqual(
             classify_mimo("model.layers.0.self_attn.qkv_proj.weight_scale_inv"), "consumed")
+
+    def test_mtp_head(self):
+        """--arch mimo --mtp: solo model.mtp.layers.0.*; pesi 2D quantizzati, norme e
+        sink bias f32, layer 1/2 e tutto il resto del modello saltati."""
+        for n in ["model.mtp.layers.0.self_attn.qkv_proj.weight",
+                  "model.mtp.layers.0.self_attn.o_proj.weight",
+                  "model.mtp.layers.0.eh_proj.weight",
+                  "model.mtp.layers.0.mlp.gate_proj.weight",
+                  "model.mtp.layers.0.mlp.up_proj.weight",
+                  "model.mtp.layers.0.mlp.down_proj.weight"]:
+            self.assertEqual(classify_mimo_mtp(n), "q", n)
+        for n in ["model.mtp.layers.0.enorm.weight",
+                  "model.mtp.layers.0.hnorm.weight",
+                  "model.mtp.layers.0.final_layernorm.weight",
+                  "model.mtp.layers.0.input_layernorm.weight",
+                  "model.mtp.layers.0.pre_mlp_layernorm.weight",
+                  "model.mtp.layers.0.self_attn.attention_sink_bias"]:
+            self.assertEqual(classify_mimo_mtp(n), "f32", n)
+        self.assertEqual(
+            classify_mimo_mtp("model.mtp.layers.0.self_attn.qkv_proj.weight_scale_inv"),
+            "consumed")
+        for n in ["model.mtp.layers.1.eh_proj.weight",       # vLLM usa solo il layer 0
+                  "model.mtp.layers.2.self_attn.qkv_proj.weight",
+                  "model.layers.3.self_attn.qkv_proj.weight",
+                  "model.embed_tokens.weight", "lm_head.weight"]:
+            self.assertEqual(classify_mimo_mtp(n), "skip", n)
 
     def test_glm_invariato(self):
         """Il refactor (estrazione della coda comune) non deve cambiare la mappa GLM."""
