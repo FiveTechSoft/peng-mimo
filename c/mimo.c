@@ -56,6 +56,10 @@ typedef struct {
                                                   * (oracolo tiny: 24/24 vs 24/16 dei full) */
     int sliding_window, vocab;
     int n_group, topk_group, norm_topk;
+    int qkv_grouped;                             /* layout del qkv fuso NEL CHECKPOINT: 1 = righe
+                                                  * raggruppate per rank TP [Q|K|V] x NR
+                                                  * (export FP8 di Xiaomi), 0 = piatto [Q|K|V]
+                                                  * (modelli salvati da modeling_mimo_v2.py) */
     int stop_ids[8], n_stop;
     int8_t is_swa[128];                          /* hybrid_layer_pattern: 1=SWA */
     int8_t is_moe[128];                          /* moe_layer_freq: 1=MoE */
@@ -610,6 +614,23 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *nt=json_get(r,"norm_topk_prob"); c->norm_topk=(nt&&nt->t==J_BOOL)?nt->boolean:0;
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=(rs&&rs->t==J_NUM)?(float)rs->num:1.f;   /* null -> 1 */
     c->vocab=gi(r,"vocab_size");
+    /* LAYOUT DEL QKV FUSO (il bug " Paris"->"00.0" del 2026-07-11): il checkpoint FP8
+     * ufficiale di MiMo-V2.5 memorizza qkv_proj.weight INTERLEAVED per rank TP
+     * ([Q|K|V] ripetuto NR=4 volte, Q = (H/NR)*hd righe per rank), mentre
+     * modeling_mimo_v2.py (e i nostri modelli tiny/fixture, salvati DA quel codice)
+     * usano lo split piatto [Q|K|V]. vLLM lo documenta e de-interleava al load
+     * (_shard_fp8_qkv_proj in vllm/model_executor/models/mimo_v2.py). Il marcatore
+     * affidabile e' la provenienza: solo l'export fp8 di Xiaomi scrive il layout
+     * raggruppato, e solo lui mette quantization_config.quant_method=="fp8" nel
+     * config.json (che il convertitore copia nel container). QKV_GROUPED=0/1 forza.
+     * EN: MiMo-V2.5's official FP8 checkpoint stores fused qkv interleaved per TP
+     * rank; the HF modeling (and our oracles, saved by it) use the flat layout. vLLM
+     * de-interleaves at load. Provenance marker: quantization_config.quant_method
+     * =="fp8". Env QKV_GROUPED overrides. */
+    { jval *qc=json_get(r,"quantization_config");
+      jval *qm=qc?json_get(qc,"quant_method"):NULL;
+      c->qkv_grouped = (qm && qm->t==J_STR && qm->str && !strcmp(qm->str,"fp8"));
+      if(getenv("QKV_GROUPED")) c->qkv_grouped=atoi(getenv("QKV_GROUPED")); }
     /* token di stop: numero singolo o array */
     c->n_stop=0;
     jval *eo=json_get(r,"eos_token_id");
@@ -678,6 +699,43 @@ static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (nor
     float *p=falloc(n); st_read_f32(&m->S,name,p,0); return p;
 }
 
+/* De-interleava il qkv fuso dal layout del checkpoint FP8 al layout piatto [Q|K|V]
+ * atteso da attention(). Il checkpoint di MiMo-V2.5 concatena NR=4 blocchi di rank
+ * tensor-parallel, ognuno [Q (H/NR teste) | K (kvh/NR teste) | V (kvh/NR teste)]:
+ * verificato sui dati (le scale fp8 a blocchi 128 del checkpoint sono emesse PER RANK:
+ * i layer full hanno 108 = 4 x ceil(3392/128) righe di scala, non ceil(13568/128)=106).
+ * E' una PERMUTAZIONE DI RIGHE: con quantizzazione per-riga (dati + scala per riga) e'
+ * esatta, nessuna requantizzazione (vLLM invece deve dequant/requant per le sue scale
+ * a blocchi: vedi _shard_fp8_qkv_proj in vllm/model_executor/models/mimo_v2.py).
+ * EN: de-interleave fused qkv from the FP8 checkpoint's per-TP-rank layout (NR=4 blocks
+ * of [Q|K|V]) to the flat [Q|K|V] attention() expects. Pure row permutation: exact
+ * under per-row quantization. NR verified from the checkpoint's per-rank scale grids. */
+static void qkv_degroup(QT *t, int H, int kvh, int hd, int vd, int nr){
+    if(nr<1 || H%nr || kvh%nr){ fprintf(stderr,"qkv_degroup: nr=%d incompatibile con H=%d kvh=%d\n",nr,H,kvh); exit(1); }
+    int qpr=(H/nr)*hd, kpr=(kvh/nr)*hd, vpr=(kvh/nr)*vd, rpr=qpr+kpr+vpr;
+    int qs=H*hd, ks=kvh*hd;
+    if((int64_t)nr*rpr != t->O){ fprintf(stderr,"qkv_degroup: O=%d != nr %d x rpr %d\n",t->O,nr,rpr); exit(1); }
+    int64_t rb = t->fmt==0 ? (int64_t)t->I*4 : t->fmt==1 ? t->I
+               : t->fmt==2 ? ((int64_t)t->I+1)/2 : ((int64_t)t->I+3)/4;   /* byte per riga */
+    uint8_t *w = t->fmt==0 ? (uint8_t*)t->qf : t->fmt==1 ? (uint8_t*)t->q8 : t->q4;
+    uint8_t *tmp=malloc((size_t)((int64_t)t->O*rb)); if(!tmp){fprintf(stderr,"OOM degroup\n");exit(1);}
+    float *stmp = t->s ? falloc(t->O) : NULL;
+    for(int g=0;g<nr;g++){
+        int64_t sq=(int64_t)g*rpr;                                  /* inizio del blocco di rank g */
+        int64_t dq=(int64_t)g*qpr, dk=(int64_t)qs+(int64_t)g*kpr, dv=(int64_t)qs+ks+(int64_t)g*vpr;
+        memcpy(tmp+dq*rb, w+sq*rb,          (size_t)((int64_t)qpr*rb));  /* Q del rank g */
+        memcpy(tmp+dk*rb, w+(sq+qpr)*rb,    (size_t)((int64_t)kpr*rb));  /* K del rank g */
+        memcpy(tmp+dv*rb, w+(sq+qpr+kpr)*rb,(size_t)((int64_t)vpr*rb));  /* V del rank g */
+        if(stmp){
+            memcpy(stmp+dq, t->s+sq,        (size_t)qpr*sizeof(float));
+            memcpy(stmp+dk, t->s+sq+qpr,    (size_t)kpr*sizeof(float));
+            memcpy(stmp+dv, t->s+sq+qpr+kpr,(size_t)vpr*sizeof(float));
+        }
+    }
+    memcpy(w, tmp, (size_t)((int64_t)t->O*rb)); free(tmp);
+    if(stmp){ memcpy(t->s, stmp, (size_t)t->O*sizeof(float)); free(stmp); }
+}
+
 /* dimensioni di attenzione del layer li (dipendono dal tipo: full o SWA) */
 static inline int lyr_kvh(const Cfg *c, int li){ return c->is_swa[li] ? c->kv_heads_swa   : c->kv_heads_full; }
 static inline int lyr_hd (const Cfg *c, int li){ return c->is_swa[li] ? c->swa_head_dim   : c->head_dim; }
@@ -710,6 +768,14 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
           if(got!=want){ fprintf(stderr,"layer %d (%s): qkv_proj ha %lld elementi, attesi %lld = (%d+%d+%d)x%d\n",
               i, c->is_swa[i]?"SWA":"full", (long long)got,(long long)want, qs,ks,vs,D); exit(1); } }
         l->qkv = qt_load(m,P("self_attn.qkv_proj.weight"), qs+ks+vs, D, dbits);
+        if(c->qkv_grouped){
+            /* NR di default: il numero minimo di teste KV tra i tipi di layer (=4 per
+             * MiMo-V2.5, coerente con le griglie di scala per-rank del checkpoint).
+             * QKV_RANKS lo forza per checkpoint futuri con altro grado di TP. */
+            int nr = getenv("QKV_RANKS") ? atoi(getenv("QKV_RANKS"))
+                   : (c->kv_heads_full < c->kv_heads_swa ? c->kv_heads_full : c->kv_heads_swa);
+            qkv_degroup(&l->qkv, c->n_heads, kvh, hd, vd, nr);
+        }
         l->o   = qt_load(m,P("self_attn.o_proj.weight"), D, c->n_heads*vd, dbits);
         if(c->is_swa[i] ? c->has_sink_swa : c->has_sink_full){
             int64_t sn=st_numel(&m->S,P("self_attn.attention_sink_bias"));

@@ -208,7 +208,33 @@ def dequant(f, name, fetch_scale=None):
             if fetch_scale is None: raise
             sc = torch.from_numpy(fetch_scale(sname)).to(torch.float32)
         O, I = w.shape
-        sc = sc.repeat_interleave(128, 0).repeat_interleave(128, 1)[:O, :I]
+        # GRIGLIA DELLE SCALE (bug " Paris"->"00.0", 2026-07-11): il qkv fuso di MiMo-V2.5
+        # concatena NR blocchi di rank TP e le sue scale sono emesse PER RANK, ognuna
+        # ceil(righe_per_rank/128) righe. Nei layer full (13568 righe, 4 rank da 3392 =
+        # 26.5 blocchi) la griglia ha 108 righe di scala, NON ceil(13568/128)=106: il
+        # vecchio repeat_interleave piatto disallineava le scale dei rank 1..3 (righe
+        # dequantizzate con la scala del blocco sbagliato). Se le righe di scala non
+        # combaciano con la griglia piatta, si ricostruisce la griglia per-rank.
+        # EN: MiMo-V2.5's fused qkv concatenates NR TP-rank blocks and its fp8 scales are
+        # emitted PER RANK (ceil(rows_per_rank/128) scale rows each). Full-attention
+        # layers have 108 scale rows, not ceil(13568/128)=106: the flat repeat_interleave
+        # misaligned ranks 1..3. Rebuild the per-rank grid when the flat grid mismatches.
+        if sc.shape[0] != (O + 127) // 128:
+            nr = None
+            for cand in range(2, 65):
+                if O % cand == 0 and sc.shape[0] % cand == 0 \
+                   and sc.shape[0] // cand == ((O // cand) + 127) // 128:
+                    nr = cand
+                    break
+            if nr is None:
+                raise ValueError(f"{name}: griglia scale ignota / unknown scale grid "
+                                 f"{tuple(sc.shape)} per peso {O}x{I}")
+            rows_per, srows = O // nr, sc.shape[0] // nr
+            sc = torch.cat([sc[g * srows:(g + 1) * srows]
+                            .repeat_interleave(128, 0)[:rows_per] for g in range(nr)], 0)
+            sc = sc.repeat_interleave(128, 1)[:, :I]
+        else:
+            sc = sc.repeat_interleave(128, 0).repeat_interleave(128, 1)[:O, :I]
         return (w * sc).numpy()
     return f.get_tensor(name).to(torch.float32).numpy()
 
