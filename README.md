@@ -218,11 +218,17 @@ PROMPT='The capital of France is' NGEN=8 TEMP=0 SNAP=~/mimo25_i4 ./mimo 64 4 8
 
 ### Qué esperar
 
-En la máquina de desarrollo (8 núcleos, 32 GB RAM, NVMe 2.75 GB/s): carga 20 s,
-~0.3 tok/s en frío, mejorando con la cache caliente. Es un modelo frontera de 311B
-en hardware de sobremesa: paciencia de telegrama, calidad de frontera. Más RAM
-(la cache de experts escala sola) y mejor NVMe suben el techo — ver la tabla de
-predicciones del [README de colibrì](docs/README-colibri-upstream.md).
+En la máquina de desarrollo (8 núcleos, 32 GB RAM, NVMe 2.75 GB/s): carga 20 s y
+**0.43 tok/s** en frío con los defaults del chat (`TOPP=0.7 DIRECT=1`, medidos 2.15×
+sobre el baseline de 0.20). Es un modelo frontera de 311B en hardware de sobremesa:
+paciencia de telegrama, calidad de frontera.
+
+La cabeza **MTP nativa** de MiMo está integrada (int8, lossless verificado byte a
+byte, aceptación ~64%) pero por defecto desactivada: en hosts disk-bound el lote de
+verificación carga más experts fríos de los que ahorra en forwards. Actívala con
+`DRAFT=2` si tienes RAM para una cache de experts caliente — ahí es donde rinde.
+Más RAM es la palanca nº 1 (la cache escala sola); ver la tabla de predicciones del
+[README de colibrì](docs/README-colibri-upstream.md).
 
 ## Licencia
 

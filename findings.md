@@ -248,6 +248,38 @@ override por env) + malla de escalas por-rango en el converter + parche in situ 
   comando (nos pasó TRES veces, una con el patrón en el comando de relance).
   Regla: `patró[n]` con clase de caracteres, y kill y relance en llamadas separadas.
 
+## Aceleración (v2)
+
+### 15. Knobs gratis: 2.15× medido (0.20 → 0.43 tok/s)
+
+`TOPP=0.7` (salta experts de peso de router bajo: −41% de lecturas) + `DIRECT=1`
+(O_DIRECT en este NVMe rinde más que buffered) se componen casi perfectamente.
+Ahora son los defaults del chat wrapper.
+
+### 16. MTP nativo: lossless probado, pero el disco frío se come la ganancia
+
+La cabeza MTP de MiMo (1 de las 3 capas encadenadas del checkpoint, geometría SWA,
+densa) quedó integrada con su misma convención qkv por-rangos (malla [116,32] = 4×29,
+misma firma que las capas SWA). Aceptación 64% a DRAFT=2 (mejor que el 39-59% de GLM),
+forwards 31→14, y salida **byte-idéntica** con y sin especulación (md5). Pero en este
+host disk-bound cada posición del draft ensancha la unión de experts a cargar por capa
+y el I/O extra anula el ahorro de forwards — exactamente el fenómeno de cache fría que
+colibrì documentó. Default `DRAFT=0`; opt-in para máquinas con RAM/pin grandes.
+
+> **En cristiano:** el truco de "adivinar varios tokens y verificarlos de golpe"
+> funciona perfecto matemáticamente, pero verificar en lote obliga a traer del disco
+> los expertos de TODAS las posiciones adivinadas. Con el disco como cuello, pagas en
+> disco lo que ahorras en cómputo. En una máquina con más RAM la balanza se invierte.
+
+### 17. El gate de identidad como oráculo afilado
+
+Exigir salida byte-idéntica entre DRAFT=0 y DRAFT=n destapó DOS bugs numéricos
+latentes que la validación token-exacta contra oráculo no podía ver estructuralmente:
+la elección de kernel int4 dependía del tamaño de batch (verificación en lote ≠
+replay secuencial) y la acumulación de experts en batch-union sumaba en orden distinto
+al secuencial (los float no conmutan; la deriva volteaba un argmax hacia el token 10).
+Ambos arreglados; benefician también a la especulación n-gram heredada.
+
 ## Entorno / herramientas
 
 ### 9. Benchmark de disco con ceros = mentira

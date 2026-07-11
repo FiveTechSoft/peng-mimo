@@ -6,7 +6,9 @@ import os, subprocess, sys
 SNAP = os.path.expanduser(os.environ.get("SNAP", "~/mimo25_i4"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV = dict(os.environ, SNAP=SNAP, SERVE="1", THINK=os.environ.get("THINK", "0"),
-           NGEN=os.environ.get("NGEN", "80"))
+           NGEN=os.environ.get("NGEN", "80"),
+           # combo medido 2.15x en el host de desarrollo (0.20 -> 0.43 tok/s):
+           TOPP=os.environ.get("TOPP", "0.7"), DIRECT=os.environ.get("DIRECT", "1"))
 READY = b"\x01\x01READY\x01\x01"
 END = b"\x01\x01END\x01\x01"
 
