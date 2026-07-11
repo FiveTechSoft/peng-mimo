@@ -1689,8 +1689,10 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
     float *nrm=falloc(D), *ch=falloc(E);
     unsigned char *seen = S>8 ? calloc(E,1) : NULL;   /* PREFILL: union dei top-K su tutte le S posizioni */
     for(int s=0;s<S;s++){
+        double tr0=now_s();
         rmsnorm(nrm, x+(int64_t)s*D, l->post_ln, D, c->eps);
         matmul(ch, nrm, l->router, 1, D, E);
+        m->t_router += now_s()-tr0;
         for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
         int top[64], kt=0;
         for(int e=0;e<E && kt<K;e++){ int b=-1; for(int f=0;f<E;f++) if((b<0||ch[f]>ch[b])&&!in_top(top,kt,f)) b=f; if(b>=0) top[kt++]=b; }
@@ -2245,6 +2247,32 @@ static int repin_pick_gpu(Model *m, RepinCand *out, int maxc){
     return nb;
 }
 #endif
+/* Proactive cache warm (literature: ProMoE / FineMoE heat maps): WILLNEED the
+ * hottest non-resident experts per layer so the next tokens hit page cache.
+ * Pure I/O hint — free if already warm. */
+static void heat_prefetch_top(Model *m, int k_per_layer){
+    if(!m || k_per_layer<1) return;
+    Cfg *c=&m->c;
+    for(int l=0;l<c->n_layers;l++){
+        if(!m->L[l].sparse) continue;
+        uint32_t *h = m->eheat && m->eheat[l] ? m->eheat[l] : (m->eusage?m->eusage[l]:NULL);
+        if(!h) continue;
+        int picked[32]; int np=0;
+        int kk = k_per_layer<32?k_per_layer:32;
+        for(int t=0;t<kk;t++){
+            int best=-1; uint32_t bh=0;
+            for(int e=0;e<c->n_experts;e++){
+                int skip=0; for(int j=0;j<np;j++) if(picked[j]==e){skip=1;break;}
+                if(skip || expert_resident(m,l,e)) continue;
+                if(h[e]>bh){ bh=h[e]; best=e; }
+            }
+            if(best<0 || bh==0) break;
+            picked[np++]=best;
+            expert_prefetch(m,l,best);
+        }
+    }
+}
+
 static void repin_pass(Model *m){
     if(g_repin<=0) return;
     if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
@@ -2308,6 +2336,8 @@ static void repin_pass(Model *m){
     }
 #endif
     for(int l=0;l<m->c.n_layers;l++) if(m->eheat[l]) tier_decay(m->eheat[l],m->c.n_experts);
+    /* After swaps, warm the new hot set into page cache. */
+    heat_prefetch_top(m, 4);
 }
 static void run_serve(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
@@ -2324,6 +2354,8 @@ static void run_serve(Model *m, const char *snap){
     int *hist=malloc(maxctx*sizeof(int));        /* storia token (= contenuto della KV): serve
                                                   * al lookup n-gram e resta allineata a len */
     char *line=NULL; size_t cap=0; ssize_t nr; char *buf=malloc(1<<16);
+    /* Kick page-cache for hottest experts before first token (ProMoE-style). */
+    heat_prefetch_top(m, 6);
     printf("\x01\x01" "READY" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout);
     while((nr=getline(&line,&cap,stdin))>0){
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
@@ -2397,6 +2429,7 @@ static void run_serve(Model *m, const char *snap){
         if(prompt_tokens<1){ free(raw); g_temp=base_temp; g_nuc=base_nuc;
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f 0 0\n", rss_gb()); fflush(stdout); continue; }
         first=0;
+        heat_prefetch_top(m, 4);                 /* warm likely experts before this turn's prefill */
         int cur=req_ngen; if(len+k+cur+g_draft+2>=maxctx) cur=maxctx-len-k-g_draft-2;
         uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
         float *logit;
@@ -2797,7 +2830,7 @@ int main(int argc, char **argv){
         g_pilot_depth=atoi(getenv("PILOT_DEPTH"));
         if(g_pilot_depth<1) g_pilot_depth=1;
         if(g_pilot_depth>3) g_pilot_depth=3;
-    } else if(serve_mode) g_pilot_depth=2;           /* chat: L+1 and L+2 WILLNEED */
+    } else if(serve_mode) g_pilot_depth=1;           /* L+2 optional: PILOT_DEPTH=2 (costs CPU) */
     if(g_looka) atexit(looka_print);
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
     else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }

@@ -606,3 +606,26 @@ Env overrides: `PREFETCH=0`, `PILOT_DEPTH=1`, `REPIN=0` (off) / `REPIN=n`.
 **Does not change math** (I/O + residency only). Expected win: multi-turn / thrashing regimes (higher live hit, less cold disk). Cold single-shot PROMPT already GPU-first may gain little; chat is the target.
 
 Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — fewer mallocs on CPU expert path.
+
+### 27. Speed sprint (2026-07-11 night) — best **0.57 tok/s**; literature map
+
+**Tried / measured:**
+
+| Idea | Result |
+|---|---|
+| Multi-stream GPU experts + `atomicAdd` yacc | **Worse** (0.21–0.25 tok/s); contention + launch tax |
+| `PILOT_DEPTH=2` on PROMPT | **Worse** (~45–67 s “other”); extra router matmuls unaccounted → now timed in `t_router`; default depth **1** |
+| `TOPK=6` + `TOPP=0.5` | fewer experts/token but quality noise; not free win |
+| Single-stream moe_acc + GPU-first + TOPP=0.55 **no PILOT** | **0.57 tok/s**, hit 60.5%, disk 8.6 s, matmul 16.4 s, attn 13.0 s |
+
+**Kept (net positive stack):** GPU-first pin, moe_acc single-stream, heat_prefetch_top (WILLNEED hot non-residents at turn/re-pin), REPIN→VRAM, sticky PREFETCH, quant scratch, SERVE PILOT=1 depth 1.
+
+**Literature (relevant, not all portable):**
+
+- [ProMoE](https://arxiv.org/abs/2410.22134) / FineMoE: proactive expert maps → inspired `heat_prefetch_top`
+- [DuoServe-MoE](https://arxiv.org/html/2509.07379v1): prefill vs decode schedules (future)
+- [Pre-gated MoE](https://www.microsoft.com/en-us/research/wp-content/uploads/2024/05/isca24_pregated_moe_camera_ready.pdf): predict experts earlier
+- [fMoE](https://arxiv.org/html/2502.05370v1): fine-grained offload
+- llama.cpp: dense on GPU, experts CPU — we already invert (hottest experts on VRAM)
+
+**Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.

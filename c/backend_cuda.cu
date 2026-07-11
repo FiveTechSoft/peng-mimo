@@ -32,10 +32,9 @@ typedef struct {
     float *yacc;                                 /* MoE accumulate: sum w*swiglu on device */
     size_t yacc_cap;
     size_t tensor_count, tensor_bytes;
-    /* Sticky device-x for decode: many GPU experts share the same packed x. */
     int sticky_S, sticky_D;
     int sticky_valid;
-    int moe_active, moe_S, moe_D;                /* open moe_begin…end window */
+    int moe_active, moe_S, moe_D;
     cudaStream_t stream;
 } DeviceContext;
 
@@ -499,7 +498,7 @@ extern "C" int coli_cuda_moe_begin(int device, const float *x, int S, int D) {
     if (!select_ctx(ctx)) return 0;
     size_t xb = (size_t)S * D * sizeof(float);
     size_t yb = xb;
-    size_t mb = (size_t)S * 16384 * sizeof(float); /* upper bound for dense I; experts use 2048 */
+    size_t mb = (size_t)S * 2048 * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) ||
         !reserve(&ctx->y, &ctx->y_cap, yb) ||
         !reserve(&ctx->yacc, &ctx->yacc_cap, yb) ||
@@ -524,6 +523,8 @@ extern "C" int coli_cuda_moe_acc(ColiCudaTensor **gate, ColiCudaTensor **up, Col
                                   const void *uw, const float *us, int ufmt,
                                   const void *dw, const float *ds, int dfmt,
                                   float weight, int S, int D, int I, int device) {
+    /* Single-stream pipeline: multi-stream+atomic was measured slower on 3060
+     * (atomic contention + launch overhead). Keep one stream, batch sync at end. */
     DeviceContext *ctx = find_ctx(device);
     if (!ctx || !ctx->moe_active || ctx->moe_S != S || ctx->moe_D != D) return 0;
     if (!select_ctx(ctx)) return 0;
@@ -532,29 +533,28 @@ extern "C" int coli_cuda_moe_acc(ColiCudaTensor **gate, ColiCudaTensor **up, Col
     if (!coli_cuda_tensor_upload(down, dw, ds, dfmt, I, D, device)) return 0;
     ColiCudaTensor *tg = *gate, *tu = *up, *td = *down;
     if (tg->device != device || tu->device != device || td->device != device) return 0;
-    /* Ensure mid buffer fits I (experts 2048; dense 16384). */
     size_t mb = (size_t)S * I * sizeof(float);
     if (!reserve(&ctx->ma, &ctx->ma_cap, mb) || !reserve(&ctx->mb, &ctx->mb_cap, mb)) return 0;
 
-    int fused_gu = launch_gate_up_silu(ctx->ma, ctx->x, tg, tu, S, D, I, ctx->stream);
+    cudaStream_t st = ctx->stream;
+    int fused_gu = launch_gate_up_silu(ctx->ma, ctx->x, tg, tu, S, D, I, st);
     if (!fused_gu) {
-        if (!launch_quant_matmul(ctx->ma, ctx->x, tg, S, D, I, ctx->stream)) return 0;
-        if (!launch_quant_matmul(ctx->mb, ctx->x, tu, S, D, I, ctx->stream)) return 0;
+        if (!launch_quant_matmul(ctx->ma, ctx->x, tg, S, D, I, st)) return 0;
+        if (!launch_quant_matmul(ctx->mb, ctx->x, tu, S, D, I, st)) return 0;
         int n = S * I;
         int block = 256;
         int grid = (n + block - 1) / block;
-        silu_mul_kernel<<<grid, block, 0, ctx->stream>>>(ctx->ma, ctx->mb, n);
+        silu_mul_kernel<<<grid, block, 0, st>>>(ctx->ma, ctx->mb, n);
         if (!cuda_ok(cudaGetLastError(), "moe silu")) return 0;
     }
-    if (!launch_quant_matmul(ctx->y, ctx->ma, td, S, I, D, ctx->stream)) return 0;
+    if (!launch_quant_matmul(ctx->y, ctx->ma, td, S, I, D, st)) return 0;
     {
         int n = S * D;
         int block = 256;
         int grid = (n + block - 1) / block;
-        axpy_kernel<<<grid, block, 0, ctx->stream>>>(ctx->yacc, ctx->y, weight, n);
+        axpy_kernel<<<grid, block, 0, st>>>(ctx->yacc, ctx->y, weight, n);
         if (!cuda_ok(cudaGetLastError(), "moe axpy")) return 0;
     }
-    /* No stream sync — end() drains once. */
     return 1;
 }
 

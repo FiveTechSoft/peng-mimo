@@ -48,12 +48,15 @@ def build_env(args) -> dict:
 
     # Speed profile defaults — user/env always wins if already set
     if args.fast:
-        # TOPP=0.55 trims more experts (speed); quality may soften slightly
+        # Fewer experts/token; anticipatory I/O ON; avoid PILOT_DEPTH=2 (CPU tax)
         temp_d, nuc_d, topp_d = "0.7", "0.9", "0.55"
+        topk_d, draft_d, pdepth = "0", "0", "1"
     elif args.quality:
         temp_d, nuc_d, topp_d = "0.4", "0.85", "0.85"
+        topk_d, draft_d, pdepth = "0", "0", "1"
     else:
-        temp_d, nuc_d, topp_d = "0.6", "0.9", "0.65"
+        temp_d, nuc_d, topp_d = "0.6", "0.9", "0.60"
+        topk_d, draft_d, pdepth = "0", "0", "1"
 
     env = dict(os.environ)
     env.update({
@@ -64,13 +67,13 @@ def build_env(args) -> dict:
         "TEMP": os.environ.get("TEMP", temp_d),
         "NUCLEUS": os.environ.get("NUCLEUS", nuc_d),
         "TOPP": os.environ.get("TOPP", topp_d),
+        "TOPK": os.environ.get("TOPK", topk_d),
+        "DRAFT": os.environ.get("DRAFT", draft_d),
         "DIRECT": os.environ.get("DIRECT", "1"),
-        # GPU path (no-op if binary built without CUDA / no GPU)
         "COLI_CUDA": os.environ.get("COLI_CUDA", "1"),
         "CUDA_DENSE": os.environ.get("CUDA_DENSE", "1"),
-        # Prefetch + live re-pin of hot experts (SERVE also defaults these in mimo)
         "PILOT": os.environ.get("PILOT", "1"),
-        "PILOT_DEPTH": os.environ.get("PILOT_DEPTH", "2"),
+        "PILOT_DEPTH": os.environ.get("PILOT_DEPTH", pdepth),
         "PREFETCH": os.environ.get("PREFETCH", "1"),
         "REPIN": os.environ.get("REPIN", "32"),
         "I4S": os.environ.get("I4S", "1"),
