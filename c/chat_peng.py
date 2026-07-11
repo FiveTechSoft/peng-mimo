@@ -5,6 +5,12 @@ import os, subprocess, sys
 
 SNAP = os.path.expanduser(os.environ.get("SNAP", "~/mimo25_i4"))
 HERE = os.path.dirname(os.path.abspath(__file__))
+# binario: env MIMO > junto al script > checkout en /mnt/c
+_cands = [os.environ.get("MIMO"), os.path.join(HERE, "mimo"), "/mnt/c/colibri/c/mimo"]
+MIMO = next((c for c in _cands if c and os.path.isfile(c)), None)
+if not MIMO:
+    sys.exit("no encuentro el binario 'mimo' (prueba MIMO=/ruta/al/binario)")
+HERE = os.path.dirname(MIMO)
 ENV = dict(os.environ, SNAP=SNAP, SERVE="1", THINK=os.environ.get("THINK", "0"),
            NGEN=os.environ.get("NGEN", "80"),
            # combo medido 2.15x en el host de desarrollo (0.20 -> 0.43 tok/s):
@@ -12,7 +18,7 @@ ENV = dict(os.environ, SNAP=SNAP, SERVE="1", THINK=os.environ.get("THINK", "0"),
 READY = b"\x01\x01READY\x01\x01"
 END = b"\x01\x01END\x01\x01"
 
-p = subprocess.Popen([os.path.join(HERE, "mimo"), "64", "4", "8"], cwd=HERE, env=ENV,
+p = subprocess.Popen([MIMO, "64", "4", "8"], cwd=HERE, env=ENV,
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                      stderr=subprocess.DEVNULL, bufsize=0)
 print("cargando modelo (~20 s)...", flush=True)
