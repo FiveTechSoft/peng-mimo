@@ -1402,6 +1402,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
     int K = g_pilot_k<c->topk ? g_pilot_k : c->topk;
     if(g_pilot && !pilot_m){ pilot_m=(void*)m; pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
     float *nrm=falloc(D), *ch=falloc(E);
+    unsigned char *seen = S>8 ? calloc(E,1) : NULL;   /* PREFILL: union dei top-K su tutte le S posizioni */
     for(int s=0;s<S;s++){
         rmsnorm(nrm, x+(int64_t)s*D, l->post_ln, D, c->eps);
         matmul(ch, nrm, l->router, 1, D, E);
@@ -1409,10 +1410,22 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
         int top[64], kt=0;
         for(int e=0;e<E && kt<K;e++){ int b=-1; for(int f=0;f<E;f++) if((b<0||ch[f]>ch[b])&&!in_top(top,kt,f)) b=f; if(b>=0) top[kt++]=b; }
         for(int k=0;k<K;k++){ int e=top[k];
+            if(seen){ seen[e]=1; continue; }           /* prefill: solo raccolta, prefetch dopo (dedup) */
             if(g_looka) pilot_pred[lnext][k]=e;
             if(g_pilot) expert_prefetch(m,lnext,e);   /* WILLNEED: idempotente, ignoriamo i duplicati */
         }
-        if(g_looka) pilot_pred_kt[lnext]=K;
+        if(g_looka && !seen) pilot_pred_kt[lnext]=K;
+    }
+    if(seen){
+        /* PREFILL: enqueue l'unione (dedup) al ring del pilot_worker — la fadvise parte
+         * dal thread I/O, non ruba tempo al compute. Ring pieno -> drop (e' solo un hint). */
+        for(int e=0;e<E;e++) if(seen[e]){
+            unsigned w=pilot_w;
+            if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)>=4096) break;
+            pilot_q[w&4095].l=lnext; pilot_q[w&4095].e=e;
+            __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
+        }
+        free(seen);
     }
     free(nrm); free(ch);
 }
@@ -1424,9 +1437,11 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     attention(m,l,li,nrm,S,pos_base,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
     /* PILOT: while computing this layer, predict the NEXT layer's experts and
-     * warm them in the background (decode-only, S<=8; prediction = layer L+1's
-     * router applied to the current state). I/O hint only: tokens are unchanged. */
-    if((g_pilot||g_looka) && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
+     * warm them in the background (prediction = layer L+1's router applied to the
+     * current state). Decode (S<=8): inline WILLNEED per position. Prefill (S>8,
+     * PILOT only): union of top-K across all S positions, queued to the I/O thread.
+     * I/O hint only: tokens are unchanged. LOOKA measurement stays decode-only. */
+    if((g_pilot || (g_looka && S<=8)) && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
     if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
