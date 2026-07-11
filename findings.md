@@ -280,6 +280,27 @@ replay secuencial) y la acumulación de experts en batch-union sumaba en orden d
 al secuencial (los float no conmutan; la deriva volteaba un argmax hacia el token 10).
 Ambos arreglados; benefician también a la especulación n-gram heredada.
 
+### 18. El overlap disco↔matmul funciona — y desenmascara al verdadero culpable
+
+El pipeline de doble buffer (pool de hilos de carga, consumo en orden original,
+bit-exacto por construcción — md5 idénticos en todos los modos) logró su objetivo
+mecánico: disco y matmul ya no son aditivos (stall 26 s vs 42 s serializados). Pero el
+wall-clock no mejoró: el matmul se infla casi 1:1 cuando hay cargas en vuelo. La suma
+`disk+matmul` se conserva → **el "tiempo de disco" en WSL2 no es espera de dispositivo,
+es CPU quemada en la pila de I/O del host/VHDX**, compitiendo por los mismos 16 hilos
+que las multiplicaciones. Ni prioridades ni tamaños de pool lo cambian.
+
+Consecuencias: (a) en ESTA máquina la única palanca restante es leer menos bytes
+(TOPP, int2, más RAM) o salir de WSL2 a Linux nativo; (b) el pipeline queda activado
+por defecto — en hosts con I/O real por DMA (NVMe nativo) el max(disco,matmul) que
+buscábamos debería materializarse. La feature está lista para la máquina que la
+aproveche.
+
+> **En cristiano:** intentamos que el cocinero picara mientras el ayudante trae
+> ingredientes — y descubrimos que "traer ingredientes" en WSL también lo hace el
+> cocinero con las mismas manos. La receta del solapado es correcta; esta cocina
+> virtualizada es la que no da más de sí. En un Linux nativo, el mismo código rendirá.
+
 ## Entorno / herramientas
 
 ### 9. Benchmark de disco con ceros = mentira
