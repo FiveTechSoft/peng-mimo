@@ -49,7 +49,7 @@ static void segv_handler(int sig){
 /* PILOT/LOOKA router-lookahead prefetch (ported from colibri/glm.c). Globals are
  * declared here (before moe()) so moe() can record the LOOKA accuracy counters;
  * the helper functions live further down, just before layer_forward. */
-static int g_looka=0, g_pilot=0, g_pilot_k=8;
+static int g_looka=0, g_pilot=0, g_pilot_k=8, g_pilot_depth=1;
 static struct { int l,e; } pilot_q[4096];
 static volatile unsigned pilot_w=0, pilot_r=0;
 static void *pilot_m=NULL;                        /* Model* (defined later); cast at use */
@@ -747,9 +747,8 @@ static int g_nopack=0;   /* NOPACK=1 -> tiene i valori <=4bit in contenitore int
 static int g_drop=0;     /* DROP=1 -> scarta le pagine expart dopo l'uso. Default 0: le lascia in
                           * page-cache (buff/cache, NON RSS) come L2 gratuito -> sfrutta lo
                           * sbilanciamento del routing MoE (pochi expert "caldi" riusati). */
-static int g_prefetch=0; /* PREFETCH=1 -> riabilita il WILLNEED cross-layer (metodo C). Default
-                          * OFF: i load VERI in parallelo lo hanno reso superfluo, e sotto
-                          * pressione di memoria il readahead speculativo veniva rievictato. */
+static int g_prefetch=-1; /* PREFETCH sticky same-layer WILLNEED for next token (enr/eroute).
+                           * -1=auto ON with SERVE/PILOT; 0=off; 1=force on. */
 static int g_direct=0;   /* DIRECT=1 -> O_DIRECT sugli slab expert. Default OFF: su questo host
                           * (VHDX su NVMe DRAM-less, latenza serializzata ~60ms/req) il buffered
                           * liscio e' risultato il migliore; su NVMe veri DIRECT=1 rende di piu'. */
@@ -1717,17 +1716,19 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
 }
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
+    /* Sticky next-token: experts used for this layer on the previous token are a
+     * strong prior for the same layer on the next token (~40%+ baseline; free). */
     if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
         for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
     attention(m,l,li,nrm,S,pos_base,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
-    /* PILOT: while computing this layer, predict the NEXT layer's experts and
-     * warm them in the background (prediction = layer L+1's router applied to the
-     * current state). Decode (S<=8): inline WILLNEED per position. Prefill (S>8,
-     * PILOT only): union of top-K across all S positions, queued to the I/O thread.
-     * I/O hint only: tokens are unchanged. LOOKA measurement stays decode-only. */
-    if((g_pilot || (g_looka && S<=8)) && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
+    /* PILOT: predict L+1 (and optionally L+2) routers while we compute this layer.
+     * I/O hint only — tokens unchanged. LOOKA stays decode-only on L+1. */
+    if((g_pilot || (g_looka && S<=8)) && li+1<c->n_layers && m->L[li+1].sparse)
+        pilot_prefetch(m,li+1,x,S);
+    if(g_pilot && g_pilot_depth>=2 && li+2<c->n_layers && m->L[li+2].sparse)
+        pilot_prefetch(m,li+2,x,S);
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
     if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
@@ -2187,21 +2188,22 @@ static int mimo_turn_render(char *buf, int cap, const char *user, int first){
  * piu' umano, piu' veloce). Template chat MiMo-V2.5 con token speciali (CHAT_TEMPLATE=0 -> grezzo).
  * Protocollo: "\x01\x01" "READY" "\x01\x01\n" dopo il load; risposta in streaming; "\x01\x01" "END" "\x01\x01\n" a fine turno.
  * ":reset" (riga "\x02RESET") azzera la memoria. EOF -> esce. */
-/* ---- RFC: RE-PIN A CALDO / LIVE RE-PIN (opt-in, REPIN=n, default OFF) ----
- * Upstream fa AUTOPIN allo START (dalla storia .coli_usage). Questo aggiunge un re-pin
- * TRA I TURNI: nel punto sicuro dopo la risposta scambia i pin peggiori con i non-pinnati
- * piu' caldi, cosi' l'hot-store insegue il carico VIVO senza un profilo a parte. Isteresi
- * 25% (+4) contro il ping-pong; max 4 scambi/passata (~20 MB di disco l'uno). Una heat
- * map separata decade a ogni passata: la storia persistente .coli_usage resta intatta.
- * EN: upstream AUTOPINs at START (from .coli_usage). This adds a between-turns re-pin: at
- * the safe point after the reply, swap the worst pins for the hottest unpinned, so the
- * hot-store tracks the LIVE workload without a separate profile. 25% (+4) hysteresis vs
- * ping-pong; max 4 swaps/pass (~20 MB disk each). A separate decaying heat map keeps
- * persistent .coli_usage intact while adapting to the current workload. */
+/* ---- LIVE RE-PIN (REPIN=n): after enough tokens, swap cold hot-store slots for
+ * hot ones from the session heat map. Covers BOTH RAM pin and VRAM gpu_pin so the
+ * adaptive cache chases the live workload (colibri #26 style). Hysteresis in
+ * tier_pick_swap; max 4 RAM + 4 VRAM swaps per pass. .coli_usage stays persistent. */
 static int g_repin=0;
 static uint64_t g_last_repin=0;
 typedef struct { long gain; int l, slot, eid; } RepinCand;
-static int repin_pick(Model *m, RepinCand *out, int maxc){
+/* Is eid already resident in RAM pin or VRAM tier for this layer? */
+static int expert_resident(Model *m, int l, int eid){
+    if(m->pin && m->pin[l]) for(int z=0;z<m->npin[l];z++) if(m->pin[l][z].eid==eid) return 1;
+#ifdef COLI_CUDA
+    if(m->gpu_pin && m->gpu_pin[l]) for(int z=0;z<m->ngpin[l];z++) if(m->gpu_pin[l][z].eid==eid) return 1;
+#endif
+    return 0;
+}
+static int repin_pick_ram(Model *m, RepinCand *out, int maxc){
     Cfg *c=&m->c; int nb=0;
     for(int l=0;l<c->n_layers;l++){
         if(!m->npin || m->npin[l]<1 || !m->eheat[l]) continue;
@@ -2209,48 +2211,102 @@ static int repin_pick(Model *m, RepinCand *out, int maxc){
         int np=m->npin[l]; if(np>4096) np=4096;
         for(int z=0;z<np;z++) ids[z]=P[z].eid;
         if(!tier_pick_swap(m->eheat[l],c->n_experts,ids,np,&zp,&eu,&g)) continue;
+        /* Don't pull an expert already on VRAM (or another pin slot). */
+        if(expert_resident(m,l,eu)) continue;
         if(nb<maxc){ out[nb].gain=g; out[nb].l=l; out[nb].slot=zp; out[nb].eid=eu; nb++; }
         else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain) w=b;
                if(g>out[w].gain){ out[w].gain=g; out[w].l=l; out[w].slot=zp; out[w].eid=eu; } }
     }
     return nb;
 }
+#ifdef COLI_CUDA
+/* Same as tier_pick_swap but cold pool is only gpu_pin; hot excludes all residents. */
+static int repin_pick_gpu(Model *m, RepinCand *out, int maxc){
+    if(!g_cuda_enabled || !m->gpu_pin) return 0;
+    Cfg *c=&m->c; int nb=0;
+    for(int l=0;l<c->n_layers;l++){
+        if(m->ngpin[l]<1 || !m->eheat[l]) continue;
+        ESlot *G=m->gpu_pin[l]; int ng=m->ngpin[l]; if(ng>4096) ng=4096;
+        int cold=0;
+        for(int z=1;z<ng;z++) if(m->eheat[l][G[z].eid]<m->eheat[l][G[cold].eid]) cold=z;
+        int hot=-1; uint32_t fh=0;
+        for(int e=0;e<c->n_experts;e++){
+            if(expert_resident(m,l,e)) continue;
+            if(m->eheat[l][e]>fh){ fh=m->eheat[l][e]; hot=e; }
+        }
+        if(hot<0) continue;
+        uint32_t fc=m->eheat[l][G[cold].eid];
+        if(fh<=fc+(fc>>2)+4) continue;            /* same hysteresis as tier_pick_swap */
+        long g=(long)fh-(long)fc;
+        if(nb<maxc){ out[nb].gain=g; out[nb].l=l; out[nb].slot=cold; out[nb].eid=hot; nb++; }
+        else { int w=0; for(int b=1;b<maxc;b++) if(out[b].gain<out[w].gain) w=b;
+               if(g>out[w].gain){ out[w].gain=g; out[w].l=l; out[w].slot=cold; out[w].eid=hot; } }
+    }
+    return nb;
+}
+#endif
 static void repin_pass(Model *m){
     if(g_repin<=0) return;
     if(m->n_emit - g_last_repin < (uint64_t)g_repin) return;
     g_last_repin = m->n_emit;
-    RepinCand cd[4]; int nb=repin_pick(m,cd,4);
+    /* ---- RAM pin swaps ---- */
+    RepinCand cd[4]; int nb=repin_pick_ram(m,cd,4);
     for(int b=0;b<nb;b++){
+        if(expert_resident(m,cd[b].l,cd[b].eid) &&
+           !(m->pin[cd[b].l][cd[b].slot].eid==cd[b].eid)){
+            /* target already elsewhere (e.g. VRAM) — skip */
+            continue;
+        }
         ESlot *s=&m->pin[cd[b].l][cd[b].slot];
         int old=s->eid;
         uint32_t old_heat=m->eheat[cd[b].l][old], new_heat=m->eheat[cd[b].l][cd[b].eid];
-#ifdef COLI_CUDA
-        int gpu=s->g.cuda_eligible;
-        int64_t old_gpu=gpu ? (int64_t)coli_cuda_tensor_bytes(s->g.cuda)
-                             +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
-                             +(int64_t)coli_cuda_tensor_bytes(s->d.cuda) : 0;
-#endif
         double t0=now_s();
-        expert_load(m,cd[b].l,cd[b].eid,s);       /* disk -> RAM, same resident slot */
-        const char *tier="RAM";
+        expert_load(m,cd[b].l,cd[b].eid,s);
+        fprintf(stderr,"[REPIN] RAM layer %d: out %d (heat=%u) <- in %d (heat=%u) in %.0f ms\n",
+            cd[b].l,old,old_heat,cd[b].eid,new_heat,(now_s()-t0)*1e3);
+    }
 #ifdef COLI_CUDA
-        if(gpu){                                  /* refresh the same VRAM slot now, not lazily */
+    /* ---- VRAM gpu_pin swaps (hottest non-residents replace coldest GPU slots) ---- */
+    if(g_cuda_enabled && m->gpu_pin){
+        RepinCand gd[4]; int ng=repin_pick_gpu(m,gd,4);
+        for(int b=0;b<ng;b++){
+            ESlot *s=&m->gpu_pin[gd[b].l][gd[b].slot];
+            int old=s->eid;
+            uint32_t old_heat=m->eheat[gd[b].l][old], new_heat=m->eheat[gd[b].l][gd[b].eid];
+            int64_t old_gpu=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                           +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                           +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+            double t0=now_s();
+            /* Drop old device tensors, load new expert to host, re-upload, free host. */
+            qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+            s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
+            s->g.gpu_only=s->u.gpu_only=s->d.gpu_only=0;
+            m->gpu_expert_bytes-=old_gpu;
+            if(m->gpu_expert_count>0) m->gpu_expert_count--;
+            expert_load(m,gd[b].l,gd[b].eid,s);
+            s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=
+                (g_cuda_ndev>0?g_cuda_devices[0]:0);
+            s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
             if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
                 int64_t now_gpu=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
                                +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
-                m->gpu_expert_bytes+=now_gpu-old_gpu; tier="VRAM";
+                m->gpu_expert_bytes+=now_gpu; m->gpu_expert_count++;
+                expert_cpu_free(m,s);
+                s->g.gpu_only=s->u.gpu_only=s->d.gpu_only=1;
+                fprintf(stderr,"[REPIN] VRAM layer %d: out %d (heat=%u) <- in %d (heat=%u) in %.0f ms\n",
+                    gd[b].l,old,old_heat,gd[b].eid,new_heat,(now_s()-t0)*1e3);
             } else {
+                /* Keep host copy as degraded RAM-like slot inside gpu_pin array
+                 * (still found by moe lookup); mark not gpu_only. */
                 qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
                 s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=0;
-                m->gpu_expert_count--; m->gpu_expert_bytes-=old_gpu;
-                fprintf(stderr,"[REPIN] upload VRAM fallito; slot degradato a RAM\n");
+                fprintf(stderr,"[REPIN] VRAM layer %d: upload failed for e=%d; slot stays host-only\n",
+                    gd[b].l,gd[b].eid);
             }
         }
-#endif
-        fprintf(stderr,"[REPIN] %s layer %d: esce/out %d (heat=%u) <- entra/in %d (heat=%u) in %.0f ms\n",
-            tier,cd[b].l,old,old_heat,cd[b].eid,new_heat,(now_s()-t0)*1e3);
     }
+#endif
     for(int l=0;l<m->c.n_layers;l++) if(m->eheat[l]) tier_decay(m->eheat[l],m->c.n_experts);
 }
 static void run_serve(Model *m, const char *snap){
@@ -2708,17 +2764,19 @@ int main(int argc, char **argv){
         free(ln); free(tbuf); return 0;
     }
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
+    /* SERVE/chat: speed-oriented defaults (override with env). Oracle/TF keep exact path. */
+    int serve_mode = getenv("SERVE") && atoi(getenv("SERVE"));
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
-    g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
+    /* sticky next-token WILLNEED: auto ON for SERVE / when PILOT is on */
+    if(getenv("PREFETCH")) g_prefetch=atoi(getenv("PREFETCH"));
+    else g_prefetch = (serve_mode || (getenv("PILOT") && atoi(getenv("PILOT")))) ? 1 : 0;
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* draft per forward; -1 = auto dopo il
                                                            * load (testa MTP presente -> 3, no -> 0) */
-    /* SERVE/chat: speed-oriented defaults (override with env). Oracle/TF keep exact path. */
-    int serve_mode = getenv("SERVE") && atoi(getenv("SERVE"));
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):(serve_mode?1:0);
     g_overlap = getenv("OVERLAP")?atoi(getenv("OVERLAP")):1;   /* 0 = load/compute a fasi (A/B) */
     { const char *e=getenv("OVERLAP_T"); if(e){ g_overlap_t=atoi(e);
@@ -2735,7 +2793,12 @@ int main(int argc, char **argv){
     /* PILOT helps disk-bound cold tokens; default ON in SERVE when not set. */
     g_pilot = getenv("PILOT")?atoi(getenv("PILOT")):(serve_mode?1:0);
     { const char *e=getenv("PILOT_K"); if(e) g_pilot_k=atoi(e); }
-    if(g_looka) atexit(looka_print);                 /* print recall at end of run (any exit) */
+    if(getenv("PILOT_DEPTH")){
+        g_pilot_depth=atoi(getenv("PILOT_DEPTH"));
+        if(g_pilot_depth<1) g_pilot_depth=1;
+        if(g_pilot_depth>3) g_pilot_depth=3;
+    } else if(serve_mode) g_pilot_depth=2;           /* chat: L+1 and L+2 WILLNEED */
+    if(g_looka) atexit(looka_print);
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
     else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }
     if(g_draft<-1) g_draft=-1;

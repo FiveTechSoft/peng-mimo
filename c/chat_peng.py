@@ -70,6 +70,8 @@ def build_env(args) -> dict:
         "CUDA_DENSE": os.environ.get("CUDA_DENSE", "1"),
         # Prefetch + live re-pin of hot experts (SERVE also defaults these in mimo)
         "PILOT": os.environ.get("PILOT", "1"),
+        "PILOT_DEPTH": os.environ.get("PILOT_DEPTH", "2"),
+        "PREFETCH": os.environ.get("PREFETCH", "1"),
         "REPIN": os.environ.get("REPIN", "32"),
         "I4S": os.environ.get("I4S", "1"),
         "OVERLAP": os.environ.get("OVERLAP", "1"),

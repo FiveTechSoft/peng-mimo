@@ -589,3 +589,20 @@ To 1.0 need ≈2× less wall (more hit + faster GEMV/attn and/or more RAM / nati
 5. **Native Linux** — drop WSL I/O CPU tax (§18).
 
 Reproduce: `TOPP=0.55 COLI_CUDA=1 CUDA_DENSE=1 DIRECT=1 NGEN=24 PROFILE=1 PROMPT='…' ./mimo 64 4 8`
+
+### 26. Intelligent anticipatory cache (2026-07-11) — REPIN→VRAM + sticky + PILOT L+2
+
+**Goal:** smarter *ahead-of-time* expert residency without changing tokens.
+
+| Mechanism | Default (SERVE/chat) | Role |
+|---|---|---|
+| **Sticky PREFETCH** | ON (`PREFETCH=1`) | At layer L start, `WILLNEED` the experts this layer used on the *previous* token (`enr`/`eroute`) — free prior for next token |
+| **PILOT** | ON | L+1 router-lookahead (~71% recall) |
+| **PILOT_DEPTH** | **2** | Also WILLNEED L+2 (weaker prior, still free I/O) |
+| **REPIN** | every 32 tokens | RAM pin swaps (as before) **plus VRAM `gpu_pin` swaps**: coldest GPU expert out, hottest non-resident in (disk→upload→free host), same heat hysteresis as `tier_pick_swap` |
+
+Env overrides: `PREFETCH=0`, `PILOT_DEPTH=1`, `REPIN=0` (off) / `REPIN=n`.
+
+**Does not change math** (I/O + residency only). Expected win: multi-turn / thrashing regimes (higher live hit, less cold disk). Cold single-shot PROMPT already GPU-first may gain little; chat is the target.
+
+Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — fewer mallocs on CPU expert path.
