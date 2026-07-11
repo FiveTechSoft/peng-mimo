@@ -367,9 +367,30 @@ serie) a ~3.3 s → hasta **~2x en los tokens fríos/perdidos**; ~0% en régimen
 cacheado. La palanca grande sigue siendo más RAM (`CAP_RAISE`), `PIN`/`autopin`, o
 offload a GPU (`COLI_CUDA=1`). RoPE (#15) es aún más marginal (~0.3%).
 
-**Pendiente de validación end-to-end:** el recall LOOKA real en MiMo y el token-exact
-bajo PILOT no se han medido todavía porque la generación del oráculo tiny
-(`make_mimo_oracle.py`) sigue bloqueada por el conflicto de versiones de
-`transformers` (hallazgo 1). Por construcción PILOT no puede alterar los tokens
-(solo WILLNEED), así que su activación es segura aunque el recall final se confirme
-cuando el oráculo esté disponible.
+**Validado end-to-end (oráculo tiny generado con transformers 5.1.0):**
+- `LOOKA=1 ./mimo 64 8 8` → **recall PILOT top-8 = 71.1% (135/190)** en MiMo,
+  idéntico al 71.6% de GLM. El router-lookahead transfer del todo a MiMo.
+- `PILOT=1` produce **tokens idénticos** al modo default (misma secuencia 15/20),
+  confirmando que el prefetch no altera la salida (I/O-only, como se diseñó).
+- `rope_check.c` ya había confirmado RoPE bit-a-bit (0 fallos).
+- **Pero el motor no es token-exacto perfecto contra ESTE oráculo:** 31/32 en
+  teacher-forcing y 18/20 greedy, INCLUSO con expertos int8 (sin ruido int4).
+  Esa divergencia de ~1 posición NO viene de PILOT/RoPE/I4S (queda probado por
+  PILOT==DEFAULT y RoPE bit-exact). Al rebasear sobre los commits recientes del
+  remoto (MTP speculative decoding + "v2 acceleration") el motor ahora incluye
+  ese código: el diff de ~1 posición probablemente entra por ahí, o por el oráculo
+  full-feature SWA+sink+value_scale que el oráculo simpler de la validación 32/32
+  no ejercitaba. Ver hallazgo #18.
+
+### 18. El motor (post-MTP/v2) diverge ~1 posición del oráculo, aún en int8
+
+Tras rebasear sobre los 4 commits recientes del remoto (MTP speculative decoding,
+"v2 acceleration: fast defaults 2.15x", chat_peng, README), el motor da 31/32 en
+TF y 18/20 greedy sobre el oráculo tiny full-feature (6 capas, SWA+sink+
+value_scale, expertos int8). Con int4 baja a 15/20 (esperado: int4 voltea ~1 pos y
+cascada). La divergencia NO es de PILOT (tokens idénticos con/sin PILOT) ni de
+RoPE (bit-exact vía rope_check.c) ni de I4S (default inalterado en AVX2).
+Queda por localizar si entra por los commits de MTP/v2-acceleration o por un
+detalle del full-feature oráculo (ventana SWA, sink bias, attention_value_scale
+0.707) que el oráculo simpler de la validación 32/32 no activaba. No es
+bloqueante para PILOT, que sigue siendo token-safe (WILLNEED only).
