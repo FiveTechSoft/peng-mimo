@@ -362,3 +362,132 @@ Divergence is NOT from PILOT (identical tokens with/without PILOT) nor RoPE (bit
 (default unchanged in AVX2). Still to locate whether it enters from MTP/v2-acceleration commits or from full-feature
 oracle detail (SWA window, sink bias, attention_value_scale 0.707) that simpler 32/32-validation oracle didn't
 activate. Not blocking for PILOT, which stays token-safe (WILLNEED only).
+
+## CUDA VRAM offload tier — segfault root cause & fix
+
+### 19. Complementary VRAM tier offloads experts to GPU, but freed host slabs must never be dereferenced
+
+The complementary VRAM tier (see mimo.c `pin_load`) loads the experts the hot-store RAM-pin set did NOT
+cover into VRAM, then `expert_cpu_free()` frees their host slab and sets `gpu_only=1`. So a VRAM-only expert's
+`qf/q8/q4/s` host pointers are NULL/freed — its weights live ONLY on the GPU. Two code paths could dereference
+those freed pointers and segfault:
+
+1. **`backend_cuda.cu` `coli_cuda_tensor_upload`**: the `if(!weights) return -1;` guard ran BEFORE the
+   `*tensor` cache-hit check. For a VRAM-only expert `weights` is NULL (freed slab) but `*tensor` already
+   holds the valid GPU copy uploaded at pin time. The early `!weights` made `coli_cuda_matmul` fall through
+   to the CPU path on freed/NULL pointers → **segfault during the first generated token** (right after the
+   prompt was printed, matching the reported symptom).
+   **Fix:** reorder so the `*tensor` cache-hit (reuse the device copy without requiring the freed host
+   pointers) is checked FIRST; `!weights` now only blocks a *fresh* upload, never a reuse.
+
+2. **`mimo.c` `matmul_qt`**: the `if(w->gpu_only) return;` guard lived INSIDE the `!omp_in_parallel()`
+   branch. If a VRAM-only expert were matmul'd inside an OpenMP region the guard was skipped and the CPU path
+   ran on the freed slab. **Fix:** pulled the `gpu_only` early-return OUTSIDE the `omp_in_parallel` check so
+   it can never touch the freed host slab (defensive for `./glm`; `./mimo`'s expert loop is serial so the
+   upload fix #1 is the actual `./mimo` fix, but #2 removes the latent `./glm` crash).
+
+Also added a `SIGSEGV` backtrace handler (`execinfo.h`/`backtrace`) at the top of `main()` and `-g -rdynamic`
+to the Makefile CFLAGS/LDFLAGS, so any future host crash prints a symbolized backtrace (no debugger here,
+ASan is incompatible with the CUDA runtime).
+
+### 20. Verification — segfault gone, VRAM tier serving experts
+
+`COLI_CUDA=1 CUDA_DENSE=1 CUDA_EXPERT_GB=6 NGEN=8 ./mimo 64 4 8` on RTX 3060 12.9 GB / 20.8 GB RAM:
+- **`mimo exited rc=0`** — no segmentation fault; generated real text (`Ecc una frase sulosa e rispos`).
+- `[CUDA] complementary VRAM tier: 378 expert, VRAM 4.77 GB` loaded (budget fix: embed+lm_head no longer
+  over-counted in `g_cuda_dense_projected`, so the tier gets real budget instead of 0).
+- `[CUDA] resident set: 1234 tensor, 11.96 GB VRAM` — GPU near-full (12.9 GB).
+- Expert hit-rate **27.2%** (up from 17% baseline). VRAM tier served **565 calls**.
+- PROFILO-GPU: router 1.07s | cuda-copy(PCIe) 6.57s | cuda-compute 23.64s (of 30.21s matmul total).
+
+### 21. Remaining bottleneck is HOST-RAM starvation, not GEMM or PCIe
+
+Even with the VRAM tier working, throughput is **0.14 tok/s** because the per-layer expert cache cap is forced
+to **3** (`[RAM_GB=20.8 auto] ... cap abbassato 64->3`), causing **658 expert reloads/token** and
+`expert-disk 15.16s` of the 56.65s total. Why so little RAM for the cache:
+- `densa residente 9.5 GB` is retained in **host** RAM (the dense tensors are uploaded to GPU but the host
+  copy is kept), and
+- the GPU VRAM is already ~full (11.96 GB), so no more experts can move to VRAM.
+
+Net: only ~2.2 GB is left for the expert LRU → cap=3 → constant disk reloads. The real win is to **free the
+host-dense copy after GPU upload** (reclaiming ~9.5 GB for the expert cache → cap would rise to ~20/layer,
+dramatically raising hit-rate), or run on a GPU with more VRAM. PCIe copy (6.57s) and cuda-compute (23.64s)
+are secondary once the cache stops thrashing.
+
+### 22. P0 hardening (2026-07-11): eager dense, fail-loud gpu_only, auto expert budget
+
+Code review of the complementary-tier work found several correctness/footgun issues that are now fixed
+in-tree (before the next full-model re-measure):
+
+1. **Eager dense upload + free host (`cuda_upload_dense_all`)** — densas were still lazy on first
+   `matmul_qt`, so `pin_load` saw inflated free VRAM and raced experts against densas. Now after
+   `model_init` (and after `g_draft` is resolved): upload every `cuda_eligible` dense tensor, free its
+   host buffers, set `gpu_only=1`, and subtract from `resident_bytes` so `cap_for_ram` / AUTOPIN see the
+   reclaimed RAM. Order is **dense → expert tier**. `embed` and `lm_head` are unmarked (never VRAM:
+   gather path / better spent as expert slots). MTP densas upload only when `DRAFT>0`.
+
+2. **`gpu_only` no longer returns silent zeros** — previous path could `return` without writing `y` if
+   CUDA failed or if called under OpenMP (host slab already freed). Now: OpenMP + `gpu_only` →
+   fatal exit; CUDA fail with no host copy → fatal exit; if host somehow still present → CPU fallback.
+   Prefer loud failure over token corruption.
+
+3. **No double-calloc of `gpu_pin`** — `model_init` allocates `gpu_pin`/`ngpin`; `pin_load` reuses them
+   (and frees a previous tier if `pin_load` is called twice) instead of overwriting the pointers.
+
+4. **Expert VRAM budget uses real free** — after eager dense, `remaining = free - 1.5 GB headroom`
+   (no more projected-dense arithmetic that double-counted embed/lm_head per device).  
+   `CUDA_EXPERT_GB`: unset + `COLI_CUDA=1` → **auto** (`-1`, fill free-headroom); `0` = off; `>0` = cap in GB.
+
+5. **PCIe timer fixed** — `g_copy_sec` used to include kernel time because D2H is synchronous after
+   launch. Now: H2D → kernel → `cudaDeviceSynchronize` → D2H; only H2D+D2H accumulate. PROFILE-GPU
+   `cuda-copy` vs compute is trustworthy again.
+
+6. **SEGV handler is Linux-only** (`#ifdef __linux__`) so macOS builds do not pull `backtrace`.
+
+### 23. P0 re-measured on full MiMo (2026-07-11) — chat runs, ~0.50 tok/s
+
+Full-model run on the reference box (RTX 3060 12 GB, ~23 GB RAM, WSL2, SNAP
+`/root/mimo25_i4`, experts int4 / dense int8, `COLI_CUDA=1 CUDA_DENSE=1`,
+`CUDA_EXPERT_GB` auto, `DIRECT=1 TOPP=0.6 THINK=0`).
+
+**PROMPT mode** (`NGEN=24`, *"Write one short sentence about Rome."*):
+
+| metric | value |
+|---|---|
+| load | 51 s (dense eager 5.8 s + pin 2 s + VRAM tier 9 s) |
+| decode | **24 tok in 48.10 s → 0.50 tok/s** |
+| hit-rate expert | **46.3%** |
+| experts loaded / token | 235 (5.0 / layer of 47; TOPP=0.6 trims top-8) |
+| RAM pin | 361 experts (4.6 GB) |
+| VRAM complementary | **443 experts (5.59 GB)**, budget auto 5.6 GB |
+| VRAM densas | 99 tensors ok, **0 fail**, freed **4.69 GB host** |
+| resident set | 1428 tensors, **10.28 GB VRAM** |
+| RSS mid-gen | 13.64 GB |
+| LRU cap | 7 / layer (was 3 when host densas still resident) |
+| expert-disk | 12.36 s |
+| expert-matmul | 16.23 s |
+| attention | 15.25 s |
+| PROFILE-GPU | router 1.28 s · **cuda-copy 0.76 s** · cuda-compute 15.47 s |
+
+Output was coherent English about Rome. CUDA path stable (rc=0, no SEGV).
+
+**SERVE / chat** (same knobs, one turn): model READY in ~26 s after densas already
+warm from prior process? / cold load ~25–40 s; streamed a full sentence on Rome.
+`chat_peng.py` protocol works with the new binary (`COLI_CUDA=1 CUDA_DENSE=1` in env).
+
+**Vs pre-P0 baselines on this box:**
+
+| era | hit | expert-disk (scale) | tok/s | notes |
+|---|---|---|---|---|
+| densas GPU, host densas kept, pin≈VRAM duplicate (§20) | ~27–40% | high / cap=3 | 0.14–0.20 | host RAM starved |
+| complementary tier, host densas still kept | ~52% (other prompt) | lower | wall ~4× densas-only | pre-eager free |
+| **P0 eager+free densas + complementary (§23)** | **46%** | **12 s / 24 tok** | **0.50** | auto expert-GB, PCIe timer honest |
+
+**Reading the profile:** with a warm-ish pin, matmul+attention (~31 s) already
+dominate wall more than disk (12 s). Real PCIe copy is only **0.76 s** of the
+16 s expert-matmul — so the next speed lever is **kernel/fusion**, not more
+memcpy accounting. Hit-rate still ~half: more distinct residents (int2 / REPIN
+on `gpu_pin`) remains the coverage lever.
+
+**Still open (speed / correctness):** fuse expert GEMM (1 H2D/D2H per expert);
+REPIN for `gpu_pin`; finding #18 oracle ~1-position drift; WSL2 I/O CPU cost.

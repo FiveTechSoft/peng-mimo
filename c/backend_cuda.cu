@@ -4,6 +4,18 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
+
+/* Profile: cumulative host-side time spent in PCIe H2D/D2H copies inside
+ * coli_cuda_matmul. The caller subtracts a baseline taken before the timed
+ * region to isolate COPY overhead from KERNEL compute — the key question for
+ * tiny S=1 decode matmuls, where launch + 2x memcpy can dominate the matmul. */
+static double g_copy_sec = 0.0;
+extern "C" double coli_cuda_copy_seconds(void) { return g_copy_sec; }
+static double now_s(void) {
+    using namespace std::chrono;
+    return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
+}
 
 struct ColiCudaTensor {
     void *weights;
@@ -159,13 +171,17 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
     DeviceContext *ctx = find_ctx(device);
-    if (!tensor || !weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
-    size_t rb = row_bytes(fmt, I);
-    if (!rb || (fmt && !scales)) return 0;
+    if (!tensor || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
+    /* Cache hit: the caller already uploaded this tensor (e.g. a VRAM-only
+     * expert whose host slab was freed, so weights/scales are now NULL).
+     * Reuse the device copy without requiring the (freed) host pointers. */
     if (*tensor) {
         ColiCudaTensor *t = *tensor;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device;
     }
+    if (!weights) return 0;
+    size_t rb = row_bytes(fmt, I);
+    if (!rb || (fmt && !scales)) return 0;
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
@@ -199,11 +215,20 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t rb = row_bytes(fmt, I);
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
+    /* Isolate PCIe copy time from kernel time: D2H is synchronous and would
+     * otherwise fold kernel duration into "copy" if measured as one interval. */
+    double tc0 = now_s();
     if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
+    double tc1 = now_s();
     dim3 grid((unsigned)O, (unsigned)S);
     quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb);
-    if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
-        !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
+    if (!cuda_ok(cudaGetLastError(), "matmul launch")) return 0;
+    if (!cuda_ok(cudaDeviceSynchronize(), "matmul sync")) return 0;
+    double tc2 = now_s();
+    if (!cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
+    double tc3 = now_s();
+    g_copy_sec += (tc1 - tc0) + (tc3 - tc2);   /* H2D + D2H only */
+    (void)tc2;                                   /* kernel = tc2-tc1 (not accumulated here) */
     return 1;
 }
 

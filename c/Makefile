@@ -24,8 +24,8 @@ CC      = gcc
 # ARCH=x86-64-v3 -> binario PORTABILE su qualsiasi x86-64 moderno con AVX2 (per distribuire).
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
 ARCH   ?= native
-CFLAGS  = -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp -pthread
+CFLAGS  = -O3 -g -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+LDFLAGS = -lm -fopenmp -pthread -rdynamic
 endif
 
 # CUDA=1 adds an opt-in backend for resident tensors. The default build remains
@@ -52,8 +52,8 @@ all: glm
 glm: glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm $(LDFLAGS)
 
-mimo: mimo.c st.h json.h tok.h tok_unicode.h compat.h
-	$(CC) $(CFLAGS) mimo.c -o mimo $(LDFLAGS)
+mimo: mimo.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
+	$(CC) $(CFLAGS) mimo.c $(CUDA_OBJ) -o mimo $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }

@@ -42,6 +42,11 @@ void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
 
+/* Cumulative host time spent in PCIe H2D/D2H copies inside coli_cuda_matmul
+ * (kernel time excluded). Caller subtracts a baseline taken before the
+ * timed region to isolate copy overhead from compute. */
+double coli_cuda_copy_seconds(void);
+
 #ifdef __cplusplus
 }
 #endif
