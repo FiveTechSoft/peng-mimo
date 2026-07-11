@@ -16,7 +16,7 @@ OMPC    =
 OMPL    =
 endif
 CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm $(OMPL)
+LDFLAGS = -lm $(OMPL) -pthread
 else
 # --- Linux x86-64 (percorso originale, invariato) ---
 CC      = gcc
@@ -25,7 +25,7 @@ CC      = gcc
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
 ARCH   ?= native
 CFLAGS  = -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp
+LDFLAGS = -lm -fopenmp -pthread
 endif
 
 # CUDA=1 adds an opt-in backend for resident tensors. The default build remains

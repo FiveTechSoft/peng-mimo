@@ -30,6 +30,18 @@
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #endif
+#include <pthread.h>                              /* PILOT: async I/O thread for router-lookahead */
+
+/* PILOT/LOOKA router-lookahead prefetch (ported from colibri/glm.c). Globals are
+ * declared here (before moe()) so moe() can record the LOOKA accuracy counters;
+ * the helper functions live further down, just before layer_forward. */
+static int g_looka=0, g_pilot=0, g_pilot_k=8;
+static struct { int l,e; } pilot_q[4096];
+static volatile unsigned pilot_w=0, pilot_r=0;
+static void *pilot_m=NULL;                        /* Model* (defined later); cast at use */
+static int  pilot_pred[256][64];                  /* LOOKA: predicted top-K per layer */
+static int  pilot_pred_kt[256];
+static long looka_hit=0, looka_tot=0;
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
@@ -134,9 +146,15 @@ typedef struct {
     int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
     uint64_t eclock, hits, miss, ereq;
     uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
-    uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
+    uint64_t n_fw, n_emit;                       /* metodo E: forward de decode / token emessi */
     double t_edisk, t_emm, t_attn, t_head;       /* profiling: dove va il tempo (sempre attivo) */
     int64_t resident_bytes;
+    /* tabella RoPE precalcolata: gli angoli dipendono SOLO da (pos, j, tipo-layer),
+     * non dalla testa. La ricomputazione con powf() costava ~100k chiamate/token; qui
+     * si calcolano una volta per max_t e si consultano via lookup (bit-identico). */
+    float *rope_full_cos, *rope_full_sin;        /* [max_t][rope_dim/2]   theta_full */
+    float *rope_swa_cos,  *rope_swa_sin;         /* [max_t][rd_swa/2]     theta_swa  */
+    int rope_cap, rope_rd_full, rope_rd_swa;
 } Model;
 
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
@@ -768,6 +786,11 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap); st_init(&m->S,snap);
     Cfg *c=&m->c; char nm[256]; int D=c->hidden;
+    /* rd del RoPE per tipo di layer: full usa head_dim (=rope_dim), SWA usa swa_head_dim.
+     * Deve combaciare ESATTAMENTE con la rd calcolata in attention() (hd*c->rope_dim/c->head_dim). */
+    m->rope_rd_full = c->rope_dim;
+    m->rope_rd_swa  = (int)((int64_t)c->swa_head_dim*c->rope_dim/c->head_dim);
+    m->rope_cap = 0; m->rope_full_cos=m->rope_full_sin=m->rope_swa_cos=m->rope_swa_sin=NULL;
     /* embed e lm_head sono il confine I/O: tenerli ad alta precisione (come i quant dynamic
      * reali). dbits>=8 -> qui f32; piu' basso -> dbits. */
     int io_bits = dbits>=8 ? 16 : dbits;
@@ -1000,14 +1023,43 @@ static void expert_prefetch(Model *m, int layer, int eid){
 }
 
 /* RoPE parziale NON-interleaved (NeoX/rotate_half) su UNA testa: ruota i primi rd dim,
- * il resto passa intatto. Coppie (j, j+half) con half=rd/2; inv_freq_j = theta^(-2j/rd). */
-static void rope_neox(float *v, int pos, int rd, float theta){
+ * il resto passa intatto. Coppie (j, j+half) con half=rd/2. cos/sin arrivano GIA'
+ * precalcolati in cos[j]/sin[j] (riga della posizione corrente nella tabella RoPE),
+ * cosi' il caldo non rifa mai powf()/cosf()/sinf() per token. Bit-identico a rope_neox. */
+static inline void rope_apply(float *v, int rd, const float *cos, const float *sin){
     int half=rd/2;
     for(int j=0;j<half;j++){
-        float ang=(float)pos*powf(theta,-2.f*(float)j/(float)rd);
-        float cs=cosf(ang), sn=sinf(ang);
+        float cs=cos[j], sn=sin[j];
         float a=v[j], b=v[half+j];
         v[j]=a*cs-b*sn; v[half+j]=b*cs+a*sn;
+    }
+}
+
+/* Precalcola le tabelle RoPE fino a max_t per I DUE tipi di layer (full/SWA, theta e rd
+ * diversi). Chiamata da kv_alloc(): gli angoli dipendono solo da (pos, j) per tipo, quindi
+ * si calcolano una volta sola e si riusano per tutti i token/capi. Ricostruisce solo se
+ * serve piu' spazio (max_t crescente). */
+static void rope_build(Model *m, int max_t){
+    Cfg *c=&m->c;
+    if(max_t<=m->rope_cap) return;
+    if(m->rope_full_cos){ free(m->rope_full_cos); free(m->rope_full_sin);
+                          free(m->rope_swa_cos);  free(m->rope_swa_sin); }
+    m->rope_cap = max_t;
+    int nf=c->rope_dim/2, ns=m->rope_rd_swa/2;
+    size_t szf=(size_t)max_t*nf, szs=(size_t)max_t*ns;
+    m->rope_full_cos=falloc(szf); m->rope_full_sin=falloc(szf);
+    m->rope_swa_cos =falloc(szs); m->rope_swa_sin =falloc(szs);
+    for(int pos=0;pos<max_t;pos++){
+        for(int j=0;j<nf;j++){
+            float ang=(float)pos*powf(c->theta_full,-2.f*(float)j/(float)c->rope_dim);
+            m->rope_full_cos[(size_t)pos*nf+j]=cosf(ang);
+            m->rope_full_sin[(size_t)pos*nf+j]=sinf(ang);
+        }
+        for(int j=0;j<ns;j++){
+            float ang=(float)pos*powf(c->theta_swa,-2.f*(float)j/(float)m->rope_rd_swa);
+            m->rope_swa_cos[(size_t)pos*ns+j]=cosf(ang);
+            m->rope_swa_sin[(size_t)pos*ns+j]=sinf(ang);
+        }
     }
 }
 
@@ -1022,7 +1074,6 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int kvh=lyr_kvh(c,layer), hd=lyr_hd(c,layer), vd=lyr_vd(c,layer);
     int group=H/kvh, qs=H*hd, ks=kvh*hd, vs=kvh*vd, rowsz=qs+ks+vs;
     int swa=c->is_swa[layer];
-    float theta = swa ? c->theta_swa : c->theta_full;
     /* rope_dim e scala dipendono dal TIPO di layer: derivati da hd, non dai campi full-only
      * di Cfg (rope_dim fu calcolato da head_dim*prf: qui lo riscaliamo in interi, esatto) */
     int rd=(int)((int64_t)hd*c->rope_dim/c->head_dim);
@@ -1031,14 +1082,21 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* 1) proiezione fusa qkv [q|k|v] per tutti i token nuovi */
     float *qkv=falloc((int64_t)S*rowsz);
     matmul_qt(qkv, x, &l->qkv, S);
-    /* 2) per token: v*v_scale prima della cache, RoPE su q (in place) e k, append in KV */
+    /* 2) per token: v*v_scale prima della cache, RoPE su q (in place) e k, append in KV.
+     * cos/sin arrivano dalla tabella precalcolata per (pos, tipo-layer): niente powf() sul
+     * percorso caldo. */
+    const float *base_cos = swa ? m->rope_swa_cos : m->rope_full_cos;
+    const float *base_sin = swa ? m->rope_swa_sin : m->rope_full_sin;
+    int half=rd/2;
     for(int s=0;s<S;s++){
         int pos=pos_base+s; float *r=qkv+(int64_t)s*rowsz;
         float *Kd=m->K[layer]+(int64_t)pos*ks, *Vd=m->V[layer]+(int64_t)pos*vs;
         memcpy(Kd, r+qs, ks*sizeof(float));
         for(int i=0;i<vs;i++) Vd[i]=r[qs+ks+i]*c->v_scale;
-        for(int h=0;h<H;h++)   rope_neox(r+(int64_t)h*hd, pos, rd, theta);
-        for(int g=0;g<kvh;g++) rope_neox(Kd+(int64_t)g*hd, pos, rd, theta);
+        const float *ct=base_cos+(size_t)pos*half;
+        const float *st=base_sin+(size_t)pos*half;
+        for(int h=0;h<H;h++)   rope_apply(r+(int64_t)h*hd, rd, ct, st);
+        for(int g=0;g<kvh;g++) rope_apply(Kd+(int64_t)g*hd, rd, ct, st);
     }
     /* 3) attenzione causale per (s,h): GQA, testa kv g=h/group */
     float *ctx=falloc((int64_t)S*H*vd);
@@ -1123,6 +1181,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
+        /* LOOKA: compare this layer's true selection against the PILOT prediction
+         * made by the previous layer (pilot_pred[layer]). */
+        if(g_looka && pilot_pred_kt[layer]>0){
+            int kt=pilot_pred_kt[layer];
+            for(int kk=0;kk<Ke;kk++){ int e=idxs[(int64_t)s*K+kk];
+                for(int j=0;j<kt;j++) if(pilot_pred[layer][j]==e){ looka_hit++; break; }
+                looka_tot++; }
+        }
     }
     m->enr[layer]=keff[S-1]; for(int kk=0;kk<keff[S-1];kk++) m->eroute[layer][kk]=idxs[(int64_t)(S-1)*K+kk];
     /* ---- FASE B: union degli expert del batch ---- */
@@ -1211,6 +1277,50 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
 }
 
 /* forward di UN layer */
+/* === PILOT: router-lookahead disk prefetch (ported from colibri/glm.c) ===============
+ * While computing layer L, we apply layer L+1's router to the current state to
+ * predict its top-K experts, and warm them with WILLNEED in a separate I/O thread.
+ * This is a purely I/O hint: it touches no weights and no compute, so it NEVER
+ * changes the output tokens. Measured recall on GLM ~71.6% of true top-8; the
+ * misses are minor stalls. PILOT=1 enables the prefetch; LOOKA=1 (without PILOT)
+ * measures its recall on MiMo. */
+static int in_top(int *a,int n,int v){ for(int i=0;i<n;i++) if(a[i]==v) return 1; return 0; }
+static void looka_print(void){
+    if(g_looka && looka_tot>0)
+        fprintf(stderr,"[looka] PILOT recall top-%d: %.1f%% (%ld/%ld)\n",
+                g_pilot_k, 100.0*looka_hit/looka_tot, looka_hit, looka_tot);
+}
+static void *pilot_worker(void *arg){
+    (void)arg;
+    for(;;){
+        unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
+        unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
+        if(r==w){ usleep(200); continue; }
+        expert_prefetch((Model*)pilot_m, pilot_q[r&4095].l, pilot_q[r&4095].e);
+        __atomic_store_n(&pilot_r,r+1,__ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
+    Cfg *c=&m->c; int D=c->hidden, E=c->n_experts;
+    Layer *l = &m->L[lnext];
+    int K = g_pilot_k<c->topk ? g_pilot_k : c->topk;
+    if(g_pilot && !pilot_m){ pilot_m=(void*)m; pthread_t t; pthread_create(&t,NULL,pilot_worker,NULL); }
+    float *nrm=falloc(D), *ch=falloc(E);
+    for(int s=0;s<S;s++){
+        rmsnorm(nrm, x+(int64_t)s*D, l->post_ln, D, c->eps);
+        matmul(ch, nrm, l->router, 1, D, E);
+        for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+        int top[64], kt=0;
+        for(int e=0;e<E && kt<K;e++){ int b=-1; for(int f=0;f<E;f++) if((b<0||ch[f]>ch[b])&&!in_top(top,kt,f)) b=f; if(b>=0) top[kt++]=b; }
+        for(int k=0;k<K;k++){ int e=top[k];
+            if(g_looka) pilot_pred[lnext][k]=e;
+            if(g_pilot) expert_prefetch(m,lnext,e);   /* WILLNEED: idempotente, ignoriamo i duplicati */
+        }
+        if(g_looka) pilot_pred_kt[lnext]=K;
+    }
+    free(nrm); free(ch);
+}
 static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_base, float *nrm, float *tmp){
     Cfg *c=&m->c; int D=c->hidden;
     if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
@@ -1218,6 +1328,10 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
     attention(m,l,li,nrm,S,pos_base,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+    /* PILOT: while computing this layer, predict the NEXT layer's experts and
+     * warm them in the background (decode-only, S<=8; prediction = layer L+1's
+     * router applied to the current state). I/O hint only: tokens are unchanged. */
+    if((g_pilot||g_looka) && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
     if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
@@ -1239,8 +1353,9 @@ static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c; int NR=c->n_layers+1;          /* riga extra: KV del layer MTP (se attivo) */
     if(m->K){ for(int i=0;i<NR;i++){ free(m->K[i]); free(m->V[i]); } free(m->K); free(m->V); }
     m->max_t=max_t;
+    rope_build(m, max_t);                 /* precomputed RoPE tables up to max_t (decode/prefill) */
     m->K=calloc(NR,sizeof(float*)); m->V=calloc(NR,sizeof(float*));
-    int rows = m->has_mtp ? NR : c->n_layers;    /* riga MTP solo se la testa esiste */
+    int rows = m->has_mtp ? NR : c->n_layers;    /* MTP KV row only if the head exists */
     for(int i=0;i<rows;i++){
         m->K[i]=falloc((int64_t)max_t*lyr_kvh(c,i)*lyr_hd(c,i));
         m->V[i]=falloc((int64_t)max_t*lyr_kvh(c,i)*lyr_vd(c,i));
@@ -2150,9 +2265,17 @@ int main(int argc, char **argv){
                                                            * load (testa MTP presente -> 3, no -> 0) */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+    { const char *e=getenv("I4S"); if(e) g_i4s=atoi(e); }   /* soglia S per IDOT int4 (doc: 1=anche
+                                                            * decode S=1 su AVX2, 2=default autore).
+                                                            * Nota: a S=1 su AVX2 cambia l'arrotondamento
+                                                            * del decode (non token-exact): solo per chat. */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.95f;  /* 0.95 = generation_config MiMo-V2.5 */
+    g_looka = getenv("LOOKA")?1:0;                    /* PILOT accuracy measurement (no prefetch) */
+    g_pilot = getenv("PILOT")?1:0;                   /* router-lookahead async WILLNEED */
+    { const char *e=getenv("PILOT_K"); if(e) g_pilot_k=atoi(e); }
+    if(g_looka) atexit(looka_print);                 /* print recall at end of run (any exit) */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
     else { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); g_rng ^= (uint64_t)ts.tv_nsec<<20 ^ (uint64_t)getpid(); }
     if(g_draft<-1) g_draft=-1;

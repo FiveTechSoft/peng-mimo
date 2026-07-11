@@ -316,3 +316,60 @@ aleatorio con arquitectura real es la herramienta: barato de generar, determinis
 > modelo con las mismas piezas y comprobamos que nuestra copia del motor produce
 > EXACTAMENTE los mismos resultados que el original, número a número. Si la maqueta
 > cuadra perfecta, el grande cuadrará.
+
+## Motor C: optimizaciones aplicadas
+
+### 15. RoPE precomputada: adiós a los ~100k powf/cosf/sinf por token
+
+El motor recalculaba los ángulos de RoPE para cada (posición, cabeza, dimensión) en
+cada token (≈100k llamadas trig/token en MiMo). Ahora `rope_build()` precalcula las
+tablas cos/sin por posición para capas full y SWA hasta `max_t`, y `rope_apply()` solo
+hace lookup (misma fórmula, mismo orden). Verificado bit-a-bit contra la fórmula
+directa con `c/rope_check.c` (512 comparaciones, 0 fallos). Ganancia de CPU: ~10 ms/token
+≈ 0.3% de un token de 3.3 s — despreciable para velocidad, pero más limpio y
+determinista (y elimina un coste que crecía con S en prefill).
+
+### 16. Knob I4S cableado (estaba documentado pero no se leía)
+
+`main()` no leía la env `I4S`; ahora `getenv("I4S")` fija `g_i4s` (umbral S para
+activar IDOT int4). Nota: en AVX2 `I4S=1` cambia el redondeo del decode (NO
+token-exact) → solo para chat, nunca para validación contra el oráculo.
+
+### 17. PILOT/LOOKA: prefetch asíncrono por lookahead del router (portado de colibri/glm.c)
+
+Mientras se calcula la capa L, se aplica el router de la capa L+1 al estado actual
+para predecir sus expertos top-K, y se calientan con WILLNEED en un hilo de I/O
+aparte (ring lock-free 1P/1C). Es un hint puramente I/O: no toca pesos ni cómputo,
+por lo que **NO cambia los tokens** (seguro dejarlo activo). Recall medido en GLM
+~71.6% de los top-8 verdaderos; los mancanti son stall menores.
+- `PILOT=1` activa el prefetch. `LOOKA=1` (sin PILOT) mide el recall en MiMo y lo
+  imprime al salir vía `atexit`. `PILOT_K` ajusta el K predicho.
+- El router de MiMo es idéntico al de GLM (sigmoid + noaux_tc, n_group=1) → portable
+  directo. En mimo el router vive en `l->router`/`l->router_bias`; la residencia se
+  consulta a través de `expert_prefetch` (WILLNEED idempotente). A diferencia de glm,
+  mimo NO usa el chequeo `st_resident`/`sh_key` (su API de shard es `m->S` a nivel
+  modelo, no por capa) — los duplicados en el ring son inofensivos.
+- Build: `Makefile` añade `-pthread` a LDFLAGS (Linux y macOS) para el hilo de I/O.
+
+**Cuánto acelera (respuesta honesta):** PILOT solo solapa I/O con cómputo; no reduce
+el coste de CPU. En la caja de referencia (64 GB RAM, disco 2.75 GB/s, 15B activos =
+7.5 GB/token): tras el warmup los 7.5 GB de expertos activos caben en caché → el
+disco queda idle y el decode es compute-bound (~3.3 s/token, 0.3 tok/s). Ahí PILOT
+aporta **~0%**. Solo ayuda cuando el disco de verdad frenaría el pipeline:
+- arranque en frío / primer token (caché vacía): solapa la lectura de los expertos de
+  la capa siguiente tras el cómputo de la actual;
+- caja con poca RAM donde el conjunto activo hace thrash (cada token necesita disco);
+- cuando el routing cambia y hay que leer un experto aún no cargado.
+
+En esos momentos disk-bound, con 71.6% de acierto PILOT esconde ~70% de la latencia
+de disco (2.7 s/token) tras el cómputo: ese token baja de ~6 s (disco+compute en
+serie) a ~3.3 s → hasta **~2x en los tokens fríos/perdidos**; ~0% en régimen
+cacheado. La palanca grande sigue siendo más RAM (`CAP_RAISE`), `PIN`/`autopin`, o
+offload a GPU (`COLI_CUDA=1`). RoPE (#15) es aún más marginal (~0.3%).
+
+**Pendiente de validación end-to-end:** el recall LOOKA real en MiMo y el token-exact
+bajo PILOT no se han medido todavía porque la generación del oráculo tiny
+(`make_mimo_oracle.py`) sigue bloqueada por el conflicto de versiones de
+`transformers` (hallazgo 1). Por construcción PILOT no puede alterar los tokens
+(solo WILLNEED), así que su activación es segura aunque el recall final se confirme
+cuando el oráculo esté disponible.
