@@ -468,12 +468,19 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
      * pay (S>=2 gate); on ARM/SDOT single-token DOES pay (see g_i4s / PR #9 for the VNNI
      * twin). Threshold configurable via I4S. */
     if(g_idot && (w->fmt==1 || (w->fmt==2 && S>=g_i4s))){
-        int I=w->I;
-        int8_t *xq=malloc((size_t)S*I); float sxb[64]; float *sx=S<=64?sxb:falloc(S);
+        /* Thread-local quant scratch (colibri #43): no malloc/free per matmul. */
+        typedef struct { int8_t *xq; size_t xq_cap; float *sx; size_t sx_cap; } QScratch;
+        static _Thread_local QScratch qs;
+        int I=w->I; size_t xn=(size_t)S*(size_t)I, sn=(size_t)S;
+        if(S<0 || I<0 || (I && (size_t)S>SIZE_MAX/(size_t)I)){
+            fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1);
+        }
+        if(xn>qs.xq_cap){ int8_t *p=realloc(qs.xq,xn); if(!p){fprintf(stderr,"OOM quant scratch\n");exit(1);} qs.xq=p; qs.xq_cap=xn; }
+        if(sn>qs.sx_cap){ float *p=realloc(qs.sx,sn*sizeof(float)); if(!p){fprintf(stderr,"OOM quant scales\n");exit(1);} qs.sx=p; qs.sx_cap=sn; }
+        int8_t *xq=qs.xq; float *sx=qs.sx;
         for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
         if(w->fmt==1) matmul_q_idot(y,xq,sx,w->q8,w->s,S,I,w->O);
         else matmul_i4_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
-        free(xq); if(sx!=sxb) free(sx);
         return;
     }
     if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
