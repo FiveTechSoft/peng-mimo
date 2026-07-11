@@ -31,6 +31,9 @@
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #endif
 #include <pthread.h>                              /* PILOT: async I/O thread for router-lookahead */
+#ifdef __linux__
+#include <sys/syscall.h>                          /* OVERLAP: gettid per il nice dei thread loader */
+#endif
 
 /* PILOT/LOOKA router-lookahead prefetch (ported from colibri/glm.c). Globals are
  * declared here (before moe()) so moe() can record the LOOKA accuracy counters;
@@ -574,6 +577,10 @@ static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (0.95 = generation_co
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
+static int g_overlap=1;  /* OVERLAP=0 -> disattiva la pipeline load/compute dentro il layer
+                          * (torna alle due fasi serializzate: prima tutti i load, poi i matmul) */
+static int g_overlap_t=4;/* OVERLAP_T: thread del pool di load asincroni. 4 misurato migliore
+                          * di 8 su WSL/VHDX (meno contesa col team OpenMP dei matmul) */
 static int g_draft=0;    /* metodo E: DRAFT=n token speculati per forward (0=off). Con la testa
                           * MTP nativa nel container il draft e' della testa (acceptance 37-64%
                           * misurata sul modello reale); senza, n-gram lookup (acceptance ~5%,
@@ -1022,6 +1029,83 @@ static void expert_prefetch(Model *m, int layer, int eid){
     }
 }
 
+/* === OVERLAP: pipeline load/compute DENTRO il layer ==================================
+ * Prima: FASE load (omp parallel sui miss) POI FASE compute — il profilo sul modello
+ * reale mostrava expert-disk ed expert-matmul ADDITIVI (74.5s + 46.4s su 139s totali:
+ * serializzati). Qui i load dei miss partono su un piccolo pool di pthread e il loop di
+ * calcolo CONSUMA gli slot ws[] nello STESSO ordine di prima, aspettando il flag ready
+ * del singolo slot: mentre l'expert j viene moltiplicato, j+1.. sono in lettura.
+ * LOSSLESS per costruzione: stessi kernel, stessi slot, stesso ordine di accumulo
+ * (findings §17: la somma float non commuta e l'ordine top-k a S=1 deve restare
+ * bit-esatto) — cambia solo QUANDO parte la pread. Compone con PILOT (hint WILLNEED
+ * per la capa L+1 su un altro thread) e col WILLNEED del blocco-64 successivo.
+ * t_edisk diventa il tempo di STALLO (attesa slot), non piu' il tempo di lettura:
+ * e' la metrica onesta dell'overlap. OVERLAP=0 ripristina il percorso a fasi.
+ * MISURATO (WSL2/VHDX, 32 token TOPP=0.7): lo stallo scende davvero (43s -> 26s,
+ * profilo non piu' additivo) ma expert-matmul si gonfia quasi 1:1 (17s -> 30s):
+ * su questo host il "disco" e' in gran parte CPU dell'I/O-stack host (VHDX) sugli
+ * STESSI core dei matmul, quindi il wall-clock resta ~pari (DIRECT=1) o ~-7%%
+ * (buffered, rumoroso). Su NVMe nativo con vero DMA il tempo nascosto e' latenza
+ * reale e l'overlap deve pagare: si lascia ON di default con pool piccolo (T=4).
+ * EN: async expert loads on a tiny pthread pool; the compute loop consumes slots in
+ * the ORIGINAL order via per-slot ready flags, so accumulation order (and thus every
+ * output bit) is unchanged. The waiter helps run unclaimed jobs, so forward progress
+ * never depends on the pool. Single producer (main); ring of 64 = max miss per block.
+ * Measured on the WSL2/VHDX reference host: stall drops 43s->26s but expert-matmul
+ * inflates 17s->30s (host-side I/O CPU shares the cores) -> wall-clock break-even
+ * with T=4; the win materializes where I/O is DMA/latency-bound, not CPU-bound. */
+typedef struct { Model *m; int layer, eid; ESlot *slot; } OvJob;
+static OvJob ov_job[64];
+static volatile int ov_done[64];
+static volatile unsigned ov_next=0, ov_total=0;   /* indici monotoni sul ring (1P/NC) */
+static int ov_started=0;
+/* prende ed esegue il job non reclamato piu' vecchio, se il suo indice e' <=idx_max.
+ * Ritorna 0 se non c'era niente da fare (il chiamante puo' dormire). */
+static int ov_claim(unsigned idx_max){
+    unsigned n=__atomic_load_n(&ov_next,__ATOMIC_RELAXED);
+    unsigned t=__atomic_load_n(&ov_total,__ATOMIC_ACQUIRE);
+    if(n>=t || n>idx_max) return 0;
+    if(!__atomic_compare_exchange_n(&ov_next,&n,n+1,0,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED)) return 1;
+    OvJob *j=&ov_job[n&63];
+    expert_load(j->m,j->layer,j->eid,j->slot);
+    __atomic_store_n(&ov_done[n&63],1,__ATOMIC_RELEASE);
+    return 1;
+}
+static void *ov_worker(void *a){ (void)a;
+#ifdef __linux__
+    /* i loader NON devono rubare cicli al team OpenMP dei matmul: senza nice l'expert-
+     * matmul raddoppiava (17s -> 32s su 32 token, misurato) e mangiava il guadagno
+     * dell'overlap. I loader stanno quasi sempre bloccati in pread; il nice conta solo
+     * nei tratti CPU (copia dalla page-cache), dove devono cedere il passo.
+     * EN: deprioritize loaders so the OMP matmul team keeps the cores; loaders mostly
+     * block in pread anyway (per-thread nice is Linux-specific and exactly what we want). */
+    setpriority(PRIO_PROCESS,(id_t)syscall(SYS_gettid),10);
+#endif
+    for(;;) if(!ov_claim(UINT_MAX)) usleep(200);
+    return NULL; }
+/* accoda i load dei miss del blocco corrente; ritorna l'indice ring del primo.
+ * Chiamato SOLO dal thread principale, e solo dopo che il blocco precedente e' stato
+ * interamente consumato (ov_wait su tutti i suoi job) -> il ring non si sovrascrive. */
+static unsigned ov_submit(Model *m,int layer,const int *eids,const int *missk,int nmiss){
+    if(!ov_started){
+        for(int i=0;i<g_overlap_t;i++){ pthread_t t;
+            if(pthread_create(&t,NULL,ov_worker,NULL)==0) pthread_detach(t); }
+        ov_started=1;   /* se qualche create fallisse: ov_wait sa eseguire i job da solo */
+    }
+    unsigned b=ov_total;
+    for(int q=0;q<nmiss;q++){
+        OvJob j={m,layer,eids[missk[q]],&m->ws[q]};
+        ov_job[(b+(unsigned)q)&63]=j;
+        __atomic_store_n(&ov_done[(b+(unsigned)q)&63],0,__ATOMIC_RELAXED);
+    }
+    __atomic_store_n(&ov_total,b+(unsigned)nmiss,__ATOMIC_RELEASE);
+    return b;
+}
+static void ov_wait(unsigned idx){
+    while(!__atomic_load_n(&ov_done[idx&63],__ATOMIC_ACQUIRE))
+        if(!ov_claim(idx)) usleep(50);            /* job orfano o in coda: aiuta il chiamante */
+}
+
 /* RoPE parziale NON-interleaved (NeoX/rotate_half) su UNA testa: ruota i primi rd dim,
  * il resto passa intatto. Coppie (j, j+half) con half=rd/2. cos/sin arrivano GIA'
  * precalcolati in cos[j]/sin[j] (riga della posizione corrente nella tabella RoPE),
@@ -1204,18 +1288,22 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     float *contrib = g_fw1 ? falloc((int64_t)S*K*D) : NULL;   /* verifica: contributi per (pos,k) */
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
-        ESlot *use[64]; int missk[64]; int nmiss=0;
-        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL;
+        ESlot *use[64]; int missk[64], jq[64]; int nmiss=0;
+        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; jq[j]=-1;
             ESlot *P=m->pin[layer];
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=++m->eclock; use[j]=&Sl[z]; break; } }
-            if(!use[j]){ use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
+            if(!use[j]){ jq[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
         }
-        if(nmiss){ double t0=now_s();
-            #pragma omp parallel for schedule(dynamic,1)
-            for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q]);
-            m->t_edisk += now_s()-t0; }
+        unsigned ovb=0;
+        if(nmiss){
+            if(g_overlap) ovb=ov_submit(m,layer,uniq+base,missk,nmiss);   /* load asincroni: si
+                                                  * consumano in ordine nel loop di calcolo */
+            else { double t0=now_s();
+                #pragma omp parallel for schedule(dynamic,1)
+                for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q]);
+                m->t_edisk += now_s()-t0; } }
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
          * questo — il kernel legge in background, le pread dopo trovano cache calda */
         if(base+64<nu){
@@ -1233,6 +1321,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                 if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; rk[nr]=kk; nr++; break; }
             if(!nr) continue;
+            if(g_overlap && jq[j]>=0){ double t0=now_s();   /* stallo = attesa del load async */
+                ov_wait(ovb+(unsigned)jq[j]); m->t_edisk += now_s()-t0; }
 #ifdef COLI_CUDA
             if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
 #endif
@@ -1248,6 +1338,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                        for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; } }
             m->t_emm += now_s()-t0;
         }
+        if(g_overlap && nmiss){ double t0=now_s();   /* ritardatari (expert rimasti senza righe):
+                                                      * gli slot ws[] vanno quiescenti PRIMA dello
+                                                      * swap LRU e del riuso al blocco successivo */
+            for(int q=0;q<nmiss;q++) ov_wait(ovb+(unsigned)q);
+            m->t_edisk += now_s()-t0; }
         { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
@@ -2264,6 +2359,9 @@ int main(int argc, char **argv){
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* draft per forward; -1 = auto dopo il
                                                            * load (testa MTP presente -> 3, no -> 0) */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
+    g_overlap = getenv("OVERLAP")?atoi(getenv("OVERLAP")):1;   /* 0 = load/compute a fasi (A/B) */
+    { const char *e=getenv("OVERLAP_T"); if(e){ g_overlap_t=atoi(e);
+        if(g_overlap_t<1)g_overlap_t=1; if(g_overlap_t>16)g_overlap_t=16; } }
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
     { const char *e=getenv("I4S"); if(e) g_i4s=atoi(e); }   /* soglia S per IDOT int4 (doc: 1=anche
                                                             * decode S=1 su AVX2, 2=default autore).
