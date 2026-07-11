@@ -13,8 +13,9 @@ if not MIMO:
 HERE = os.path.dirname(MIMO)
 ENV = dict(os.environ, SNAP=SNAP, SERVE="1", THINK=os.environ.get("THINK", "0"),
            NGEN=os.environ.get("NGEN", "80"),
-           # combo medido 2.15x en el host de desarrollo (0.20 -> 0.43 tok/s):
-           TOPP=os.environ.get("TOPP", "0.7"), DIRECT=os.environ.get("DIRECT", "1"))
+           # combo medido 2.4x en el host de desarrollo (0.20 -> 0.48 tok/s);
+           # TOPP=0.5 ya altera la trayectoria del modelo: 0.6 es el punto dulce
+           TOPP=os.environ.get("TOPP", "0.6"), DIRECT=os.environ.get("DIRECT", "1"))
 READY = b"\x01\x01READY\x01\x01"
 END = b"\x01\x01END\x01\x01"
 
