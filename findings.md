@@ -1,417 +1,364 @@
-# findings — hallazgos del proyecto peng
+# findings — project discoveries and technical insights
 
-Registro de sorpresas y descubrimientos técnicos durante el port de colibrì a MiMo-V2.5.
-Cada entrada: el hallazgo técnico + una explicación para no entendidos.
+Record of surprises and technical discoveries during the port of colibrí to MiMo-V2.5.
+Each entry: the technical finding + an explanation for the uninitiated.
 
 ---
 
-## Arquitectura de MiMo-V2.5
+## MiMo-V2.5 Architecture
 
-### 1. El código de referencia oficial solo funciona con transformers 5.0–5.1
+### 1. Official reference code only works with transformers 5.0–5.1
 
-El `modeling_mimo_v2.py` que publica Xiaomi necesita a la vez una API que nació en
-transformers 5.0 (`standardize_rope_params`) y otra que murió en la 5.2 (el argumento
-`input_embeds` de `create_causal_mask`, renombrado después). Probamos las ruedas de
-4.57 a 5.13: solo 5.0.0 y 5.1.0 satisfacen ambas. Usamos 5.1.0 en un venv dedicado
-(`~/mimo-venv`) sin tocar ni una coma del código oficial.
+The `modeling_mimo_v2.py` that Xiaomi publishes requires both an API that was born in
+transformers 5.0 (`standardize_rope_params`) and another that died in 5.2 (the `input_embeds`
+argument to `create_causal_mask`, renamed later). We tested versions 4.57 to 5.13: only
+5.0.0 and 5.1.0 satisfy both. We use 5.1.0 in a dedicated venv (`~/mimo-venv`) without
+touching a single comma of the official code.
 
-> **En cristiano:** el "manual de instrucciones" del modelo solo se puede leer con una
-> versión muy concreta de la librería de referencia — ni la que dice su propia etiqueta
-> (4.57) ni la última. Encontramos la ventana exacta probando una por una.
+> **In plain terms:** the "instruction manual" for the model can only be read with a very
+> specific version of the reference library — neither the one its own tag says (4.57) nor
+> the latest. We found the exact window by testing one by one.
 
-### 2. Las capas de ventana deslizante tienen SU PROPIA geometría de atención
+### 2. Sliding window attention layers have THEIR OWN attention geometry
 
-No solo cambia la ventana: las capas SWA usan más cabezas KV (8 vs 4 en el modelo real;
-4 vs 2 en el tiny) y sus propias dimensiones de cabeza (`swa_head_dim`, `swa_v_head_dim`
-— y ojo: si no están en el config, `swa_v_head_dim` hereda de `swa_head_dim`, NO de
-`v_head_dim`). Lo descubrió el modelo tiny: su `o_proj` SWA es [128,192], no [128,128].
+It's not just the window: SWA layers use more KV heads (8 vs 4 in the real model; 4 vs 2 in
+tiny) and their own head dimensions (`swa_head_dim`, `swa_v_head_dim` — and watch out: if
+they're not in the config, `swa_v_head_dim` inherits from `swa_head_dim`, NOT from
+`v_head_dim`). Discovered by the tiny model: its SWA `o_proj` is [128,192], not [128,128].
 
-> **En cristiano:** el modelo alterna dos tipos de "vista": 9 capas miran toda la
-> conversación y 39 solo las últimas 128 palabras. Resulta que además usan gafas de
-> distinta graduación — si el motor asume la misma para todas, los números no cuadran.
+> **In plain terms:** the model alternates two types of "vision": 9 layers see the entire
+> conversation and 39 only the last 128 words. Turns out they also wear glasses with
+> different prescriptions — if the engine assumes the same for all, the numbers don't add up.
 
-### 3. Sink bias: un "desagüe de atención" solo en capas SWA
+### 3. Sink bias: an "attention sink" only in SWA layers
 
-Cada cabeza de las capas de ventana tiene un logit extra aprendido que participa en el
-softmax pero cuya probabilidad se descarta — un sumidero que absorbe atención sobrante.
-Las capas full no lo tienen (`add_full_attention_sink_bias: false`).
+Each head in sliding window layers has an extra learned logit that participates in the softmax
+but whose probability is discarded — a sink that absorbs excess attention. Full layers don't
+have it (`add_full_attention_sink_bias: false`).
 
-> **En cristiano:** cuando el modelo solo ve las últimas 128 palabras, necesita un sitio
-> donde "aparcar" la atención que no quiere gastar en ninguna de ellas. Es un truco de
-> estabilidad; sin implementarlo, los resultados divergen.
+> **In plain terms:** when the model only sees the last 128 words, it needs a place to "park"
+> attention it doesn't want to spend on any of them. It's a stability trick; without implementing
+> it, results diverge.
 
-### 4. Los valores (V) se multiplican por 0.707 antes de todo
+### 4. Values (V) are multiplied by 0.707 before everything
 
-`attention_value_scale: 0.707` (≈ 1/√2) se aplica al vector V justo tras la proyección,
-antes de entrar en la cache KV. Lo aplicamos en runtime (coste despreciable) para que el
-mismo código sirva al oráculo f32 y al contenedor cuantizado.
+`attention_value_scale: 0.707` (≈ 1/√2) is applied to the V vector right after projection,
+before entering the KV cache. We apply it at runtime (negligible cost) so the same code serves
+both the f32 oracle and the quantized container.
 
-### 5. QKV fusionado y o_proj fuera de la cuantización FP8
+### 5. Fused QKV and o_proj outside FP8 quantization
 
-El checkpoint guarda q, k y v en un solo tensor por capa (`qkv_proj`, layout
-"fused_qkv") — y todos los `o_proj` están en la lista `ignored_layers`: viajan en
-bf16 mientras el resto va en FP8 con escalas de bloque 128×128. El converter tendrá
-que tratarlos distinto.
+The checkpoint saves q, k, and v in a single tensor per layer (`qkv_proj`, "fused_qkv" layout)
+— and all `o_proj` are in the `ignored_layers` list: they travel in bf16 while the rest go in
+FP8 with 128×128 block scales. The converter will need to treat them differently.
 
-### 6. Config con trampas pequeñas
+### 6. Config with small gotchas
 
-- `rope_theta` y `partial_rotary_factor` aparecen DUPLICADOS (top-level y dentro de
-  `rope_parameters`); `swa_rope_theta` solo top-level.
-- `routed_scaling_factor` es `null` JSON (no ausente) → hay que tratar null como 1.0.
-- El epsilon de normalización se llama `layernorm_epsilon` (GLM usa `rms_norm_eps`).
-- RoPE es parcial (primeros 64 de 192 dims) y NO-interleaved (estilo NeoX/rotate_half),
-  con theta distinto por tipo de capa: 10.000.000 (full) vs 10.000 (SWA).
+- `rope_theta` and `partial_rotary_factor` appear DUPLICATED (top-level and inside
+  `rope_parameters`); `swa_rope_theta` only top-level.
+- `routed_scaling_factor` is null JSON (not absent) → must treat null as 1.0.
+- Normalization epsilon is called `layernorm_epsilon` (GLM uses `rms_norm_eps`).
+- RoPE is partial (first 64 of 192 dims) and NOT-interleaved (NeoX/rotate_half style),
+  with different theta per layer type: 10,000,000 (full) vs 10,000 (SWA).
 
-> **En cristiano:** el fichero de configuración tiene varios campos con nombres o
-> formatos ligeramente distintos a los de otros modelos. Cada uno es una mina si el
-> motor asume el formato "habitual".
+> **In plain terms:** the config file has several fields with names or formats slightly different
+> from other models. Each is a minefield if the engine assumes the "usual" format.
 
-### 6b. La atención C clavó la validación a la primera
+### 6b. C attention nailed validation on the first try
 
-Con los hechos verificados de antemano (orden exacto: proyección fusionada → V×0.707 →
-RoPE parcial → cache → ventana p−128+1 → sink en denominador → o_proj), la
-implementación C pasó teacher-forcing 32/32 y greedy 20/20 en el primer intento, sin
-una sola iteración de debugging. Verificado dos veces por un revisor independiente.
+With facts verified in advance (exact order: fused projection → V×0.707 → partial RoPE → cache
+→ window p−128+1 → sink in denominator → o_proj), the C implementation passed teacher-forcing
+32/32 and greedy 20/20 on the first attempt, without a single debugging iteration. Verified twice
+by an independent reviewer.
 
-> **En cristiano:** cuando inviertes el tiempo en leer el plano original con lupa antes
-> de construir, la pieza encaja a la primera. Todo el trabajo de arqueología del config
-> y el modeling (hallazgos 1–6) se cobró aquí.
+> **In plain terms:** when you invest time reading the original blueprint with a magnifying glass
+> before building, the piece fits on the first try. All the archaeology work on config and modeling
+> (findings 1–6) paid off here.
 
-Nota de fragilidad anotada: el rope_dim por tipo de capa se deriva por reescala entera
-desde el valor full; si un config futuro tuviera `swa_head_dim ≠ head_dim` con factor
-no exacto, podría diferir en ±1 del cálculo de la referencia. Los configs actuales
-(tiny y real) son inmunes; el oráculo lo detectaría al instante en cualquier caso.
+Fragility note recorded: the rope_dim per layer type is derived by integer rescaling from the
+full value; if a future config had `swa_head_dim ≠ head_dim` with a non-exact factor, it could
+differ by ±1 from the reference calculation. Current configs (tiny and real) are immune; the
+oracle would detect it instantly in any case.
 
-### 6c. Cuantización en el tiny: int8 exacto, int4 voltea un argmax, packing sin pérdidas
+### 6c. Quantization in tiny: exact int8, int4 flips one argmax, lossless packing
 
-Matriz completa en el oráculo tiny: int8 reproduce el f32 **token-exacto** (32/32,
-20/20 — ni un flip); int4 voltea UNA posición de 32 (el resto de la divergencia greedy
-es cascada autoregresiva de ese único flip); int4 empaquetado ≡ int4 sin empaquetar
-byte a byte (packing lossless); kernels enteros IDOT ≡ dequant exacto a int8; todo
-determinista. Verificado independientemente por el controlador.
+Full matrix in the oracle tiny: int8 reproduces f32 **token-exact** (32/32, 20/20 — not a single
+flip); int4 flips ONE position out of 32 (rest of greedy divergence is autoregressive cascade from
+that single flip); int4 packed ≡ int4 unpacked byte-for-byte (lossless packing); entire IDOT kernels
+≡ exact dequant to int8; all deterministic. Independently verified by the driver.
 
-> **En cristiano:** comprimir los pesos a la mitad (int8) no cambió ni un solo
-> resultado; comprimir a un cuarto (int4) cambió uno de 32 — y en un modelo de pesos
-> aleatorios donde cualquier ruido voltea decisiones al borde. En el modelo real,
-> entrenado, los márgenes son mucho mayores.
+> **In plain terms:** compressing weights to half (int8) didn't change a single result; compressing
+> to a quarter (int4) changed one of 32 — and on a random-weight model where any noise flips
+> decisions at the margin. On the real, trained model, margins are much larger.
 
-### 6d. El cap de cache se auto-sube silenciosamente (gotcha de benchmark)
+### 6d. Cache cap auto-raises silently (benchmark gotcha)
 
-Pedir `cap=2` por CLI no da cache de 2: el auto-raise del upstream (feature del
-2026-07-10) lo sube hasta llenar el presupuesto de RAM. Para forzar el cap pedido:
-`CAP_RAISE=0`. Con él, la evicción LRU real mantiene tokens exactos (20/20) con
-hit-rate 88%→81% — streaming bajo presión validado.
+Requesting `cap=2` from CLI doesn't give a cache of 2: the auto-raise from upstream (feature of
+2026-07-10) bumps it up to fill the RAM budget. To force the requested cap: `CAP_RAISE=0`. With it,
+real LRU eviction maintains exact tokens (20/20) with hit-rate 88%→81% — streaming under pressure
+validated.
 
 ## Tokenizer
 
-### 7. Formato moderno de merges: string única, no pares
+### 7. Modern merges format: single string, not pairs
 
-GLM guarda las reglas BPE como pares `["Ġ","Ġ"]`; MiMo (tokenizers ≥0.20) las guarda
-como una sola string `"Ġ Ġ"`. El parser C original habría dereferenciado NULL. Añadido
-soporte para ambos formatos en `tok.h` (+ fallo explícito si una entrada viene sin
-separador — hallazgo del code review).
+GLM stores BPE rules as pairs `["Ġ","Ġ"]`; MiMo (tokenizers ≥0.20) stores them as a single string
+`"Ġ Ġ"`. The original C parser would have dereferenced NULL. Added support for both formats in
+`tok.h` (+ explicit failure if an entry comes without separator — code review finding).
 
-### 8. Dígitos: de uno en uno, no de tres en tres
+### 8. Digits: one at a time, not three at a time
 
-La regex de pretokenización de GLM agrupa números en trozos de hasta 3 dígitos
-(`\p{N}{1,3}`, estilo cl100k); la de MiMo/Qwen los toma de uno en uno (`\p{N}`).
-Auto-detectado del tokenizer.json. Validado contra la librería oficial con 6 casos
-unicode + 4 adversariales (emoji ZWJ, run de 13 dígitos…): ids idénticos.
+GLM's pretokenization regex groups numbers in chunks of up to 3 digits (`\p{N}{1,3}`, cl100k style);
+MiMo/Qwen takes them one at a time (`\p{N}`). Auto-detected from tokenizer.json. Validated against
+the official library with 6 Unicode cases + 4 adversarial ones (emoji ZWJ, 13-digit run…): identical ids.
 
-> **En cristiano:** dos modelos pueden trocear "2026" de forma distinta: uno como
-> "202"+"6", otro como "2"+"0"+"2"+"6". Si el motor trocea distinto que el modelo
-> espera, entiende otra cosa. Nota pendiente: la detección es una búsqueda de texto
-> simple — endurecer antes de soportar una tercera familia.
+> **In plain terms:** two models can chop "2026" differently: one as "202"+"6", another as "2"+"0"+"2"+"6".
+> If the engine chops differently than the model expects, it understands something else. Pending note:
+> detection is simple text search — harden before supporting a third family.
 
-## Converter (FP8 → contenedor int4/int8)
+## Converter (FP8 → int4/int8 container)
 
-### 8b. El converter valida contra sí mismo: container ≡ cuantización runtime
+### 8b. Converter validates against itself: container ≡ runtime quantization
 
-El gate del converter no es "se parece": el contenedor pre-cuantizado debe producir
-EXACTAMENTE los mismos tokens que el motor cuantizando al vuelo los mismos pesos —
-misma aritmética (`np.rint` ≡ `lrintf`), mismas escalas por fila. Verificado en tiny y
-en el fixture de 396M, también bajo evicción de cache. Además: el path GLM quedó
-probado byte-idéntico antes/después del refactor con un harness A/B sobre shards
-sintéticos.
+The converter's gate is not "looks similar": the pre-quantized container must produce EXACTLY the same
+tokens as the engine quantizing the same weights on the fly — same arithmetic (`np.rint` ≡ `lrintf`),
+same per-row scales. Verified on tiny and the 396M fixture, also under cache eviction. Plus: the GLM
+path remained byte-identical before/after the refactor with an A/B harness on synthetic shards.
 
-### 8c. Trampas del checkpoint real anotadas para la conversión de 316 GB
+### 8c. Real checkpoint gotchas noted for 316 GB conversion
 
-- Los shards de MiMo llegan hasta **34.4 GB** (GLM ~5 GB): el guardarraíl
-  `--min-free-gb` por defecto (20) es INSUFICIENTE — subirlo al lanzar.
-- `save_file` no es atómico: un corte durante la escritura final deja un shard de
-  salida truncado que el resume saltará; si pasa, borrar el último `out-*` y relanzar.
-- Con ~4 MB/s medidos en esta línea, la descarga sola ≈ 22 h (resumible en cualquier
-  punto; los shards de visión/audio/MTP nunca se descargan gracias al filtro sobre
-  el weight_map).
-- `--io-bits 16` estaba silenciosamente roto en el upstream (overflow de astype int8);
-  ahora bits≥16 → f32 explícito. Los defaults de `--arch mimo` (dense int8, experts
-  int4, io f32) reproducen el punto de operación validado del motor.
+- MiMo shards reach **34.4 GB** (GLM ~5 GB): the default guardrail `--min-free-gb` (20) is
+  INSUFFICIENT — raise it when launching.
+- `save_file` is not atomic: a cutoff during final write leaves a truncated output shard that resume
+  will skip; if it happens, delete the last `out-*` and restart.
+- With ~4 MB/s measured on this line, download alone ≈ 22 h (resumable at any point; vision/audio/MTP
+  shards never download thanks to weight_map filter).
+- `--io-bits 16` was silently broken upstream (int8 astype overflow); now bits≥16 → explicit f32.
+  The `--arch mimo` defaults (dense int8, experts int4, io f32) reproduce the motor's validated
+  operating point.
 
-> **En cristiano:** convertir 316 GB llevará un día entero de descarga. Todo el
-> esfuerzo de esta fase fue asegurar que, cuando ese día termine, el resultado sea
-> correcto a la primera — cada pieza del pipeline demuestra producir bits idénticos
-> a la referencia antes de tocar el modelo real.
+> **In plain terms:** converting 316 GB will take a full day of downloading. All effort in this phase
+> went to ensuring that when that day ends, the result is correct on the first try — each pipeline piece
+> proves it produces bits identical to the reference before touching the real model.
 
-### 8d. Chat template de MiMo: ChatML con trampas propias
+### 8d. MiMo chat template: ChatML with its own gotchas
 
-- Los turnos se unen SIN salto de línea tras `<|im_end|>` (el ChatML de Qwen lleva `\n`
-  — venir de ahí garantiza el error) y sin token BOS.
-- Sistema por defecto: "You are MiMo, a helpful AI assistant engineered by Xiaomi."
-- Thinking viene ACTIVADO por defecto en el template oficial (`<think>` tras
-  `<|im_start|>assistant\n`); con razonamiento largo puede comerse todo el presupuesto
-  de tokens antes de la respuesta visible.
-- Los ids de stop se arman POR NOMBRE del tokenizer (`<|endoftext|>`, `<|im_end|>`),
-  no por id del config — el config del snapshot solo declara uno de los dos.
-- `generation_config` oficial: temperature 1.0, top_p 0.95 (y un `do_sample: false`
-  contradictorio que ignoramos).
-- Validación sin modelo: `TEMPLATE_DUMP=1` vuelca el prompt renderizado antes de
-  tokenizar y un test lo compara contra `apply_chat_template` de HF — 5/5 casos.
+- Turns are joined WITHOUT a line break after `<|im_end|>` (Qwen's ChatML carries `\n` — coming from
+  there guarantees the error) and without BOS token.
+- Default system: "You are MiMo, a helpful AI assistant engineered by Xiaomi."
+- Thinking comes ENABLED by default in the official template (`<think>` after `<|im_start|>assistant\n`);
+  with long reasoning it can consume the entire token budget before the visible response.
+- Stop ids are built BY NAME from the tokenizer (`<|endoftext|>`, `<|im_end|>`), not by id from config
+  — the snapshot config only declares one of the two.
+- Official `generation_config`: temperature 1.0, top_p 0.95 (and a contradictory `do_sample: false`
+  that we ignore).
+- Validation without model: `TEMPLATE_DUMP=1` dumps the rendered prompt before tokenizing and a test
+  compares it against HF's `apply_chat_template` — 5/5 cases.
 
-> **En cristiano:** cada modelo tiene su "protocolo de conversación" — dónde van las
-> etiquetas de quién habla. Un espacio de más y el modelo balbucea. Lo comprobamos
-> contra la herramienta oficial sin necesitar el modelo descargado.
+> **In plain terms:** each model has its own "conversation protocol" — where the speaker labels go.
+> One extra space and the model babbles. We checked against the official tool without needing the model
+> downloaded.
 
-### 8e. La estimación de descarga era 15× pesimista
+### 8e. Download estimate was 15× too pessimistic
 
-Con HF anónimo una prueba corta midió ~4 MB/s → estimamos 22 h. La descarga real
-sostiene **~59 MB/s** con 2 streams: shard de 34.4 GB en 9.7 min → ~2-4 h el total.
-Moraleja: no estimar ancho de banda con una conexión fría y rate-limit de handshake.
+With anonymous HF a short test measured ~4 MB/s → we estimated 22 h. Actual download sustains **~59 MB/s**
+with 2 streams: 34.4 GB shard in 9.7 min → ~2-4 h total. Lesson: don't estimate bandwidth from a cold
+connection and handshake rate-limit.
 
-### 8f. El checkpoint real corta pares peso/escala en las fronteras de shard
+### 8f. Real checkpoint cuts weight/scale pairs at shard boundaries
 
-Primer contacto con el checkpoint FP8 de verdad: crash. El shard 0 trae 4096 pesos
-pero 4095 escalas — el escritor del checkpoint partió un par `weight`/`weight_scale_inv`
-justo en el límite del archivo (la escala quedó en el shard siguiente). Ningún test
-podía verlo: nuestras fuentes de prueba eran bf16 (sin escalas separadas). Fix:
-resolver la escala vía el índice del repo y traer solo sus bytes por HTTP Range
-(las escalas son KB). El shard de 34 GB descargado se conserva y se reutiliza.
+First contact with the real FP8 checkpoint: crash. Shard 0 brings 4096 weights but 4095 scales — the
+checkpoint writer split a `weight`/`weight_scale_inv` pair right at the file boundary (the scale ended
+up in the next shard). No test could see it: our test sources were bf16 (no separate scales). Fix:
+resolve the scale via the repo index and fetch only its bytes via HTTP Range (scales are KB). The
+downloaded 34 GB shard is conserved and reused.
 
-> **En cristiano:** el modelo viene en 16 "cajas" y el embalador cortó una pieza en
-> dos cajas distintas. Nuestro desembalador asumía piezas completas por caja. Es
-> EXACTAMENTE el tipo de fallo para el que montamos conversión resumible: se arregla
-> el desembalador y se continúa donde iba, sin re-descargar nada.
+> **In plain terms:** the model comes in 16 "boxes" and the packer cut a piece in two. Our unpacker
+> assumed complete pieces per box. It's EXACTLY the kind of failure the resumable conversion was designed
+> for: fix the unpacker and continue where it left off, no re-download needed.
 
-### 11b. Cuidado con monitores que se buscan a sí mismos
+### 11b. Watch out for monitors that find themselves
 
-El monitor del convertidor tenía dos bugs de novato: su `$(...)` se expandió una capa
-de shell antes de tiempo (quedó vigilando strings vacíos), y su `pgrep -f convert_fp8`
-se encontraba A SÍ MISMO (el patrón estaba en su propia línea de comando) — reportaba
-"VIVO" con el convertidor muerto. Reglas: scripts de monitor a archivo (no inline con
-anidamiento de comillas), y patrones de pgrep que no aparezcan en el comando del
-propio monitor (`pgrep -f 'python.*convert_fp8'`).
+The converter monitor had two rookie bugs: its `$(...)` expanded one shell layer early (ended up watching
+empty strings), and its `pgrep -f convert_fp8` found ITSELF (the pattern was in its own command line) —
+reported "ALIVE" with the converter dead. Rules: monitor scripts to file (not inline with quote nesting),
+and pgrep patterns that don't appear in the monitor's own command (`pgrep -f 'python.*convert_fp8'`).
 
-## El bug final: el checkpoint que ni su propio código sabe leer
+## The final bug: the checkpoint that its own code can't read
 
-### 13. Los qkv del checkpoint FP8 vienen entrelazados por rangos de tensor-parallelism
+### 13. FP8 checkpoint qkv comes interleaved by tensor-parallelism ranges
 
-El hallazgo estrella del proyecto. Con TODO validado (motor token-exacto en dos modelos
-de prueba, converter byte-exacto contra re-derivación, tokenizer exacto), el modelo
-real generaba basura. Bisección capa a capa (referencia numpy construida desde los
-mismos tensores del contenedor): el motor calculaba PERFECTO — 6 dígitos significativos
-de acuerdo en las 48 capas. La divergencia estaba entre lo que el checkpoint significa
-y lo que todos creíamos que significa.
+The star finding of the project. With EVERYTHING validated (motor token-exact on two test models, converter
+byte-exact against re-derivation, tokenizer exact), the real model generated garbage. Layer-by-layer
+bisection (numpy reference built from the same container tensors): the motor computed PERFECT — 6 significant
+digits agreement across all 48 layers. The divergence was between what the checkpoint means and what we all
+thought it meant.
 
-El checkpoint FP8 oficial de Xiaomi guarda cada `qkv_proj` fusionado como **4 bloques
-de rango TP concatenados** `[Q₁|K₁|V₁|Q₂|K₂|V₂|...]`, no el plano `[Q|K|V]` que hace
-`split()` el propio `modeling_mimo_v2.py` publicado junto a los pesos. vLLM lo sabe y
-lo des-entrelaza en código aparte (`_shard_fp8_qkv_proj`). Además las escalas de bloque
-FP8 de esos tensores van POR RANGO (108 filas = 4×27, no ceil(13568/128)=106), así que
-el dequant "plano" corrompía 3 de los 4 rangos en las 9 capas full (las SWA se salvaban
-por divisibilidad casual). Prueba forense: la saturación FP8 por celda es perfecta (448)
-bajo la malla por-rango y rota bajo la plana.
+Xiaomi's official FP8 checkpoint stores each fused `qkv_proj` as **4 concatenated TP-range blocks**
+`[Q₁|K₁|V₁|Q₂|K₂|V₂|...]`, not the flat `[Q|K|V]` that the published `modeling_mimo_v2.py` makes `split()`
+do. vLLM knows this and de-interleaves in separate code (`_shard_fp8_qkv_proj`). Plus the FP8 block scales
+for those tensors go PER-RANGE (108 rows = 4×27, not ceil(13568/128)=106), so the "flat" dequant corrupted
+3 of 4 ranges in the 9 full layers (SWA saved by casual divisibility). Forensic proof: FP8 saturation per cell
+is perfect (448) under the per-range mesh and rotten under the flat one.
 
-**Por qué ningún test podía verlo**: el oráculo tiny y el fixture los generó el propio
-código de modeling — layout plano coherente consigo mismo. Motor y referencia
-compartían la misma convención; el checkpoint real usa otra. Solo el modelo real,
-con sus 316 GB, podía exponer la discrepancia.
+**Why no test caught it**: the oracle tiny and fixture were generated by modeling code itself — flat layout
+coherent with itself. Motor and reference shared the same convention; the real checkpoint uses another. Only
+the real model, with its 316 GB, could expose the discrepancy.
 
-Fix: des-entrelazado en carga (`qkv_degroup`, auto-detectado por procedencia FP8, con
-override por env) + malla de escalas por-rango en el converter + parche in situ de los
-18 tensores afectados del contenedor. Resultado: **"The capital of France is → Paris."**
+Fix: de-interleaving on load (`qkv_degroup`, auto-detected by FP8 provenance, with env override) + per-range
+scale mesh in converter + in-place patch of 18 affected tensors in container. Result: **"The capital of France is
+→ Paris."**
 
-> **En cristiano:** el fabricante publicó el mueble con las piezas de 4 cajas mezcladas
-> y el manual de OTRA versión del mueble. Su propio manual no puede montarlo; solo un
-> ensamblador de terceros (vLLM) documenta el orden real de las piezas. Tuvimos que
-> descubrirlo midiendo qué ordenación hace que los tornillos (la saturación FP8)
-> encajen perfectos.
+> **In plain terms:** the maker published the furniture with pieces from 4 boxes mixed up and a manual from
+> ANOTHER version of the furniture. Its own manual can't assemble it; only a third-party assembler (vLLM)
+> documents the real piece order. We had to discover it by measuring which ordering makes the bolts (FP8
+> saturation) fit perfectly.
 
-### 14. Racha de bugs de infraestructura del día final
+### 14. Infrastructure bug streak on final day
 
-- `pread()` de Linux no lee más de 2 GB por llamada y puede quedarse corto sin error:
-  los embed/lm_head f32 de 2.5 GB necesitaron un bucle `pread_full` en `st.h`.
-- "0 warnings" no es "build ok": un grep de warnings tapó un ERROR de compilación y
-  corrimos 20 minutos con un binario viejo. Regla: comprobar exit code del make.
-- Un `inspect.py` de scratch de un subagente sombreó la stdlib de Python (el dir del
-  script entra primero en sys.path) y rompió numpy con un error indescifrable.
-  Regla: jamás nombrar archivos de scratch como módulos estándar.
-- `pkill -f patrón` se mata a sí mismo si el patrón aparece en la propia línea de
-  comando (nos pasó TRES veces, una con el patrón en el comando de relance).
-  Regla: `patró[n]` con clase de caracteres, y kill y relance en llamadas separadas.
+- Linux `pread()` won't read more than 2 GB per call and can come up short without error: the 2.5 GB
+  embed/lm_head f32 needed a `pread_full` loop in `st.h`.
+- "0 warnings" is not "build ok": a grep for warnings hid a COMPILATION ERROR and we ran 20 minutes with
+  an old binary. Rule: check make exit code.
+- A scratch `inspect.py` from a subagent shadowed Python stdlib (`script dir enters sys.path first`) and
+  broke numpy with an indecipherable error. Rule: never name scratch files like standard modules.
+- `pkill -f pattern` kills itself if the pattern appears in its own command line (happened to us THREE times,
+  once with the pattern in the restart command). Rule: `patté[r]n` with character class, and kill and restart
+  in separate calls.
 
-## Aceleración (v2)
+## Acceleration (v2)
 
-### 15. Knobs gratis: 2.15× medido (0.20 → 0.43 tok/s)
+### 15. Free knobs: 2.15× measured (0.20 → 0.43 tok/s)
 
-`TOPP=0.7` (salta experts de peso de router bajo: −41% de lecturas) + `DIRECT=1`
-(O_DIRECT en este NVMe rinde más que buffered) se componen casi perfectamente.
-Ahora son los defaults del chat wrapper.
+`TOPP=0.7` (skips low-router-weight experts: −41% of reads) + `DIRECT=1` (O_DIRECT on this NVMe outperforms
+buffered) compose almost perfectly. Now they're the chat wrapper defaults.
 
-### 16. MTP nativo: lossless probado, pero el disco frío se come la ganancia
+### 16. Native MTP: lossless proven, but cold disk eats the gain
 
-La cabeza MTP de MiMo (1 de las 3 capas encadenadas del checkpoint, geometría SWA,
-densa) quedó integrada con su misma convención qkv por-rangos (malla [116,32] = 4×29,
-misma firma que las capas SWA). Aceptación 64% a DRAFT=2 (mejor que el 39-59% de GLM),
-forwards 31→14, y salida **byte-idéntica** con y sin especulación (md5). Pero en este
-host disk-bound cada posición del draft ensancha la unión de experts a cargar por capa
-y el I/O extra anula el ahorro de forwards — exactamente el fenómeno de cache fría que
-colibrì documentó. Default `DRAFT=0`; opt-in para máquinas con RAM/pin grandes.
+MiMo's MTP head (1 of 3 chained checkpoint layers, SWA geometry, dense) integrated with its same per-range qkv
+convention (mesh [116,32] = 4×29, same signature as SWA layers). 64% acceptance at DRAFT=2 (better than GLM's
+39-59%), forwards 31→14, and output **byte-identical** with and without speculation (md5). But on this disk-bound
+host each draft position widens the expert union to load per layer and the extra I/O cancels the forwards savings
+— exactly the cold-cache phenomenon colibrí documented. Default `DRAFT=0`; opt-in for machines with large RAM/pin.
 
-> **En cristiano:** el truco de "adivinar varios tokens y verificarlos de golpe"
-> funciona perfecto matemáticamente, pero verificar en lote obliga a traer del disco
-> los expertos de TODAS las posiciones adivinadas. Con el disco como cuello, pagas en
-> disco lo que ahorras en cómputo. En una máquina con más RAM la balanza se invierte.
+> **In plain terms:** the trick of "guess several tokens and verify them together" works perfectly
+> mathematically, but batch-verifying forces loading experts from ALL guessed positions. With disk as bottleneck,
+> you pay in disk what you save in compute. On a machine with more RAM the scales flip.
 
-### 17. El gate de identidad como oráculo afilado
+### 17. Identity gate as sharp oracle
 
-Exigir salida byte-idéntica entre DRAFT=0 y DRAFT=n destapó DOS bugs numéricos
-latentes que la validación token-exacta contra oráculo no podía ver estructuralmente:
-la elección de kernel int4 dependía del tamaño de batch (verificación en lote ≠
-replay secuencial) y la acumulación de experts en batch-union sumaba en orden distinto
-al secuencial (los float no conmutan; la deriva volteaba un argmax hacia el token 10).
-Ambos arreglados; benefician también a la especulación n-gram heredada.
+Requiring byte-identical output between DRAFT=0 and DRAFT=n exposed TWO latent numeric bugs that token-exact
+validation against oracle couldn't see structurally: int4 kernel choice depended on batch size (batch verification
+≠ sequential replay) and expert accumulation in batch-union summed in different order than sequential (floats
+don't commute; drift flipped an argmax to token 10). Both fixed; also benefit inherited n-gram speculation.
 
-### 18. El overlap disco↔matmul funciona — y desenmascara al verdadero culpable
+### 18. Disk↔matmul overlap works — and unmasking the real culprit
 
-El pipeline de doble buffer (pool de hilos de carga, consumo en orden original,
-bit-exacto por construcción — md5 idénticos en todos los modos) logró su objetivo
-mecánico: disco y matmul ya no son aditivos (stall 26 s vs 42 s serializados). Pero el
-wall-clock no mejoró: el matmul se infla casi 1:1 cuando hay cargas en vuelo. La suma
-`disk+matmul` se conserva → **el "tiempo de disco" en WSL2 no es espera de dispositivo,
-es CPU quemada en la pila de I/O del host/VHDX**, compitiendo por los mismos 16 hilos
-que las multiplicaciones. Ni prioridades ni tamaños de pool lo cambian.
+The double-buffer pipeline (load-thread pool, consume in original order, bit-exact by construction — md5 identical
+in all modes) achieved its mechanical goal: disk and matmul are no longer additive (stall 26 s vs 42 s serialized).
+But wall-clock didn't improve: matmul inflates almost 1:1 when loads are in flight. The sum `disk+matmul` stays constant
+→ **"disk time" in WSL2 is not device wait, it's CPU burned in the host/VHDX I/O stack**, competing for the same
+16 threads as multiplications. Neither priorities nor pool sizes change it.
 
-Consecuencias: (a) en ESTA máquina la única palanca restante es leer menos bytes
-(TOPP, int2, más RAM) o salir de WSL2 a Linux nativo; (b) el pipeline queda activado
-por defecto — en hosts con I/O real por DMA (NVMe nativo) el max(disco,matmul) que
-buscábamos debería materializarse. La feature está lista para la máquina que la
-aproveche.
+Consequences: (a) on THIS machine the only remaining lever is read fewer bytes (TOPP, int2, more RAM) or exit WSL2
+to native Linux; (b) the pipeline stays enabled by default — on hosts with real I/O via DMA (native NVMe) the
+max(disk,matmul) we sought should materialize. The feature is ready for the machine that benefits from it.
 
-> **En cristiano:** intentamos que el cocinero picara mientras el ayudante trae
-> ingredientes — y descubrimos que "traer ingredientes" en WSL también lo hace el
-> cocinero con las mismas manos. La receta del solapado es correcta; esta cocina
-> virtualizada es la que no da más de sí. En un Linux nativo, el mismo código rendirá.
+> **In plain terms:** we tried having the chef mince while the helper brings ingredients — and discovered
+> "bringing ingredients" in WSL also the chef does with the same hands. The overlapped recipe is correct; this
+> virtualized kitchen is just tapped out. On native Linux, the same code will perform.
 
-## Entorno / herramientas
+## Environment / tools
 
-### 9. Benchmark de disco con ceros = mentira
+### 9. Disk benchmark with zeros = lie
 
-Primer iobench sobre fichero de ceros: 8.5 GB/s "imposibles" (más que el bus físico).
-Causa: cache del host Windows sobre el VHDX. Con datos aleatorios y caches frías:
-2.75 GB/s reales (O_DIRECT, 8 hilos). Regla: benchmarks de disco siempre con datos
-aleatorios y tras reinicio de WSL.
+First iobench on zero file: 8.5 GB/s "impossible" (faster than physical bus). Cause: Windows host cache on VHDX.
+With random data and cold caches: 2.75 GB/s real (O_DIRECT, 8 threads). Rule: disk benchmarks always with random
+data and after WSL restart.
 
-### 10. El tamaño "lógico" engaña con OneDrive
+### 10. "Logical" size deceives with OneDrive
 
-37.6 GB "en disco" eran en su mayoría placeholders solo-en-línea (0 bytes reales).
-Borrarlos no liberó casi nada. Medir con `Length` de PowerShell cuenta el tamaño
-lógico, no el físico.
+37.6 GB "on disk" were mostly online-only placeholders (0 real bytes). Deleting them freed almost nothing. PowerShell's
+`Length` measures logical size, not physical.
 
-### 11. WSL: quirks que costaron tiempo
+### 11. WSL: quirks that cost time
 
-- `/tmp` es tmpfs y se borra cuando la VM de WSL se apaga entre comandos — nada de
-  estado entre invocaciones ahí; usar `~` o `/mnt/c`.
-- `echo EXIT=$?` dentro del mismo `wsl -e bash -c "..."` desde PowerShell/Git Bash
-  reporta mal el código de salida; comprobar desde la shell exterior.
-- El VHDX de WSL crece pero no encoge (sparse deshabilitado por defecto por riesgo de
-  corrupción); compactar requiere admin (`Optimize-VHD`) o export/import.
+- `/tmp` is tmpfs and erases when WSL VM shuts down between commands — no state there across invocations; use `~` or `/mnt/c`.
+- `echo EXIT=$?` inside the same `wsl -e bash -c "..."` from PowerShell/Git Bash reports exit code wrong; check from outer shell.
+- WSL VHDX grows but doesn't shrink (sparse disabled by default due to corruption risk); compacting requires admin
+  (`Optimize-VHD`) or export/import.
 
-### 12. Validación token-exacta como método
+### 12. Token-exact validation as method
 
-Todo cambio se acepta solo si el motor C reproduce bit a bit los tokens de la
-implementación de referencia (teacher-forcing 32/32, greedy 20/20). El modelo tiny
-aleatorio con arquitectura real es la herramienta: barato de generar, determinista
-(mismo seed → mismos bytes), y expone errores que un modelo entrenado escondería
-(pesos aleatorios → márgenes mínimos → cualquier desviación voltea el argmax).
+Every change is accepted only if the C motor reproduces the reference implementation's tokens bit-for-bit
+(teacher-forcing 32/32, greedy 20/20). The random-weight tiny model with real architecture is the tool: cheap to
+generate, deterministic (same seed → same bytes), and exposes errors a trained model hides (random weights → minimal
+margins → any deviation flips argmax).
 
-> **En cristiano:** antes de descargar 316 GB, construimos una maqueta a escala del
-> modelo con las mismas piezas y comprobamos que nuestra copia del motor produce
-> EXACTAMENTE los mismos resultados que el original, número a número. Si la maqueta
-> cuadra perfecta, el grande cuadrará.
+> **In plain terms:** before downloading 316 GB, we build a scaled mockup of the model with the same pieces and
+> check that our copy of the motor produces EXACTLY the same results as the original, number for number. If the mockup
+> squares perfectly, the big one will too.
 
-## Motor C: optimizaciones aplicadas
+## C Motor: applied optimizations
 
-### 15. RoPE precomputada: adiós a los ~100k powf/cosf/sinf por token
+### 15. Precomputed RoPE: goodbye to ~100k powf/cosf/sinf per token
 
-El motor recalculaba los ángulos de RoPE para cada (posición, cabeza, dimensión) en
-cada token (≈100k llamadas trig/token en MiMo). Ahora `rope_build()` precalcula las
-tablas cos/sin por posición para capas full y SWA hasta `max_t`, y `rope_apply()` solo
-hace lookup (misma fórmula, mismo orden). Verificado bit-a-bit contra la fórmula
-directa con `c/rope_check.c` (512 comparaciones, 0 fallos). Ganancia de CPU: ~10 ms/token
-≈ 0.3% de un token de 3.3 s — despreciable para velocidad, pero más limpio y
-determinista (y elimina un coste que crecía con S en prefill).
+The motor recalculated RoPE angles for each (position, head, dimension) per token (~100k trig calls/token in MiMo).
+Now `rope_build()` precomputes cos/sin tables per position for full and SWA layers up to `max_t`, and `rope_apply()`
+only does lookup (same formula, same order). Verified bit-for-bit against direct formula with `c/rope_check.c` (512
+comparisons, 0 fails). CPU gain: ~10 ms/token ≈ 0.3% of a 3.3 s token — negligible for speed, but cleaner and
+deterministic (and removes a cost that grew with S in prefill).
 
-### 16. Knob I4S cableado (estaba documentado pero no se leía)
+### 16. I4S knob wired (was documented but not read)
 
-`main()` no leía la env `I4S`; ahora `getenv("I4S")` fija `g_i4s` (umbral S para
-activar IDOT int4). Nota: en AVX2 `I4S=1` cambia el redondeo del decode (NO
-token-exact) → solo para chat, nunca para validación contra el oráculo.
+`main()` wasn't reading `I4S` env; now `getenv("I4S")` sets `g_i4s` (threshold S for int4 IDOT activation). Note:
+on AVX2 `I4S=1` changes decode rounding (NOT token-exact) → chat only, never for oracle validation.
 
-### 17. PILOT/LOOKA: prefetch asíncrono por lookahead del router (portado de colibri/glm.c)
+### 17. PILOT/LOOKA: async prefetch by router lookahead (ported from colibri/glm.c)
 
-Mientras se calcula la capa L, se aplica el router de la capa L+1 al estado actual
-para predecir sus expertos top-K, y se calientan con WILLNEED en un hilo de I/O
-aparte (ring lock-free 1P/1C). Es un hint puramente I/O: no toca pesos ni cómputo,
-por lo que **NO cambia los tokens** (seguro dejarlo activo). Recall medido en GLM
-~71.6% de los top-8 verdaderos; los mancanti son stall menores.
-- `PILOT=1` activa el prefetch. `LOOKA=1` (sin PILOT) mide el recall en MiMo y lo
-  imprime al salir vía `atexit`. `PILOT_K` ajusta el K predicho.
-- El router de MiMo es idéntico al de GLM (sigmoid + noaux_tc, n_group=1) → portable
-  directo. En mimo el router vive en `l->router`/`l->router_bias`; la residencia se
-  consulta a través de `expert_prefetch` (WILLNEED idempotente). A diferencia de glm,
-  mimo NO usa el chequeo `st_resident`/`sh_key` (su API de shard es `m->S` a nivel
-  modelo, no por capa) — los duplicados en el ring son inofensivos.
-- Build: `Makefile` añade `-pthread` a LDFLAGS (Linux y macOS) para el hilo de I/O.
+While layer L computes, layer L+1's router is applied to current state to predict its top-K experts, and they're
+warmed with WILLNEED in a separate I/O thread (ring lock-free 1P/1C). It's purely an I/O hint: doesn't touch
+weights or compute, so **doesn't change tokens** (safe to leave enabled). Measured recall on GLM ~71.6% of true
+top-8; missing ones are minor stalls.
+- `PILOT=1` activates prefetch. `LOOKA=1` (without PILOT) measures MiMo recall and prints it on exit via `atexit`.
+  `PILOT_K` adjusts predicted K.
+- MiMo's router is identical to GLM's (sigmoid + noaux_tc, n_group=1) → directly portable. In mimo router lives in
+  `l->router`/`l->router_bias`; residency queried via `expert_prefetch` (WILLNEED idempotent). Unlike glm, mimo
+  does NOT use `st_resident`/`sh_key` checks (its shard API is `m->S` at model level, not per-layer) — ring
+  duplicates are harmless.
+- Build: `Makefile` adds `-pthread` to LDFLAGS (Linux and macOS) for I/O thread.
 
-**Cuánto acelera (respuesta honesta):** PILOT solo solapa I/O con cómputo; no reduce
-el coste de CPU. En la caja de referencia (64 GB RAM, disco 2.75 GB/s, 15B activos =
-7.5 GB/token): tras el warmup los 7.5 GB de expertos activos caben en caché → el
-disco queda idle y el decode es compute-bound (~3.3 s/token, 0.3 tok/s). Ahí PILOT
-aporta **~0%**. Solo ayuda cuando el disco de verdad frenaría el pipeline:
-- arranque en frío / primer token (caché vacía): solapa la lectura de los expertos de
-  la capa siguiente tras el cómputo de la actual;
-- caja con poca RAM donde el conjunto activo hace thrash (cada token necesita disco);
-- cuando el routing cambia y hay que leer un experto aún no cargado.
+**How much it accelerates (honest answer):** PILOT only overlaps I/O with compute; doesn't reduce CPU cost. On the
+reference box (64 GB RAM, 2.75 GB/s disk, 15B active = 7.5 GB/token): after warmup the 7.5 GB of active experts
+fit in cache → disk idle and decode compute-bound (~3.3 s/token, 0.3 tok/s). There PILOT provides **~0%**. Only helps
+when disk really would brake the pipeline:
+- cold boot / first token (empty cache): overlaps reading next-layer experts after current-layer compute;
+- box with little RAM where active set thrashes (each token needs disk);
+- when routing changes and uncached expert must load.
 
-En esos momentos disk-bound, con 71.6% de acierto PILOT esconde ~70% de la latencia
-de disco (2.7 s/token) tras el cómputo: ese token baja de ~6 s (disco+compute en
-serie) a ~3.3 s → hasta **~2x en los tokens fríos/perdidos**; ~0% en régimen
-cacheado. La palanca grande sigue siendo más RAM (`CAP_RAISE`), `PIN`/`autopin`, o
-offload a GPU (`COLI_CUDA=1`). RoPE (#15) es aún más marginal (~0.3%).
+In those disk-bound moments, with 71.6% hit rate PILOT hides ~70% of disk latency (2.7 s/token) behind compute:
+that token drops from ~6 s (disk+compute serial) to ~3.3 s → up to **~2x on cold/missed tokens**; ~0% in cached
+regime. The big lever remains more RAM (`CAP_RAISE`), `PIN`/`autopin`, or GPU offload (`COLI_CUDA=1`). RoPE (#15)
+is even more marginal (~0.3%).
 
-**Validado end-to-end (oráculo tiny generado con transformers 5.1.0):**
-- `LOOKA=1 ./mimo 64 8 8` → **recall PILOT top-8 = 71.1% (135/190)** en MiMo,
-  idéntico al 71.6% de GLM. El router-lookahead transfer del todo a MiMo.
-- `PILOT=1` produce **tokens idénticos** al modo default (misma secuencia 15/20),
-  confirmando que el prefetch no altera la salida (I/O-only, como se diseñó).
-- `rope_check.c` ya había confirmado RoPE bit-a-bit (0 fallos).
-- **Pero el motor no es token-exacto perfecto contra ESTE oráculo:** 31/32 en
-  teacher-forcing y 18/20 greedy, INCLUSO con expertos int8 (sin ruido int4).
-  Esa divergencia de ~1 posición NO viene de PILOT/RoPE/I4S (queda probado por
-  PILOT==DEFAULT y RoPE bit-exact). Al rebasear sobre los commits recientes del
-  remoto (MTP speculative decoding + "v2 acceleration") el motor ahora incluye
-  ese código: el diff de ~1 posición probablemente entra por ahí, o por el oráculo
-  full-feature SWA+sink+value_scale que el oráculo simpler de la validación 32/32
-  no ejercitaba. Ver hallazgo #18.
+**End-to-end validated (oracle tiny generated with transformers 5.1.0):**
+- `LOOKA=1 ./mimo 64 8 8` → **PILOT top-8 recall = 71.1% (135/190)** on MiMo, identical to GLM's 71.6%.
+  Router-lookahead transfer wholly to MiMo.
+- `PILOT=1` produces **identical tokens** to default mode (same sequence 15/20), confirming prefetch doesn't alter
+  output (I/O-only, by design).
+- `rope_check.c` already confirmed RoPE bit-for-bit (0 fails).
+- **But motor is not perfect token-exact vs THIS oracle:** 31/32 teacher-forcing and 18/20 greedy, EVEN with int8
+  experts (no int4 noise). That ~1-position divergence does NOT come from PILOT/RoPE/I4S (proven by PILOT==DEFAULT
+  and RoPE bit-exact). On rebasing against recent remote commits (MTP speculative decoding + "v2 acceleration") the
+  motor now includes that code: the ~1-position diff probably enters there, or from full-feature oracle SWA+sink+value_scale
+  that simpler oracle for 32/32 validation didn't exercise. See finding #18.
 
-### 18. El motor (post-MTP/v2) diverge ~1 posición del oráculo, aún en int8
+### 18. Motor (post-MTP/v2) diverges ~1 position from oracle, even in int8
 
-Tras rebasear sobre los 4 commits recientes del remoto (MTP speculative decoding,
-"v2 acceleration: fast defaults 2.15x", chat_peng, README), el motor da 31/32 en
-TF y 18/20 greedy sobre el oráculo tiny full-feature (6 capas, SWA+sink+
-value_scale, expertos int8). Con int4 baja a 15/20 (esperado: int4 voltea ~1 pos y
-cascada). La divergencia NO es de PILOT (tokens idénticos con/sin PILOT) ni de
-RoPE (bit-exact vía rope_check.c) ni de I4S (default inalterado en AVX2).
-Queda por localizar si entra por los commits de MTP/v2-acceleration o por un
-detalle del full-feature oráculo (ventana SWA, sink bias, attention_value_scale
-0.707) que el oráculo simpler de la validación 32/32 no activaba. No es
-bloqueante para PILOT, que sigue siendo token-safe (WILLNEED only).
+After rebasing on 4 recent remote commits (MTP speculative decoding, "v2 acceleration: fast defaults 2.15x",
+chat_peng, README), motor gives 31/32 teacher-forcing and 18/20 greedy on full-feature tiny oracle (6 layers,
+SWA+sink+value_scale, int8 experts). With int4 drops to 15/20 (expected: int4 flips ~1 pos and cascade).
+Divergence is NOT from PILOT (identical tokens with/without PILOT) nor RoPE (bit-exact via rope_check.c) nor I4S
+(default unchanged in AVX2). Still to locate whether it enters from MTP/v2-acceleration commits or from full-feature
+oracle detail (SWA window, sink bias, attention_value_scale 0.707) that simpler 32/32-validation oracle didn't
+activate. Not blocking for PILOT, which stays token-safe (WILLNEED only).
