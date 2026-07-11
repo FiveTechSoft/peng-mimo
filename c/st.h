@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
 #include "json.h"
@@ -199,7 +200,12 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "tensore mancante: %s\n", name); exit(1); }
     void *raw = malloc(t->nbytes);
-    if (pread_full(t->fd, raw, t->nbytes, t->off) != t->nbytes) { perror("pread data"); exit(1); }
+    if (pread_full(t->fd, raw, t->nbytes, t->off) != t->nbytes) {
+        struct stat sb; fstat(t->fd, &sb);
+        fprintf(stderr, "pread data corto: %s off=%lld nbytes=%lld file=%lld byte\n",
+                t->name, (long long)t->off, (long long)t->nbytes, (long long)sb.st_size);
+        perror("pread data"); exit(1);
+    }
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
