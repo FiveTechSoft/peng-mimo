@@ -629,3 +629,91 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 - llama.cpp: dense on GPU, experts CPU — we already invert (hottest experts on VRAM)
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
+
+### 30. COLI_PROFILE + mem_watch polish (colibri #71 remainder, 2026-07-12)
+
+**Code:**
+
+- `COLI_PROFILE` / `PENG_PROFILE` → usage file `SNAP/.coli_usage.<sanitized>` so chat vs code heat maps do not share pin history. `chat_peng.py --profile NAME` sets it; `MEMWATCH=1` default in chat env.
+- Autopin at full history: **85%** of expert budget (was 50%); override `PIN_FRAC=`.
+- `mem_watch_pass`: safer `realloc`, heat_prefetch after pressure shrink; still on every SERVE turn + MORE.
+
+```bash
+COLI_PROFILE=chat SERVE=1 … ./mimo 64 4 8
+# stderr: [PROFILE] COLI_PROFILE=chat -> /path/.coli_usage.chat
+python3 c/chat_peng.py --fast --profile code
+```
+
+### 29. SWA KV ring + push toward 1.0 tok/s (2026-07-12) — **gate still FAIL**
+
+**Code (F-11 speed):** SWA/MTP layers allocate `sliding_window` KV rows (ring, `pos % W`); full layers stay linear; RoPE still uses logical `pos`. `kv_bytes_at` matches ring → expert budget sees ~0.2 GB KV@4096 instead of ~1.9 GB. Default `PC_GB` 1.5→1.0.
+
+**Effect at load (this box):**
+
+| | before (§27) | after ring |
+|---|---|---|
+| KV budget @4096 | ~1.9 GB | **~0.2 GB** |
+| LRU cap | 11 | **13** |
+| RAM pin experts | ~365 | **~427–430 (5.4 GB)** |
+| VRAM experts | 522 | 522 |
+
+**PROMPT** (Rome, NGEN=24, TOPP=0.55, PILOT=0, CUDA stack):
+
+| run | tok/s | hit | disk | matmul | attn |
+|---|---|---|---|---|---|
+| warm | **0.50** | 59% | 9.7 s | 15.5 s | 12.7 s |
+| TOPP=0.45 | 0.43 | 54% | 10.8 s | **24.7 s** | 14.7 s |
+
+Fewer experts (TOPP 0.45) **hurt**: fewer VRAM hits (hot experts from usage miss the thinner top-p set) → more host matmul.
+
+**Physics (honest):** even if disk → 0 on the warm profile (~15.5+12.7+3.6 s / 21 tok) ≈ **0.66 tok/s**. **1.0 needs ~2× faster matmul+attn**, not only hit-rate. Soft ceiling on 23 GB + 3060 + WSL2 remains **~0.55–0.65** without more RAM or faster GEMV/attn.
+
+**Gate 1.0: FAIL** (best still §27 **0.57**). Ring is still correct: frees budget for SERVE/long CTX and multi-turn.
+
+### 28b. Product review F-01/F-02 (2026-07-12)
+
+See [`docs/review-2026-07-11-product.md`](docs/review-2026-07-11-product.md) for the full F-01…F-21 audit (@ `1482e26`) and status table.
+
+- **F-02 fixed:** `mimo_turn_render` uses capacity-safe `snappend`; returns `-1` on overflow; SERVE/TEMPLATE_DUMP reject without OOB read/write. Test: `python3 -m unittest tests.test_template_overflow`.
+- **F-01 partial:** `st_init` validates header length vs file size, JSON object shape, offsets in-range, F32/BF16/F16 `nbytes==numel*esz`, duplicate names. U8 packed payloads only require non-empty when `numel>0`. Malformed fixtures in `tests/test_st.c` (fork).
+- **F-15 fixed post-audit:** `mimo` links `$(CUDA_OBJ)` in current Makefile.
+
+### 28. colibri #71 — GPU||CPU MoE block + mem_watch (2026-07-12)
+
+Ported from [JustVugg/colibri#71](https://github.com/JustVugg/colibri/pull/71) (open PR: Windows + GPU tiers + dynamic RAM).
+
+**Code (`c/mimo.c`):**
+
+1. **GPU||CPU expert overlap (same 64-expert block)**  
+   Phase A: wait load (if any) only for GPU-resident experts, queue `moe_acc` async.  
+   Phase B: wait remaining loads + host/SwiGLU path while GPU queue runs until layer `moe_end`.  
+   Per-expert waits keep `OVERLAP` load||compute (an all-loads-first draft serialised disk and was reverted).
+
+2. **`mem_watch_pass` (dynamic LRU)**  
+   After every SERVE turn and after `\x02MORE`: re-read `MemAvailable`.  
+   - free &lt; 3.5 GB → shrink `ecap`, **real** LRU slab free (`eslot_release`)  
+   - free &gt; 6.0 GB → grow `ecap` (realloc ecache)  
+   - dead band 3.5–6 GB → no-op  
+   `MEMWATCH=0` disables. Default ON.
+
+3. **`repin_pass` after full turns** (was MORE-only) so live RAM/VRAM heat chase runs every boundary.
+
+**SERVE smoke** (NGEN=8, one turn):
+
+```text
+[RAM] headroom: 6.8 GB free -> cap RAISED 11->12 (MEMWATCH=0 to disable)
+[REPIN] RAM layer … / VRAM layer …   # after END, not only MORE
+```
+
+**PROMPT** (`TOPP=0.55`, NGEN=24, Rome, CUDA stack): **0.44–0.48 tok/s**, hit ~55–59%, not a clear beat of §27 **0.57**. Expected: single-shot PROMPT is already GPU-first; mem_watch/repin are multi-turn levers. Gate 1.0 still FAIL.
+
+Reproduce:
+
+```bash
+# PROMPT
+SNAP=/root/mimo25_i4 COLI_CUDA=1 CUDA_DENSE=1 DIRECT=1 TOPP=0.55 TEMP=0.7 \
+  NGEN=24 PROFILE=1 PROMPT='Write one short sentence about Rome.' ./c/mimo 64 4 8
+
+# SERVE (watch [RAM] / [REPIN] on stderr after END)
+SERVE=1 MEMWATCH=1 REPIN=1 … ./c/mimo 64 4 8
+```

@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -99,6 +100,51 @@ static int st_direct_fd(shards *S, int fd) {
     return -1;
 }
 
+/* F-01: dtype payload size (bytes/element). U8/I8 = 1 (packed int4/int2 may use
+ * nbytes < numel*1 if shape is logical — still require nbytes > 0 and in-file). */
+static int st_dtype_esz(int dtype) {
+    if (dtype == 2) return 4;   /* F32 */
+    if (dtype == 0 || dtype == 1) return 2; /* BF16 / F16 */
+    if (dtype == 3) return 1;   /* U8 / I8 */
+    return -1;
+}
+/* product of shape dims with overflow detection; empty shape [] => scalar numel 1. */
+static int64_t st_shape_numel(jval *shp) {
+    if (!shp || shp->t != J_ARR) return -1;
+    int64_t numel = 1;
+    for (int k = 0; k < shp->len; k++) {
+        if (!shp->kids[k] || shp->kids[k]->t != J_NUM) return -1;
+        double d = shp->kids[k]->num;
+        if (d < 0 || d != (double)(int64_t)d) return -1;
+        int64_t dim = (int64_t)d;
+        if (dim < 0) return -1;
+        if (dim > 0 && numel > INT64_MAX / dim) return -1;
+        numel *= dim;
+    }
+    return numel;
+}
+/* Linear name scan (used during st_init before the hash index exists). */
+static int st_name_seen(shards *S, const char *name) {
+    for (int i = 0; i < S->n; i++) if (!strcmp(S->t[i].name, name)) return 1;
+    return 0;
+}
+/* pread completo: una singola pread() Linux tronca a ~2 GB (0x7ffff000). */
+static ssize_t pread_full(int fd, void *buf, int64_t count, int64_t off) {
+    int64_t got = 0;
+    while (got < count) {
+        ssize_t r = pread(fd, (char *)buf + got, (size_t)(count - got), off + got);
+        if (r < 0) return -1;
+        if (r == 0) { errno = 0; return got; }   /* EOF prematuro */
+        got += r;
+    }
+    return got;
+}
+
+/* Max JSON header we will accept (safetensors header is rarely > few MB). */
+#ifndef ST_MAX_HEADER
+#define ST_MAX_HEADER (64ULL << 20)   /* 64 MiB */
+#endif
+
 /* indicizza tutti i model-*.safetensors in snap_dir */
 static void st_init(shards *S, const char *snap_dir) {
     memset(S, 0, sizeof(*S));
@@ -120,27 +166,99 @@ static void st_init(shards *S, const char *snap_dir) {
 
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
-        uint64_t hlen;
+        struct stat sb;
+        if (fstat(fd, &sb) != 0) { perror(files[fi]); exit(1); }
+        int64_t fsz = (int64_t)sb.st_size;
+        if (fsz < 8) { fprintf(stderr, "safetensors too small: %s (%lld bytes)\n", files[fi], (long long)fsz); exit(1); }
+        uint64_t hlen = 0;
         if (pread(fd, &hlen, 8, 0) != 8) { perror("pread hlen"); exit(1); }
-        char *hdr = malloc(hlen + 1);
-        if (pread(fd, hdr, hlen, 8) != (ssize_t)hlen) { perror("pread hdr"); exit(1); }
+        /* F-01: header size must fit in file and stay under ST_MAX_HEADER */
+        if (hlen == 0 || hlen > ST_MAX_HEADER || (int64_t)hlen > fsz - 8) {
+            fprintf(stderr, "safetensors bad header length: %s hlen=%llu file=%lld\n",
+                    files[fi], (unsigned long long)hlen, (long long)fsz);
+            exit(1);
+        }
+        char *hdr = malloc((size_t)hlen + 1);
+        if (!hdr) { fprintf(stderr, "OOM safetensors header %s\n", files[fi]); exit(1); }
+        if (pread_full(fd, hdr, (int64_t)hlen, 8) != (ssize_t)hlen) {
+            fprintf(stderr, "pread hdr short: %s\n", files[fi]); exit(1);
+        }
         hdr[hlen] = 0;
         int64_t data_start = 8 + (int64_t)hlen;
         char *arena = NULL;
         jval *root = json_parse(hdr, &arena);
+        if (!root || root->t != J_OBJ) {
+            fprintf(stderr, "safetensors header JSON invalid: %s\n", files[fi]);
+            free(arena); free(hdr); exit(1);
+        }
         for (int i = 0; i < root->len; i++) {
             const char *name = root->keys[i];
-            if (!strcmp(name, "__metadata__")) continue;
+            if (!name || !strcmp(name, "__metadata__")) continue;
             jval *m = root->kids[i];
+            if (!m || m->t != J_OBJ) {
+                fprintf(stderr, "safetensors tensor entry not object: %s in %s\n", name, files[fi]);
+                exit(1);
+            }
             jval *dt = json_get(m, "dtype");
             jval *off = json_get(m, "data_offsets");
             jval *shp = json_get(m, "shape");
+            if (!dt || dt->t != J_STR || !dt->str ||
+                !off || off->t != J_ARR || off->len != 2 ||
+                !off->kids[0] || !off->kids[1] ||
+                off->kids[0]->t != J_NUM || off->kids[1]->t != J_NUM) {
+                fprintf(stderr, "safetensors missing dtype/data_offsets: %s in %s\n", name, files[fi]);
+                exit(1);
+            }
             int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
-            int64_t numel = 1; for (int k = 0; k < shp->len; k++) numel *= (int64_t)shp->kids[k]->num;
+            if (a0 < 0 || b0 < a0) {
+                fprintf(stderr, "safetensors bad offsets %lld..%lld for %s in %s\n",
+                        (long long)a0, (long long)b0, name, files[fi]);
+                exit(1);
+            }
+            int64_t nbytes = b0 - a0;
+            int64_t abs_end = data_start + b0;
+            if (abs_end < data_start || abs_end > fsz) {
+                fprintf(stderr, "safetensors range out of file: %s off=%lld..%lld file=%lld (%s)\n",
+                        name, (long long)(data_start + a0), (long long)abs_end,
+                        (long long)fsz, files[fi]);
+                exit(1);
+            }
+            int64_t numel = st_shape_numel(shp);
+            if (numel < 0) {
+                fprintf(stderr, "safetensors bad shape: %s in %s\n", name, files[fi]);
+                exit(1);
+            }
+            int dtype = st_dtype_code(dt->str);
+            int esz = st_dtype_esz(dtype);
+            if (esz < 0) {
+                fprintf(stderr, "safetensors bad dtype code for %s\n", name);
+                exit(1);
+            }
+            /* F32/BF16/F16: payload size must match shape. U8/I8 may be packed (int4). */
+            if (dtype != 3) {
+                if (numel > 0 && esz > 0 && numel > INT64_MAX / esz) {
+                    fprintf(stderr, "safetensors numel*esz overflow: %s\n", name);
+                    exit(1);
+                }
+                int64_t expect = numel * (int64_t)esz;
+                if (nbytes != expect) {
+                    fprintf(stderr, "safetensors nbytes mismatch: %s nbytes=%lld expect=%lld (numel=%lld esz=%d) in %s\n",
+                            name, (long long)nbytes, (long long)expect,
+                            (long long)numel, esz, files[fi]);
+                    exit(1);
+                }
+            } else if (nbytes < 1 && numel > 0) {
+                fprintf(stderr, "safetensors empty U8 payload: %s in %s\n", name, files[fi]);
+                exit(1);
+            }
+            if (st_name_seen(S, name)) {
+                fprintf(stderr, "safetensors duplicate tensor name: %s (also in %s)\n", name, files[fi]);
+                exit(1);
+            }
             if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
-            t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
+            t->nbytes = nbytes; t->dtype = dtype; t->numel = numel;
         }
         free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
         free(hdr);
@@ -180,26 +298,23 @@ static void st_prefetch(shards *S, const char *name) {
     if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
 }
 
-/* pread completo: una singola pread() Linux tronca a ~2 GB (0x7ffff000) e puo'
- * comunque leggere corto senza errore. I tensori f32 residenti di MiMo (embed,
- * lm_head: 2.5 GB l'uno) superano il limite -> si legge a pezzi fino a completare. */
-static ssize_t pread_full(int fd, void *buf, int64_t count, int64_t off) {
-    int64_t got = 0;
-    while (got < count) {
-        ssize_t r = pread(fd, (char *)buf + got, (size_t)(count - got), off + got);
-        if (r < 0) return -1;
-        if (r == 0) { errno = 0; return got; }   /* EOF prematuro */
-        got += r;
-    }
-    return got;
-}
-
-/* legge un tensore in un buffer float32 fornito dal chiamante (numel float).
- * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
-static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
+/* legge un tensore in un buffer float32 fornito dal chiamante.
+ * out_cap = numero di float disponibili in `out` (F-01: no write past end).
+ * drop=1 -> fadvise DONTNEED (streaming expert). */
+static int64_t st_read_f32(shards *S, const char *name, float *out, int64_t out_cap, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "tensore mancante: %s\n", name); exit(1); }
-    void *raw = malloc(t->nbytes);
+    if (!out || out_cap < t->numel) {
+        fprintf(stderr, "st_read_f32 buffer too small: %s need %lld floats, cap %lld\n",
+                name, (long long)t->numel, (long long)out_cap);
+        exit(1);
+    }
+    if (t->dtype == 3) {
+        fprintf(stderr, "st_read_f32: U8 tensor %s — use st_read_raw\n", name);
+        exit(1);
+    }
+    void *raw = malloc((size_t)t->nbytes);
+    if (!raw) { fprintf(stderr, "OOM st_read_f32 %s (%lld bytes)\n", name, (long long)t->nbytes); exit(1); }
     if (pread_full(t->fd, raw, t->nbytes, t->off) != t->nbytes) {
         struct stat sb; fstat(t->fd, &sb);
         fprintf(stderr, "pread data corto: %s off=%lld nbytes=%lld file=%lld byte\n",
@@ -207,11 +322,14 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
         perror("pread data"); exit(1);
     }
     if (t->dtype == 2) {
-        memcpy(out, raw, t->nbytes);
+        memcpy(out, raw, (size_t)t->nbytes);
     } else if (t->dtype == 0) {
         uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = bf16_to_f32(p[i]);
-    } else {
+    } else if (t->dtype == 1) {
         uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = f16_to_f32(p[i]);
+    } else {
+        fprintf(stderr, "st_read_f32: dtype %d non gestito per %s\n", t->dtype, name);
+        exit(1);
     }
     free(raw);
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
@@ -225,26 +343,45 @@ static int64_t st_nbytes(shards *S, const char *name) {
     st_tensor *t = st_find(S, name); return t ? t->nbytes : -1;
 }
 
-/* legge i byte GREZZI di un tensore (nessuna conversione di dtype): per i pesi gia'
- * quantizzati int4/int8 del nostro container (dtype U8). drop=1 -> fadvise DONTNEED. */
-static void st_read_raw(shards *S, const char *name, void *out, int drop) {
+/* legge i byte GREZZI di un tensore (U8 quant). out_cap_bytes = capacità del buffer (F-01). */
+static void st_read_raw(shards *S, const char *name, void *out, int64_t out_cap_bytes, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "tensore mancante: %s\n", name); exit(1); }
+    if (!out || out_cap_bytes < t->nbytes) {
+        fprintf(stderr, "st_read_raw buffer too small: %s need %lld bytes, cap %lld\n",
+                name, (long long)t->nbytes, (long long)out_cap_bytes);
+        exit(1);
+    }
     if (pread_full(t->fd, out, t->nbytes, t->off) != t->nbytes) { perror("pread raw"); exit(1); }
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
 
 /* legge una FETTA di un tensore: n_elems a partire dall'elemento elem_off.
- * Serve per gli expert fusi di GLM (un tensore = blocco [E, ...]): si legge il
- * solo expert richiesto via pread del sotto-range, niente lettura dell'intero blocco. */
-static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
+ * out_cap = float disponibili in out. Serve per expert fusi GLM [E,...]. */
+static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems,
+                              float *out, int64_t out_cap, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "tensore mancante: %s\n", name); exit(1); }
-    int esz = (t->dtype == 2) ? 4 : 2;
+    if (!out || out_cap < n_elems) {
+        fprintf(stderr, "st_read_slice_f32 buffer too small: %s need %lld floats, cap %lld\n",
+                name, (long long)n_elems, (long long)out_cap);
+        exit(1);
+    }
+    if (t->dtype == 3) {
+        fprintf(stderr, "st_read_slice_f32: U8 tensor %s\n", name); exit(1);
+    }
+    if (elem_off < 0 || n_elems < 0 || elem_off > t->numel || n_elems > t->numel - elem_off) {
+        fprintf(stderr, "st_read_slice_f32 range: %s off=%lld n=%lld numel=%lld\n",
+                name, (long long)elem_off, (long long)n_elems, (long long)t->numel);
+        exit(1);
+    }
+    int esz = st_dtype_esz(t->dtype);
+    if (esz < 2) { fprintf(stderr, "st_read_slice_f32 bad esz for %s\n", name); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
-    void *raw = malloc(nb);
+    void *raw = malloc((size_t)nb);
+    if (!raw) { fprintf(stderr, "OOM st_read_slice_f32\n"); exit(1); }
     if (pread_full(t->fd, raw, nb, boff) != nb) { perror("pread slice"); exit(1); }
-    if (t->dtype == 2) memcpy(out, raw, nb);
+    if (t->dtype == 2) memcpy(out, raw, (size_t)nb);
     else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
     free(raw);

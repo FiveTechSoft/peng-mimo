@@ -137,7 +137,7 @@ static float *load_t(Model *m, const char *name) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "manca %s\n", name); exit(1); }
     float *p = falloc(n);
-    st_read_f32(&m->S, name, p, 0);   /* densa: niente DONTNEED, resta residente */
+    st_read_f32(&m->S, name, p, n, 0);   /* densa: niente DONTNEED, resta residente */
     return p;
 }
 
@@ -171,7 +171,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 
 /* legge un weight dal disco (streaming) e lo quantizza in q[O,I]+scale[O] */
 static void load_expert_w(Model *m, const char *name, int8_t *q, float *scale, int O, int I, float *tmp) {
-    st_read_f32(&m->S, name, tmp, 1);            /* pread + fadvise DONTNEED */
+    st_read_f32(&m->S, name, tmp, (int64_t)O*I, 1);            /* pread + fadvise DONTNEED */
     quantize_rows(tmp, q, scale, O, I, m->quant_bits);
 }
 

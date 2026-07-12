@@ -8,8 +8,9 @@ Bench de tok/s (meta 1.0 por defecto):
   # en chat interactivo:  /bench   o  /bench 3
 
 Perfiles (env o flags):
-  --fast     maxima velocidad (CUDA, TOPP=0.65, TEMP=0.7, PILOT, REPIN)
+  --fast     maxima velocidad (CUDA, TOPP=0.55, TEMP=0.7, PILOT, REPIN)
   --quality  mas anclado (TEMP=0.4, TOPP=0.85) — mas lento
+  --profile NAME  heat map aislado: SNAP/.coli_usage.NAME (COLI_PROFILE)
   default    equilibrio calidad+velocidad
 """
 from __future__ import annotations
@@ -78,7 +79,12 @@ def build_env(args) -> dict:
         "REPIN": os.environ.get("REPIN", "32"),
         "I4S": os.environ.get("I4S", "1"),
         "OVERLAP": os.environ.get("OVERLAP", "1"),
+        "MEMWATCH": os.environ.get("MEMWATCH", "1"),
     })
+    # Domain heat map (colibri #71): chat vs code vs … do not share pin history
+    prof = getattr(args, "profile", None) or os.environ.get("COLI_PROFILE") or os.environ.get("PENG_PROFILE")
+    if prof:
+        env["COLI_PROFILE"] = prof
     return env
 
 
@@ -378,16 +384,22 @@ def main() -> int:
         default=None,
         help="max tokens por respuesta (default env NGEN o 80; en --bench suele 24)",
     )
-    prof = ap.add_mutually_exclusive_group()
-    prof.add_argument(
+    speed = ap.add_mutually_exclusive_group()
+    speed.add_argument(
         "--fast",
         action="store_true",
-        help="perfil velocidad: TOPP=0.65 TEMP=0.7 + CUDA/PILOT/REPIN/I4S",
+        help="perfil velocidad: TOPP=0.55 TEMP=0.7 + CUDA/PILOT/REPIN/I4S",
     )
-    prof.add_argument(
+    speed.add_argument(
         "--quality",
         action="store_true",
         help="perfil calidad: TEMP=0.4 TOPP=0.85 (mas lento, menos alucinacion)",
+    )
+    ap.add_argument(
+        "--profile",
+        default=None,
+        metavar="NAME",
+        help="mapa de experts aislado: SNAP/.coli_usage.NAME (env COLI_PROFILE)",
     )
     args = ap.parse_args()
 

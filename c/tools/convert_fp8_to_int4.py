@@ -33,8 +33,78 @@ Default bit: densa int8, expert int4, embed/lm_head f32 = il punto operativo './
   python3 tools/convert_fp8_to_int4.py --arch mimo --src mimo_tiny --out mimo_tiny_i4
   python3 tools/convert_fp8_to_int4.py --arch mimo --repo XiaomiMiMo/MiMo-V2.5-FP8 --out ~/mimo_i4
 """
-import os, sys, glob, json, shutil, argparse
+import os, sys, glob, json, shutil, argparse, hashlib, time
 import numpy as np
+
+# ---------- F-05: atomic safetensors write + resume validation ----------
+def safetensors_is_valid(path):
+    """True if path is a readable non-empty safetensors file (not truncated mid-write)."""
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        if os.path.getsize(path) < 16:
+            return False
+        from safetensors import safe_open
+        with safe_open(path, framework="np") as f:
+            _ = list(f.keys())  # force header parse
+        return True
+    except Exception:
+        return False
+
+def atomic_save_file(tensors, outp):
+    """Write safetensors via .tmp + validate + os.replace (F-05). Never leaves a
+    truncated final path that a resume would skip."""
+    from safetensors.numpy import save_file
+    parent = os.path.dirname(outp) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp = outp + ".tmp"
+    if os.path.exists(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    save_file(tensors, tmp)
+    if not safetensors_is_valid(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise RuntimeError(f"atomic_save_file: written file failed validation: {tmp}")
+    os.replace(tmp, outp)
+    return outp
+
+def file_sha256(path, chunk=8 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+def write_convert_manifest(outdir, *, repo, revision, arch, ebits, io_bits, xbits,
+                           shards_meta, source_index_sha=None):
+    """Persist provenance + completed shard inventory (F-05/F-06)."""
+    man = {
+        "peng_format_version": 1,
+        "arch": arch,
+        "repo": repo,
+        "revision": revision,
+        "source_index_sha256": source_index_sha,
+        "ebits": ebits,
+        "io_bits": io_bits,
+        "xbits": xbits,
+        "created_unix": int(time.time()),
+        "shards": shards_meta,
+    }
+    path = os.path.join(outdir, "peng_convert_manifest.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(man, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+    return path
 
 # ---------- quantizzazione: identica al C (glm.c) ----------
 def quant_int8(w, bits):                       # w: [O,I] f32 -> (qbytes U8 [O*I], scale f32 [O])
@@ -138,14 +208,19 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
 # EN: `name.weight_scale_inv` in the NEXT one (happened on MiMo-V2.5: shard0/shard1).
 # EN: Scales are tiny (a few KB of f32): repo mode Range-fetches JUST that tensor,
 # EN: local mode scans the other shards in the dir.
-def fetch_remote_tensor(repo, shard, name, _hdrs={}):
+def hf_resolve_url(repo, path, revision="main"):
+    """Pinned revision URL (F-06). Prefer a commit SHA over mutable branch names."""
+    rev = revision or "main"
+    return f"https://huggingface.co/{repo}/resolve/{rev}/{path}"
+
+def fetch_remote_tensor(repo, shard, name, revision="main", _hdrs={}):
     """Scarica UN SOLO tensore da uno shard remoto via HTTP Range: 8 byte little-endian
     = lunghezza dell'header, header JSON con i data_offsets per-tensore, poi il Range
     esatto dei byte del tensore. Nessun download dell'intero shard.
     EN: fetch ONE tensor from a remote shard via HTTP Range: 8 LE bytes = header length,
     EN: JSON header with per-tensor data_offsets, then the tensor's exact byte span."""
     import struct, time as _t, urllib.request
-    url = f"https://huggingface.co/{repo}/resolve/main/{shard}"
+    url = hf_resolve_url(repo, shard, revision)
     def rng(b0, b1):                     # GET con Range [b0,b1] inclusivo, con retry
         for att in range(10):            # EN: ranged GET (inclusive), with retries
             req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert",
@@ -168,7 +243,7 @@ def fetch_remote_tensor(repo, shard, name, _hdrs={}):
     d0, d1 = meta["data_offsets"]
     return np.frombuffer(rng(base + d0, base + d1 - 1), np.float32).reshape(meta["shape"]).copy()
 
-def make_scale_fetcher(repo=None, weight_map=None, local_shards=None):
+def make_scale_fetcher(repo=None, weight_map=None, local_shards=None, revision="main"):
     """Risolutore per una `*_scale_inv` assente dallo shard aperto. Repo mode: weight_map
     dell'index.json (scaricato pigramente se non fornito) + fetch Range del solo tensore.
     Local mode: scansiona gli ALTRI shard della dir; errore chiaro se manca ovunque.
@@ -178,6 +253,7 @@ def make_scale_fetcher(repo=None, weight_map=None, local_shards=None):
     EN: Local mode: scan the OTHER shards in the dir; clear error if truly absent.
     EN: Results are cached (a later boundary may need the same scale again)."""
     cache = {}; state = {"map": weight_map}
+    rev = revision or "main"
     def fetch(sname):
         if sname in cache: return cache[sname]
         if local_shards is not None:
@@ -192,7 +268,7 @@ def make_scale_fetcher(repo=None, weight_map=None, local_shards=None):
         if state["map"] is None:
             import urllib.request
             state["map"] = json.loads(urllib.request.urlopen(
-                f"https://huggingface.co/{repo}/resolve/main/model.safetensors.index.json",
+                hf_resolve_url(repo, "model.safetensors.index.json", rev),
                 timeout=30).read())["weight_map"]
         shard = state["map"].get(sname)
         if shard is None:
@@ -200,7 +276,7 @@ def make_scale_fetcher(repo=None, weight_map=None, local_shards=None):
         print(f"    [scale-fetch] {sname} <- {shard} "
               f"(coppia peso/scala divisa sul confine di shard / pair split across shards)",
               flush=True)
-        cache[sname] = fetch_remote_tensor(repo, shard, sname)
+        cache[sname] = fetch_remote_tensor(repo, shard, sname, revision=rev)
         return cache[sname]
     return fetch
 
@@ -280,6 +356,10 @@ def main():
              "shard ep dall'index.json, salta model_mtp/vision/audio). Default bit mimo: "
              "densa int8, expert int4, embed/lm_head f32 = il punto operativo del motore '4 8'.")
     ap.add_argument("--repo", default=None)
+    ap.add_argument("--revision", default=None,
+        help="HF git revision (branch/tag/SHA). Resolved to a commit SHA at start (F-06) "
+             "and used for every index/metadata/shard fetch so a long conversion cannot mix "
+             "upstream revisions. Default: repo default branch tip, pinned at start.")
     ap.add_argument("--indir", "--src", default=None)
     ap.add_argument("--outdir", "--out", required=False)
     ap.add_argument("--ebits", type=int, default=None)   # bit residenti (default 4 glm / 8 mimo; 8 per --mtp/--indexer)
@@ -330,7 +410,6 @@ def main():
     if a.indir and a.arch == "mimo" and a.mtp:
         # locale: converte SOLO model_mtp.safetensors nel container (nuovi tensori, il
         # resto del container non viene toccato). / local: convert ONLY the MTP shard.
-        from safetensors.numpy import save_file
         src = os.path.join(a.indir, "model_mtp.safetensors")
         if not os.path.exists(src):
             print(f"ERRORE: {src} non esiste."); return
@@ -339,7 +418,7 @@ def main():
         convert_shard(src, out, a.n_layers, a.ebits, a.io_bits, a.xbits,
                       keep_mtp=True, arch="mimo", fetch_scale=fetch)
         outp = os.path.join(a.outdir, "out-mtp-00000.safetensors")
-        save_file(out, outp)
+        atomic_save_file(out, outp)
         print(f"[MTP] {len(out)} tensori (int{a.ebits} + norme f32) -> {outp} "
               f"({os.path.getsize(outp)/1e9:.2f} GB)")
         return
@@ -347,18 +426,33 @@ def main():
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
         if a.arch == "mimo":   # la testa MTP e' uno shard a parte: mai convertirla
             shards = [s for s in shards if "mtp" not in os.path.basename(s)]
-        from safetensors.numpy import save_file
         fetch = make_scale_fetcher(local_shards=shards)   # scale spezzate tra shard locali
+        shard_meta = []
         for i, sp in enumerate(shards):
+            outp = os.path.join(a.outdir, f"out-{i:05d}.safetensors")
+            if safetensors_is_valid(outp):
+                print(f"  skip valid {os.path.basename(outp)}", flush=True)
+                shard_meta.append({"name": os.path.basename(outp), "size": os.path.getsize(outp),
+                                   "sha256": file_sha256(outp), "source": os.path.basename(sp)})
+                continue
+            if os.path.exists(outp):
+                print(f"  redoing invalid/truncated {outp}", flush=True)
+                try: os.remove(outp)
+                except OSError: pass
             out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits, arch=a.arch,
                                     fetch_scale=fetch)
-            save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
+            atomic_save_file(out, outp)
+            shard_meta.append({"name": os.path.basename(outp), "size": os.path.getsize(outp),
+                               "sha256": file_sha256(outp), "source": os.path.basename(sp)})
         # copia config + tokenizer
         meta = (["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]
                 if a.arch == "mimo" else ["config.json"])
         for fn in meta:
             src = os.path.join(a.indir, fn)
             if os.path.exists(src): shutil.copy(src, a.outdir)
+        write_convert_manifest(a.outdir, repo=a.indir, revision="local", arch=a.arch,
+                               ebits=a.ebits, io_bits=a.io_bits, xbits=a.xbits,
+                               shards_meta=shard_meta)
         print(f"convertito {len(shards)} shard -> {a.outdir}")
         return
 
@@ -394,6 +488,17 @@ def main():
     except OSError:
         print("ERRORE: un altro convertitore sta gia' lavorando su questa outdir. Esco."); return
 
+    # F-06: pin a single commit SHA for the whole conversion (index, meta, shards).
+    for att in range(999):
+        try:
+            info0 = HfApi().repo_info(a.repo, revision=a.revision)
+            break
+        except KeyboardInterrupt: raise
+        except Exception as ex:
+            w = min(60, 5*(att+1)); print(f"repo_info KO ({type(ex).__name__}): riprovo tra {w}s", flush=True); time.sleep(w)
+    REV = getattr(info0, "sha", None) or a.revision or "main"
+    print(f"[F-06] pinned revision={REV} (requested={a.revision or 'default'})", flush=True)
+
     # dimensioni note dei file, riempite dopo repo_info: il downloader multi-stream le usa
     # per calcolare i confini dei segmenti e per sapere quando un file e' completo.
     # EN: known file sizes, filled after repo_info: the multi-stream downloader uses them
@@ -414,7 +519,7 @@ def main():
         EN: home line. Small files, COLI_DL_STREAMS=1 or a legacy .part -> single-stream
         EN: path (_download_single)."""
         import time as _t, threading, urllib.request, urllib.error
-        url = f"https://huggingface.co/{repo}/resolve/main/{fn}"
+        url = hf_resolve_url(repo, fn, REV)
         out = os.path.join(dest, fn); part = out + ".part"; side = part + ".seg"
         os.makedirs(dest, exist_ok=True)
         expected = SIZES.get(fn)
@@ -550,104 +655,132 @@ def main():
               f"({sz/dt/1e6:.1f} MB/s medi/avg, {nres} riprese/resumes)", flush=True)
         return out
 
-    from safetensors.numpy import save_file
     import time as _t
+    import urllib.request
     for att in range(999):
         try:
-            info = HfApi().repo_info(a.repo, files_metadata=True)
+            info = HfApi().repo_info(a.repo, revision=REV, files_metadata=True)
             # dimensioni note dallo store: abilitano il download multi-stream a segmenti.
-            # EN: sizes known from the store: enable segmented multi-stream download.
             SIZES.update({s.rfilename: s.size for s in info.siblings if s.size})
             break
         except KeyboardInterrupt: raise
         except Exception as ex:
             w = min(60, 5*(att+1)); print(f"repo_info KO ({type(ex).__name__}): riprovo tra {w}s", flush=True); _t.sleep(w)
     shards = sorted(s.rfilename for s in info.siblings if s.rfilename.endswith(".safetensors"))
-    wmap = None            # weight_map dell'index: serve al risolutore di scale cross-shard
+    wmap = None
+    index_sha = None
     if a.arch == "mimo":
-        # guida l'iterazione con l'index (weight_map): salta model_mtp.safetensors e ogni shard
-        # che contiene SOLO tensori da saltare (vision/audio) -> zero byte scaricati per nulla.
-        # Le tre matrici di un expert possono stare su shard ep diversi: ogni shard scrive i
-        # tensori che ha (out-NNNNN keyed sullo shard), st.h del motore li ricuce per nome.
-        # EN: drive iteration from the index (weight_map): skip model_mtp.safetensors and any
-        # EN: shard holding ONLY skippable tensors (vision/audio) -> no wasted download bytes.
-        # EN: An expert's three matrices may live on different ep shards: each shard writes the
-        # EN: tensors it has (out-NNNNN keyed on the shard), the engine's st.h stitches by name.
-        import urllib.request
-        idx = json.loads(urllib.request.urlopen(
-            f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json",
-            timeout=30).read())["weight_map"]
+        idx_bytes = urllib.request.urlopen(
+            hf_resolve_url(a.repo, "model.safetensors.index.json", REV), timeout=30).read()
+        index_sha = hashlib.sha256(idx_bytes).hexdigest()
+        idx = json.loads(idx_bytes)["weight_map"]
         wmap = idx
         shards = sorted(set(v for k, v in idx.items() if classify_mimo(k) != "skip"))
         shards = [s for s in shards if "mtp" not in os.path.basename(s)]
     if not a.mtp and not a.indexer:
-        # --mtp/--indexer scrivono in un container GIA' convertito: non sovrascrivere
-        # il suo config.json (potrebbe essere stato patchato in situ).
-        # EN: --mtp/--indexer write into an EXISTING container: don't clobber its config.
         for fn in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"]:
-            try: shutil.copy(hf_hub_download(a.repo, fn, local_dir=a.outdir+"/_meta"), a.outdir)
-            except Exception: pass
+            try:
+                shutil.copy(hf_hub_download(a.repo, fn, revision=REV, local_dir=a.outdir+"/_meta"), a.outdir)
+            except Exception:
+                pass
     tmp = os.path.join(a.outdir, "_inflight"); os.makedirs(tmp, exist_ok=True)
+    shard_meta = []
+
+    def _skip_or_clear(outp, label):
+        if safetensors_is_valid(outp):
+            print(f"{label} {outp} gia' valido (skip)", flush=True)
+            return True
+        if os.path.exists(outp):
+            print(f"{label} invalid/truncated {outp}: regenerating", flush=True)
+            try: os.remove(outp)
+            except OSError: pass
+        return False
+
     if a.mtp:
-        import urllib.request
         idx = wmap or json.loads(urllib.request.urlopen(
-            f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
+            hf_resolve_url(a.repo, "model.safetensors.index.json", REV), timeout=30).read())["weight_map"]
         pref = "model.mtp." if a.arch == "mimo" else f"model.layers.{a.n_layers}."
         mtp_shards = sorted(set(v for k, v in idx.items() if k.startswith(pref)))
         print(f"[MTP] testa ({pref}*): {len(mtp_shards)} shard da processare: {mtp_shards}")
-        fetch = make_scale_fetcher(a.repo, idx)
+        fetch = make_scale_fetcher(a.repo, idx, revision=REV)
         for i, sh in enumerate(mtp_shards):
             outp = os.path.join(a.outdir, f"out-mtp-{i:05d}.safetensors")
-            if os.path.exists(outp): print(f"[MTP] {outp} gia' fatto"); continue
+            if _skip_or_clear(outp, "[MTP]"):
+                shard_meta.append({"name": os.path.basename(outp), "size": os.path.getsize(outp),
+                                   "sha256": file_sha256(outp), "source": sh})
+                continue
             print(f"[MTP {i+1}/{len(mtp_shards)}] scarico {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
             out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True,
                                     arch=a.arch, fetch_scale=fetch)
-            save_file(out, outp)
+            atomic_save_file(out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
                 if os.path.isfile(blob): os.remove(blob)
+            shard_meta.append({"name": os.path.basename(outp), "size": os.path.getsize(outp),
+                               "sha256": file_sha256(outp), "source": sh})
             print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB, {len(out)} tensori)", flush=True)
+        write_convert_manifest(a.outdir, repo=a.repo, revision=REV, arch=a.arch,
+                               ebits=a.ebits, io_bits=a.io_bits, xbits=a.xbits,
+                               shards_meta=shard_meta, source_index_sha=index_sha)
         shutil.rmtree(tmp, ignore_errors=True); print("[MTP] FATTO."); return
     if a.indexer:
-        import urllib.request
         idx = json.loads(urllib.request.urlopen(
-            f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
+            hf_resolve_url(a.repo, "model.safetensors.index.json", REV), timeout=30).read())["weight_map"]
         idx_shards = sorted(set(v for k, v in idx.items()
                                 if "indexer" in k and 0 <= layer_idx(k) < a.n_layers))
         tot_gb = len(idx_shards) * 5.4
         print(f"[IDX] pesi indexer su {len(idx_shards)} shard (~{tot_gb:.0f} GB di download totale, resumabile)")
-        fetch = make_scale_fetcher(a.repo, idx)
+        fetch = make_scale_fetcher(a.repo, idx, revision=REV)
         for i, sh in enumerate(idx_shards):
             outp = os.path.join(a.outdir, f"out-idx-{i:05d}.safetensors")
-            if os.path.exists(outp): continue             # gia' fatto -> ripartibile
+            if _skip_or_clear(outp, "[IDX]"):
+                shard_meta.append({"name": os.path.basename(outp), "size": os.path.getsize(outp),
+                                   "sha256": file_sha256(outp), "source": sh})
+                continue
             print(f"[IDX {i+1}/{len(idx_shards)}] scarico {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
             out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True,
                                     fetch_scale=fetch)
-            if out: save_file(out, outp)
+            if out: atomic_save_file(out, outp)
             os.remove(p)
             for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
                 if os.path.isfile(blob): os.remove(blob)
+            if os.path.exists(outp):
+                shard_meta.append({"name": os.path.basename(outp), "size": os.path.getsize(outp),
+                                   "sha256": file_sha256(outp), "source": sh})
             print(f"    -> {os.path.basename(outp)} ({len(out)} tensori)", flush=True)
+        write_convert_manifest(a.outdir, repo=a.repo, revision=REV, arch=a.arch,
+                               ebits=a.ebits, io_bits=a.io_bits, xbits=a.xbits,
+                               shards_meta=shard_meta, source_index_sha=index_sha)
         shutil.rmtree(tmp, ignore_errors=True); print("[IDX] FATTO."); return
-    fetch = make_scale_fetcher(a.repo, wmap)   # scale spezzate sul confine di shard (Range remoto)
+    fetch = make_scale_fetcher(a.repo, wmap, revision=REV)
+    last_i = -1
     for i, sh in enumerate(shards):
+        last_i = i
         if free_gb(a.outdir) < a.min_free_gb:
             print(f"STOP: spazio libero < {a.min_free_gb} GB. Libera spazio e rilancia (riprende)."); break
         outp = os.path.join(a.outdir, f"out-{i:05d}.safetensors")
-        if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
+        if _skip_or_clear(outp, ""):
+            shard_meta.append({"name": os.path.basename(outp), "size": os.path.getsize(outp),
+                               "sha256": file_sha256(outp), "source": sh})
+            continue
         print(f"[{i+1}/{len(shards)}] scarico {sh} (libero {free_gb(a.outdir):.0f} GB)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
         out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, arch=a.arch,
                                 fetch_scale=fetch)
-        save_file(out, outp)
-        os.remove(p)                                       # <-- cancella subito lo shard fp8
+        atomic_save_file(out, outp)
+        os.remove(p)
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
             if os.path.isfile(blob): os.remove(blob)
+        shard_meta.append({"name": os.path.basename(outp), "size": os.path.getsize(outp),
+                           "sha256": file_sha256(outp), "source": sh})
         print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB)", flush=True)
+    write_convert_manifest(a.outdir, repo=a.repo, revision=REV, arch=a.arch,
+                           ebits=a.ebits, io_bits=a.io_bits, xbits=a.xbits,
+                           shards_meta=shard_meta, source_index_sha=index_sha)
     shutil.rmtree(tmp, ignore_errors=True)
-    print("FATTO." if i == len(shards)-1 else "INTERROTTO (rilancia per riprendere).")
+    print("FATTO." if last_i == len(shards)-1 and last_i >= 0 else "INTERROTTO (rilancia per riprendere).")
 
 if __name__ == "__main__":
     main()
