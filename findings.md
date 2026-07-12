@@ -630,14 +630,14 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
-### 36. TAO=1 — wu wei stack (2026-07-12)
+### 36. TAO=1 — wu wei + sacred geometry (2026-07-12)
 
-Meta-profile: flow with the residual, do not force.
+Meta-profile: flow with the residual, do not force; harmonic knobs when unset.
 
-- `TAO=1` → SPEED/TRAJ/FLOW on (if unset), `ENERGY` auto, **`DRAFT=0`**, softer `REPIN=48`.
-- Explicit env always wins. Log: `[TAO] wu wei: flow with residual · …`
-- Docs: `docs/tao.md` (yin/yang of snow/light, non-forcing I/O).
-- `scripts/start_peng.sh` honors `TAO=1` before tier defaults.
+- `TAO=1` → SPEED/TRAJ/FLOW on, `ENERGY` auto with **φ fraction (0.618)** of free VRAM.
+- Fibonacci: `TRAJ_K=5`, `FLOW_R=3`, `REPIN=55`, traj warm budget 55; **`DRAFT=0`**.
+- Docs: `docs/tao.md`, `docs/sacred-geometry.md`, `docs/diagrams/sacred-geometry-mimo.svg`.
+- Explicit env always wins. Log: `[TAO] wu wei + sacred proportions (φ, Fibonacci)…`
 
 ### 35. ENERGY — channel snow → pure VRAM (2026-07-12)
 

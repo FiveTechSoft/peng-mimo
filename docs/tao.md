@@ -65,7 +65,7 @@ nieve ──thaw──► caché ──ENERGY──► VRAM ──shear──►
 
 ---
 
-## 4. TAO=1 (executable stillness)
+## 4. TAO=1 (executable stillness + sacred proportions)
 
 ```bash
 TAO=1 SERVE=1 SNAP=~/mimo25_i4 ./mimo 64 4 8
@@ -73,21 +73,24 @@ TAO=1 SERVE=1 SNAP=~/mimo25_i4 ./mimo 64 4 8
 TAO=1 scripts/start_peng.sh chat
 ```
 
-| Knob | Under TAO (if unset) |
-|------|----------------------|
-| `SPEED` | 1 |
-| `TRAJ` / `FLOW` | 1 |
-| `ENERGY` | auto (−1) with FLOW |
-| `DRAFT` | **0** (no force) |
-| `REPIN` | 48 (softer) |
-| `TOPP` | 0.55 via SPEED |
+| Knob | Under TAO (if unset) | Geometry |
+|------|----------------------|----------|
+| `SPEED` | 1 | unity path |
+| `TRAJ` / `FLOW` | 1 | habit channels |
+| `TRAJ_K` | **5** | Fibonacci |
+| `FLOW_R` | **3** | Fibonacci |
+| `ENERGY` | auto (−1), fill **1/φ ≈ 0.618** of free VRAM | golden void |
+| `DRAFT` | **0** (no force) | wu wei |
+| `REPIN` | **55** | Fibonacci |
+| `TOPP` | 0.55 via SPEED | measured |
 
-Explicit env always wins. The Tao does not bind the hand that already chose.
+Explicit env always wins. The Tao does not bind the hand that already chose.  
+Full map: [`sacred-geometry.md`](sacred-geometry.md).
 
 Log:
 
 ```
-[TAO] wu wei: flow with residual · thaw/ignite without force · DRAFT stays off
+[TAO] wu wei + sacred proportions (φ, Fibonacci) · DRAFT stays off
 ```
 
 ---

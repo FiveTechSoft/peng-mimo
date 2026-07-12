@@ -13,13 +13,15 @@ set -euo pipefail
 
 # TAO=1 → Corriente without force (explicit env still wins)
 if [[ "${TAO:-0}" == "1" ]]; then
+  # Sacred / Fibonacci harmonics (explicit env still wins)
   export SPEED="${SPEED:-1}"
   export TRAJ="${TRAJ:-1}"
+  export TRAJ_K="${TRAJ_K:-5}"
   export FLOW="${FLOW:-1}"
-  export FLOW_R="${FLOW_R:-2}"
+  export FLOW_R="${FLOW_R:-3}"
   export ENERGY="${ENERGY:--1}"
   export DRAFT="${DRAFT:-0}"
-  export REPIN="${REPIN:-48}"
+  export REPIN="${REPIN:-55}"
   export PILOT="${PILOT:-1}"
   export PILOT_DEPTH="${PILOT_DEPTH:-1}"
   export PREFETCH="${PREFETCH:-1}"
@@ -150,7 +152,7 @@ fi
 print_banner() {
   echo "========== peng-mimo start =========="
   if [[ "${TAO:-0}" == "1" ]]; then
-    echo " TAO=1  wu wei · flow with residual · do not force"
+    echo " TAO=1  wu wei · sacred φ/Fibonacci · flow without force"
   fi
   echo " SNAP=$SNAP"
   echo " tier: $TIER"

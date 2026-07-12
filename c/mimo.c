@@ -2730,7 +2730,11 @@ static void pathpack_energy_ignite(Model *m){
         return;
     }
     if(g_energy_gb>0 && g_energy_gb*1e9<budget) budget=g_energy_gb*1e9;
-    else if(g_energy_gb<0) budget*=0.85;         /* auto: most remaining free */
+    else if(g_energy_gb<0){
+        /* auto: fill most free VRAM; under TAO leave void = 1/φ (golden) headroom */
+        int tao = getenv("TAO") && atoi(getenv("TAO"));
+        budget *= tao ? 0.6180339887 : 0.85;
+    }
     int max_pos=0;
     for(int l=0;l<c->n_layers && l<TRAJ_LMAX;l++)
         if(g_pp_n[l]>max_pos) max_pos=g_pp_n[l];
@@ -3620,7 +3624,7 @@ int main(int argc, char **argv){
      * Residual is the Way; pin/FLOW/ENERGY yield to free VRAM; no DRAFT thrash. */
     int tao_mode = getenv("TAO") && atoi(getenv("TAO"));
     if(tao_mode)
-        fprintf(stderr,"[TAO] wu wei: flow with residual · thaw/ignite without force · DRAFT stays off\n");
+        fprintf(stderr,"[TAO] wu wei + sacred proportions (φ, Fibonacci) · DRAFT stays off\n");
     /* SPEED=1: unity profile — fewer experts/token, tighter I/O anticipatory stack.
      * Does not change matmul math (TOPK only shrinks routed set). Chat --fast sets it. */
     int speed_mode = getenv("SPEED") ? atoi(getenv("SPEED")) : (tao_mode ? 1 : 0);
@@ -3649,14 +3653,15 @@ int main(int argc, char **argv){
       if(e) g_i4s=atoi(e);
       else if(serve_mode) g_i4s=1;   /* chat default; CUDA path may force I4S=1 below */
     }
-    /* REPIN: SERVE/SPEED every 32 tok; TAO slightly softer (less thrash = wu wei) */
-    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):(tao_mode?48:(serve_mode||speed_mode?32:0));
+    /* REPIN: SERVE/SPEED 32; TAO Fibonacci 55 (softer thrash, sacred growth) */
+    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):(tao_mode?55:(serve_mode||speed_mode?32:0));
     g_memwatch = getenv("MEMWATCH")?atoi(getenv("MEMWATCH")):1;  /* #71: adapt ecap each SERVE turn */
     /* Trajectory bulk WILLNEED: default ON for SERVE (multi-turn hit); off for oracle/TF */
     if(getenv("TRAJ")) g_traj=atoi(getenv("TRAJ"));
     else g_traj = (serve_mode || speed_mode || tao_mode) ? 1 : 0;
     if(getenv("TRAJ_K")){ g_traj_k=atoi(getenv("TRAJ_K")); if(g_traj_k<1)g_traj_k=1; if(g_traj_k>8)g_traj_k=8; }
-    else g_traj_k = (speed_mode || serve_mode) ? 6 : 8;  /* lean: more K was fadvise storm */
+    else if(tao_mode) g_traj_k=5;                /* Fibonacci */
+    else g_traj_k = (speed_mode || serve_mode) ? 6 : 8;
     if(getenv("TRAJ_DEPTH")){ g_traj_depth=atoi(getenv("TRAJ_DEPTH")); if(g_traj_depth<1)g_traj_depth=1; if(g_traj_depth>4)g_traj_depth=4; }
     if(g_traj>0)
         fprintf(stderr,"[TRAJ] bulk expert path WILLNEED on (K=%d depth=%d; TRAJ=0 off)\n",
@@ -3665,14 +3670,17 @@ int main(int argc, char **argv){
     if(getenv("FLOW")) g_flow=atoi(getenv("FLOW"));
     else g_flow = (g_traj>0 || serve_mode || speed_mode || tao_mode) ? 1 : 0;
     if(getenv("FLOW_R")){ g_flow_r=atoi(getenv("FLOW_R")); if(g_flow_r<1)g_flow_r=1; if(g_flow_r>8)g_flow_r=8; }
+    else if(tao_mode) g_flow_r=3;                /* Fibonacci neighbor radius */
     if(g_flow>0)
         fprintf(stderr,"[FLOW] pathpack channel thaw on (R=%d; FLOW=0 off)\n", g_flow_r);
+    if(tao_mode && g_flow>0 && !getenv("TRAJ_BUDGET"))
+        g_traj_pref_budget=55;                   /* Fibonacci fadvise budget */
     /* ENERGY: snow→VRAM pure compute along channels. Default auto when FLOW+CUDA. */
     if(getenv("ENERGY")) g_energy_gb=atof(getenv("ENERGY"));
     else g_energy_gb = (g_flow>0) ? -1.0 : 0.0;  /* -1 auto remaining VRAM; 0 off; >0 GB */
     if(g_energy_gb!=0 && g_flow>0)
         fprintf(stderr,"[ENERGY] channel ignition %s (ENERGY=0 off, ENERGY=n GB cap)\n",
-                g_energy_gb<0?"auto (free VRAM after pin)":"capped");
+                g_energy_gb<0?(tao_mode?"auto φ·free VRAM (TAO)":"auto (free VRAM after pin)"):"capped");
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.95f;  /* 0.95 = generation_config MiMo-V2.5 */
     g_looka = getenv("LOOKA")?1:0;                    /* PILOT accuracy measurement (no prefetch) */

@@ -57,6 +57,7 @@ Two static SVGs render on GitHub; open the HTML for an interactive Three.js orbi
 | **peng physical** | NVMe → RAM pin/LRU/KV → VRAM dense+gpu_pin, decode pipeline | [`docs/diagrams/peng-mimo-geometry.svg`](docs/diagrams/peng-mimo-geometry.svg) |
 | **3D interactive** | Toggle MiMo stack ↔ peng memory map (drag / zoom) | [`docs/diagrams/mimo-vs-peng-3d.html`](docs/diagrams/mimo-vs-peng-3d.html) |
 | **Corriente Peng** | Residual as river · MoE as vortices · NVMe as snow · mouth = lm_head | [`docs/diagrams/corriente-peng.svg`](docs/diagrams/corriente-peng.svg) · [manifesto](docs/corriente-peng.md) |
+| **Sacred geometry** | Vesica (full/SWA) · flower (layers) · octagon (top-8) · φ budgets | [`docs/diagrams/sacred-geometry-mimo.svg`](docs/diagrams/sacred-geometry-mimo.svg) · [doc](docs/sacred-geometry.md) |
 
 #### 0) Corriente Peng — beyond the net (conception)
 
@@ -207,7 +208,7 @@ scripts/start_peng.sh prompt "la capital de Francia es" 24
 
 The script refuses to be silent about `SNAP` under `/mnt/c` (slow 9p), picks `~/mimo25_i4` or `/root/mimo25_i4`, and tiers knobs by free RAM (PILOT+SPEED on ≤24 GB; DRAFT stays off unless you set it).
 
-**Tao (wu wei):** `TAO=1 scripts/start_peng.sh chat` — FLOW + ENERGY auto + SPEED, no forced DRAFT. See [`docs/tao.md`](docs/tao.md).
+**Tao (wu wei + sacred proportions):** `TAO=1 scripts/start_peng.sh chat` — FLOW + ENERGY (φ of free VRAM) + Fibonacci knobs, no forced DRAFT. See [`docs/tao.md`](docs/tao.md) · [`docs/sacred-geometry.md`](docs/sacred-geometry.md).
 
 ### Requirements
 
