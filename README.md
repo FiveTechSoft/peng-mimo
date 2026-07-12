@@ -177,6 +177,22 @@ Pending for Phase 6, beyond disk: replace the GLM-inherited chat template with M
 
 ## How to use it
 
+### Fast start (auto env for your RAM / SNAP / CUDA)
+
+```bash
+cd c
+# inspect what would be exported (no model load)
+scripts/start_peng.sh env
+
+# interactive chat (SPEED/PILOT/TRAJ/CUDA when available)
+scripts/start_peng.sh chat
+
+# one-shot prompt
+scripts/start_peng.sh prompt "la capital de Francia es" 24
+```
+
+The script refuses to be silent about `SNAP` under `/mnt/c` (slow 9p), picks `~/mimo25_i4` or `/root/mimo25_i4`, and tiers knobs by free RAM (PILOT+SPEED on ≤24 GB; DRAFT stays off unless you set it).
+
 ### Requirements
 
 - Linux or WSL2, gcc with OpenMP, CPU with AVX2
