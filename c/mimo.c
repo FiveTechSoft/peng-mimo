@@ -160,6 +160,11 @@ typedef struct {
     ESlot ws[64];                                /* working set del layer corrente (load paralleli) */
     ESlot **pin; int *npin;                      /* HOT-STORE: expert pinnati in RAM (mai evicted) */
     ESlot **gpu_pin; int *ngpin;                 /* VRAM tier: complementary experts (not in RAM pin) */
+    /* Bitmaps (the other way): 256 experts → 4×u64 per layer.
+     * res_bits  = resident (VRAM|RAM pin|LRU) — O(1) hit test / skip WILLNEED
+     * pref_bits = already WILLNEED'd this epoch — dedupe PILOT∪TRAJ∪sticky∪block */
+    uint64_t *res_bits;                          /* [n_layers * 4] */
+    uint64_t *pref_bits;                         /* [n_layers * 4] */
     uint32_t **eusage;                           /* contatori persistenti (per STATS/PIN) */
     uint32_t **eheat;                            /* calore recente per promotion/demotion live */
     int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
@@ -1032,6 +1037,8 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->eroute=calloc(NR,sizeof(int*)); m->enr=calloc(NR,sizeof(int));
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
     m->gpu_pin=calloc(NR,sizeof(ESlot*)); m->ngpin=calloc(NR,sizeof(int));
+    m->res_bits=calloc((size_t)NR*4,sizeof(uint64_t));
+    m->pref_bits=calloc((size_t)NR*4,sizeof(uint64_t));
     m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
     m->kv_start=calloc(NR+1,sizeof(int));        /* +1: riga KV del layer MTP */
     for(int i=0;i<c->n_layers;i++){
@@ -1251,9 +1258,70 @@ static void expert_cpu_free(Model *m, ESlot *s){
     for(int k=0;k<3;k++){ qt[k]->qf=NULL; qt[k]->q8=NULL; qt[k]->q4=NULL; qt[k]->s=NULL; }
 }
 
+/* ---- Expert bitmaps (256 experts → 4×uint64_t words per layer) -------------------- */
+#define EMAP_W 4
+static inline int emap_ok(const Model *m, int layer, int eid){
+    return m && layer>=0 && layer<m->c.n_layers && eid>=0 && eid<m->c.n_experts
+        && eid<256 && m->res_bits && m->pref_bits;
+}
+static inline uint64_t *emap_row(uint64_t *base, int layer){ return base+(size_t)layer*EMAP_W; }
+static inline int emap_test(const uint64_t *row, int eid){
+    return (row[eid>>6] >> (eid&63)) & 1ull;
+}
+static inline void emap_set(uint64_t *row, int eid){
+    row[eid>>6] |= 1ull << (eid&63);
+}
+static inline void emap_clr(uint64_t *row, int eid){
+    row[eid>>6] &= ~(1ull << (eid&63));
+}
+/* Rebuild residency mask for one layer (pin ∪ gpu ∪ LRU). */
+static void res_bits_rebuild_layer(Model *m, int l){
+    if(!m->res_bits || l<0 || l>=m->c.n_layers) return;
+    uint64_t *row=emap_row(m->res_bits,l);
+    memset(row,0,EMAP_W*sizeof(uint64_t));
+    if(m->pin && m->pin[l])
+        for(int z=0;z<m->npin[l];z++){ int e=m->pin[l][z].eid; if(e>=0&&e<256) emap_set(row,e); }
+#ifdef COLI_CUDA
+    if(m->gpu_pin && m->gpu_pin[l])
+        for(int z=0;z<m->ngpin[l];z++){ int e=m->gpu_pin[l][z].eid; if(e>=0&&e<256) emap_set(row,e); }
+#endif
+    if(m->ecache && m->ecache[l])
+        for(int z=0;z<m->ecn[l];z++){ int e=m->ecache[l][z].eid; if(e>=0&&e<256) emap_set(row,e); }
+}
+static void res_bits_rebuild_all(Model *m){
+    if(!m) return;
+    for(int l=0;l<m->c.n_layers;l++) res_bits_rebuild_layer(m,l);
+}
+/* Clear WILLNEED-epoch mask (call once per SERVE turn / PROMPT). Within a turn,
+ * bits stick: first hint wins, duplicates are free no-ops. */
+static void pref_bits_clear(Model *m){
+    if(m && m->pref_bits)
+        memset(m->pref_bits,0,(size_t)m->c.n_layers*EMAP_W*sizeof(uint64_t));
+}
+/* Is eid resident in RAM pin, VRAM tier, or LRU for this layer? O(1) via bitmap. */
+static int expert_resident(Model *m, int l, int eid){
+    if(!emap_ok(m,l,eid)){
+        /* Fallback scan if bitmaps not ready (early boot). */
+        if(m->pin && m->pin[l]) for(int z=0;z<m->npin[l];z++) if(m->pin[l][z].eid==eid) return 1;
+#ifdef COLI_CUDA
+        if(m->gpu_pin && m->gpu_pin[l]) for(int z=0;z<m->ngpin[l];z++) if(m->gpu_pin[l][z].eid==eid) return 1;
+#endif
+        if(m->ecache && m->ecache[l]) for(int z=0;z<m->ecn[l];z++) if(m->ecache[l][z].eid==eid) return 1;
+        return 0;
+    }
+    return emap_test(emap_row(m->res_bits,l), eid);
+}
 /* prefetch asincrono dei pesi di un expert (e delle sue scale .qs): avvia il readahead
- * cosi' le letture sincrone successive trovano la page-cache calda. */
+ * cosi' le letture sincrone successive trovano la page-cache calda.
+ * Bitmap path: skip if already resident OR already hinted this epoch (no fadvise storm). */
 static void expert_prefetch(Model *m, int layer, int eid){
+    if(eid<0 || layer<0) return;
+    if(emap_ok(m,layer,eid)){
+        uint64_t *rb=emap_row(m->res_bits,layer);
+        uint64_t *pb=emap_row(m->pref_bits,layer);
+        if(emap_test(rb,eid) || emap_test(pb,eid)) return;
+        emap_set(pb,eid);
+    }
     char nm[300];
     const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
     for(int k=0;k<3;k++){
@@ -1605,16 +1673,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
          * questo — il kernel legge in background, le pread dopo trovano cache calda */
         if(base+64<nu){
             int nb2 = nu-(base+64)<64 ? nu-(base+64) : 64;
-            for(int j=0;j<nb2;j++){ int eid=uniq[base+64+j]; int found=0;
-#ifdef COLI_CUDA
-                if(g_cuda_enabled){ ESlot *G=m->gpu_pin[layer];
-                    for(int z=0;z<m->ngpin[layer] && !found;z++) if(G[z].eid==eid) found=1; }
-#endif
-                ESlot *P=m->pin[layer];
-                for(int z=0;z<m->npin[layer] && !found;z++) if(P[z].eid==eid) found=1;
-                ESlot *Sl=m->ecache[layer];
-                for(int z=0;z<m->ecn[layer] && !found;z++) if(Sl[z].eid==eid) found=1;
-                if(!found) expert_prefetch(m,layer,eid);
+            for(int j=0;j<nb2;j++){
+                int eid=uniq[base+64+j];
+                if(!expert_resident(m,layer,eid)) expert_prefetch(m,layer,eid);
             }
         }
         /* ---- Compute: GPU first (queue), then CPU (runs while GPU works) ----
@@ -1700,6 +1761,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
               else { int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; dst=&Sl[lru]; }
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=++m->eclock; }
+          if(promo>0) res_bits_rebuild_layer(m,layer);   /* bitmap: pin∪gpu∪LRU */
         }
     }
     if(contrib){                                  /* riduzione nell'ordine top-k della posizione */
@@ -2223,6 +2285,7 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     printf("prompt: %d token | genero fino a %d (stop EOS=%d) | draft %s=%d\n",
         np, ngen, eos, m->has_mtp?"MTP":"n-gram", g_draft);
     fputs(prompt,stdout); fflush(stdout);
+    pref_bits_clear(m);                          /* new PROMPT epoch for WILLNEED dedupe */
     kv_alloc(m, np+ngen+g_draft+2);
     int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
 #ifdef COLI_CUDA
@@ -2305,14 +2368,7 @@ static int mimo_turn_render(char *buf, int cap, const char *user, int first){
 static int g_repin=0;
 static uint64_t g_last_repin=0;
 typedef struct { long gain; int l, slot, eid; } RepinCand;
-/* Is eid already resident in RAM pin or VRAM tier for this layer? */
-static int expert_resident(Model *m, int l, int eid){
-    if(m->pin && m->pin[l]) for(int z=0;z<m->npin[l];z++) if(m->pin[l][z].eid==eid) return 1;
-#ifdef COLI_CUDA
-    if(m->gpu_pin && m->gpu_pin[l]) for(int z=0;z<m->ngpin[l];z++) if(m->gpu_pin[l][z].eid==eid) return 1;
-#endif
-    return 0;
-}
+/* expert_resident: see bitmaps near expert_prefetch (O(1) res_bits, includes LRU). */
 static int repin_pick_ram(Model *m, RepinCand *out, int maxc){
     Cfg *c=&m->c; int nb=0;
     for(int l=0;l<c->n_layers;l++){
@@ -2676,6 +2732,7 @@ static void mem_watch_pass(Model *m){
         fprintf(stderr,"[RAM] pressure: %.1f GB free -> cap %d->%d (LRU slots freed)%s\n",
             avail,m->ecap,newcap, g_profile[0]?g_profile:"");
         m->ecap=newcap;
+        res_bits_rebuild_all(m);
         /* After shrink, warm hottest non-residents — next turn pays less disk. */
         heat_prefetch_top(m, 3);
     } else if(avail>6.0 && m->ecap<c->n_experts){   /* headroom: grow LRU */
@@ -2760,6 +2817,7 @@ static void repin_pass(Model *m){
     }
 #endif
     for(int l=0;l<m->c.n_layers;l++) if(m->eheat[l]) tier_decay(m->eheat[l],m->c.n_experts);
+    res_bits_rebuild_all(m);                     /* REPIN changed residency */
     /* After swaps, warm the new hot set into page cache. */
     heat_prefetch_top(m, 4);
 }
@@ -2864,6 +2922,7 @@ static void run_serve(Model *m, const char *snap){
         if(prompt_tokens<1){ free(raw); g_temp=base_temp; g_nuc=base_nuc;
             printf("\x01\x01" "END" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f 0 0\n", rss_gb()); fflush(stdout); continue; }
         first=0;
+        pref_bits_clear(m);                      /* new turn epoch: allow WILLNEED again */
         heat_prefetch_top(m, 4);                 /* warm likely experts before this turn's prefill */
         int cur=req_ngen; if(len+k+cur+g_draft+2>=maxctx) cur=maxctx-len-k-g_draft-2;
         uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
@@ -3148,6 +3207,7 @@ static void pin_load(Model *m, const char *statspath, double gb){
         free(cnt_l);
     }
     pin_wire(m);
+    res_bits_rebuild_all(m);                     /* bitmap: pin ∪ gpu after hot-store load */
     free(on_gpu); free(r);
 }
 
@@ -3420,6 +3480,7 @@ int main(int argc, char **argv){
       if(g_traj>0){
           long w0=g_traj_warm_n;
           int bud0=g_traj_pref_budget; g_traj_pref_budget=128; /* boot: one-shot, allow more */
+          pref_bits_clear(&m);
           heat_prefetch_top(&m, g_traj_k>4?g_traj_k:4);
           g_traj_pref_budget=bud0;
           if(g_traj_warm_n>w0)

@@ -630,6 +630,27 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 33. Expert bitmaps (2026-07-12) — the other map
+
+**Intuition:** lists of slots are the slow story. **Bits** are the real map.
+
+| Bitmap | Shape | Role |
+|---|---|---|
+| `res_bits` | `n_layers × 4×u64` (256 experts) | resident = VRAM ∪ RAM pin ∪ LRU — O(1) `expert_resident` |
+| `pref_bits` | same | already WILLNEED'd this epoch — dedupe PILOT ∪ TRAJ ∪ sticky ∪ block readahead |
+
+- Rebuild `res_bits` after pin_load, LRU promote, REPIN, mem_watch shrink.
+- Clear `pref_bits` once per PROMPT / SERVE turn (within a turn: first hint wins).
+- `expert_prefetch`: no-op if resident **or** already hinted → kills duplicate `posix_fadvise` storms without shrinking the useful prior.
+- Also fixed: residency now includes **LRU** (old `expert_resident` only checked pin/gpu).
+
+```bash
+# no new knobs — always on with the model
+# stderr still shows [TRAJ] willneed_calls=… (now much closer to unique experts)
+```
+
+**Why it fits Vedanta/binary:** presence is 0/1; the continuous scores only *choose* which bits to set; the connected path is OR of masks, not another list scan.
+
 ### 32. SPEED unity (2026-07-12) — GEMV denser + lean TRAJ + profile
 
 **Goal:** give peng-mimo a coherent speed body without fadvise storms.
