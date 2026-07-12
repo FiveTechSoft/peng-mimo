@@ -277,12 +277,24 @@ def generation_options(body, limit):
     return maximum, float(temperature), float(top_p)
 
 
-def read_engine_turn(stream, sentinel, on_bytes):
+def read_engine_turn(stream, sentinel, on_bytes, cancel_check=None, poll_s=0.25):
+    """Read until sentinel. Optional cancel_check() aborts with ClientCancelled (F-08)."""
     pending = b""
+    fileno = None
+    try:
+        fileno = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        fileno = None
     while True:
+        if cancel_check and cancel_check():
+            raise ClientCancelled()
+        if fileno is not None:
+            readable, _, _ = select.select([fileno], [], [], poll_s)
+            if not readable:
+                continue
         byte = stream.read(1)
         if byte == b"":
-            raise RuntimeError("colibri engine exited unexpectedly")
+            raise RuntimeError("engine exited unexpectedly")
         pending += byte
         if pending.endswith(sentinel):
             data = pending[:-len(sentinel)]
@@ -293,7 +305,17 @@ def read_engine_turn(stream, sentinel, on_bytes):
             on_bytes(pending[:-len(sentinel)])
             pending = pending[-len(sentinel):]
 
-    fields = stream.readline().decode("utf-8", "replace").strip().split()
+    # STAT line may arrive after a short delay
+    while True:
+        if cancel_check and cancel_check():
+            raise ClientCancelled()
+        if fileno is not None:
+            readable, _, _ = select.select([fileno], [], [], poll_s)
+            if not readable:
+                continue
+        line = stream.readline()
+        break
+    fields = line.decode("utf-8", "replace").strip().split()
     if len(fields) < 5 or fields[0] != "STAT":
         raise RuntimeError(f"invalid engine status: {' '.join(fields)}")
     return {
@@ -307,16 +329,80 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 
 class Engine:
-    def __init__(self, executable, model, cap=8, max_tokens=1024, env=None):
-        child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", NGEN=str(max_tokens))
-        self.process = subprocess.Popen(
-            [str(executable), str(cap)], env=child_env, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, bufsize=0,
-        )
-        self.lock = threading.Lock()
-        read_engine_turn(self.process.stdout, READY, lambda _: None)
+    """Single SERVE child. F-08: client cancel kills the child and respawns (load ~20–50s).
+    F-09: alive() for readiness probes."""
 
-    def generate(self, prompt, max_tokens, temperature, top_p, on_text):
+    def __init__(self, executable, model, cap=8, max_tokens=1024, env=None,
+                 ebits=4, dbits=8):
+        self.executable = str(executable)
+        self.model = str(model)
+        self.cap = int(cap)
+        self.max_tokens = int(max_tokens)
+        self.ebits = int(ebits)
+        self.dbits = int(dbits)
+        self.base_env = dict(env or os.environ)
+        self.process = None
+        self.lock = threading.Lock()
+        self.restarts = 0
+        self.last_restart_reason = ""
+        self._spawn("initial")
+
+    def _child_env(self):
+        env = dict(self.base_env)
+        env.update({
+            "SNAP": self.model,
+            "SERVE": "1",
+            "NGEN": str(self.max_tokens),
+        })
+        return env
+
+    def _spawn(self, reason=""):
+        if self.process is not None and self.process.poll() is None:
+            self._kill_process()
+        # peng defaults: cap ebits dbits (chat_peng uses 64 4 8)
+        cmd = [self.executable, str(self.cap), str(self.ebits), str(self.dbits)]
+        self.process = subprocess.Popen(
+            cmd, env=self._child_env(), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+        )
+        self.last_restart_reason = reason or "spawn"
+        try:
+            read_engine_turn(self.process.stdout, READY, lambda _: None)
+        except Exception:
+            self._kill_process()
+            raise RuntimeError(f"engine failed READY after {reason or 'spawn'}")
+        if reason and reason != "initial":
+            self.restarts += 1
+            sys.stderr.write(f"[engine] restarted ({reason}) pid={self.process.pid} "
+                             f"total_restarts={self.restarts}\n")
+
+    def _kill_process(self):
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            try:
+                self.process.kill()
+            except OSError:
+                pass
+            try:
+                self.process.wait(timeout=15)
+            except Exception:
+                pass
+        for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
+            try:
+                if pipe:
+                    pipe.close()
+            except OSError:
+                pass
+        self.process = None
+
+    def alive(self):
+        return self.process is not None and self.process.poll() is None
+
+    def pid(self):
+        return self.process.pid if self.process is not None else None
+
+    def generate(self, prompt, max_tokens, temperature, top_p, on_text, cancel_check=None):
         payload = prompt.encode("utf-8")
         if b"\0" in payload:
             raise APIError(400, "NUL bytes are not supported in prompts.", "messages")
@@ -328,28 +414,46 @@ class Engine:
                 on_text(text)
 
         with self.lock:
-            if self.process.poll() is not None:
-                raise RuntimeError("colibri engine is not running")
+            if not self.alive():
+                self._spawn("recover-dead")
             header = f"\x02PROMPT {len(payload)} {max_tokens} {temperature:.8g} {top_p:.8g}\n".encode()
-            self.process.stdin.write(header + payload + b"\n")
-            self.process.stdin.flush()
-            stats = read_engine_turn(self.process.stdout, END, decode)
-            tail = decoder.decode(b"", final=True)
-            if tail:
-                on_text(tail)
-            return stats
+            try:
+                self.process.stdin.write(header + payload + b"\n")
+                self.process.stdin.flush()
+                stats = read_engine_turn(self.process.stdout, END, decode,
+                                         cancel_check=cancel_check)
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    on_text(tail)
+                return stats
+            except ClientCancelled:
+                # F-08: hard-kill frees the scheduler; next request pays load time
+                sys.stderr.write("[engine] client cancelled — killing SERVE child\n")
+                self._spawn("client-cancel")
+                raise
+            except Exception:
+                if not self.alive():
+                    try:
+                        self._spawn("recover-after-error")
+                    except Exception as restart_err:
+                        sys.stderr.write(f"[engine] restart failed: {restart_err}\n")
+                raise
 
     def close(self):
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
+        with self.lock:
+            if self.process is not None:
+                if self.process.poll() is None:
+                    try:
+                        self.process.terminate()
+                        self.process.wait(timeout=5)
+                    except Exception:
+                        self._kill_process()
+                        return
+                self._kill_process()
 
 
 def model_object(model_id, created):
-    return {"id": model_id, "object": "model", "created": created, "owned_by": "colibri"}
+    return {"id": model_id, "object": "model", "created": created, "owned_by": "peng"}
 
 
 class APIServer(ThreadingHTTPServer):
@@ -429,8 +533,33 @@ class APIHandler(BaseHTTPRequestHandler):
         request_id = "req_" + uuid.uuid4().hex
         try:
             path = urlsplit(self.path).path
-            if path == "/health":
-                self.send_json(200, {"status": "ok", "scheduler": self.server.scheduler.snapshot()}, request_id)
+            if path in ("/health", "/ready", "/live"):
+                # F-09: liveness of the HTTP process vs readiness of the SERVE child
+                eng = self.server.engine
+                alive = eng.alive()
+                sched = self.server.scheduler.snapshot()
+                body = {
+                    "status": "ok" if alive else "engine_down",
+                    "ready": alive,
+                    "live": True,
+                    "engine": {
+                        "alive": alive,
+                        "pid": eng.pid(),
+                        "restarts": getattr(eng, "restarts", 0),
+                        "last_restart_reason": getattr(eng, "last_restart_reason", ""),
+                    },
+                    "scheduler": sched,
+                }
+                if path == "/live":
+                    self.send_json(200, {"status": "ok", "live": True}, request_id)
+                    return
+                if path == "/ready" or (path == "/health" and not alive):
+                    # /ready always 503 when engine dead; /health also 503 when dead
+                    # so naive probes fail closed (still returns JSON body).
+                    if not alive:
+                        self.send_json(503, body, request_id)
+                        return
+                self.send_json(200, body, request_id)
                 return
             self.require_auth()
             if path == "/v1/models":
@@ -495,7 +624,9 @@ class APIHandler(BaseHTTPRequestHandler):
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
             if not stream:
                 output = []
-                stats = self.server.engine.generate(prompt, maximum, temperature, top_p, output.append)
+                stats = self.server.engine.generate(
+                    prompt, maximum, temperature, top_p, output.append,
+                    cancel_check=self.client_disconnected)
                 text = "".join(output)
                 finish = "length" if stats["length_limited"] else "stop"
                 choice = ({"index": 0, "message": {"role": "assistant", "content": text,
@@ -542,7 +673,18 @@ class APIHandler(BaseHTTPRequestHandler):
                           {"index": 0, "text": text, "logprobs": None, "finish_reason": None})
                 event([choice])
 
-            stats = self.server.engine.generate(prompt, maximum, temperature, top_p, emit)
+            def cancel_or_stream_dead():
+                if not connected:
+                    return True
+                return self.client_disconnected()
+
+            try:
+                stats = self.server.engine.generate(
+                    prompt, maximum, temperature, top_p, emit,
+                    cancel_check=cancel_or_stream_dead)
+            except ClientCancelled:
+                # stream already half-written; free scheduler via engine restart
+                raise
             finish = "length" if stats["length_limited"] else "stop"
             final_choice = ({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}
                             if chat else {"index": 0, "text": "", "logprobs": None,

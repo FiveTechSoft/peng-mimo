@@ -13,9 +13,21 @@ from openai_server import (APIError, APIServer, ClientCancelled, END, Generation
 class FakeEngine:
     def __init__(self):
         self.calls = []
+        self.restarts = 0
+        self.last_restart_reason = ""
+        self._alive = True
 
-    def generate(self, prompt, maximum, temperature, top_p, on_text):
+    def alive(self):
+        return self._alive
+
+    def pid(self):
+        return 1 if self._alive else None
+
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cancel_check=None):
         self.calls.append((prompt, maximum, temperature, top_p))
+        if cancel_check and cancel_check():
+            from openai_server import ClientCancelled
+            raise ClientCancelled()
         on_text("Hé")
         on_text("llo")
         return {"prompt_tokens": 7, "completion_tokens": 2, "length_limited": False}
@@ -27,10 +39,10 @@ class BlockingEngine(FakeEngine):
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def generate(self, prompt, maximum, temperature, top_p, on_text):
+    def generate(self, prompt, maximum, temperature, top_p, on_text, cancel_check=None):
         self.entered.set()
         self.release.wait(2)
-        return super().generate(prompt, maximum, temperature, top_p, on_text)
+        return super().generate(prompt, maximum, temperature, top_p, on_text, cancel_check)
 
 
 class TemplateTest(unittest.TestCase):
@@ -215,9 +227,34 @@ class HTTPTest(unittest.TestCase):
 
     def test_health_reports_scheduler(self):
         with self.request("/health") as response:
-            scheduler = json.load(response)["scheduler"]
-        self.assertEqual(scheduler["max_queue"], 8)
-        self.assertIn("queued", scheduler)
+            body = json.load(response)
+        self.assertTrue(body["ready"])
+        self.assertTrue(body["engine"]["alive"])
+        self.assertEqual(body["scheduler"]["max_queue"], 8)
+        self.assertIn("queued", body["scheduler"])
+
+    def test_ready_503_when_engine_dead(self):
+        self.engine._alive = False
+        try:
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/ready")
+            self.assertEqual(caught.exception.code, 503)
+            detail = json.loads(caught.exception.read().decode())
+            self.assertFalse(detail["ready"])
+            self.assertEqual(detail["status"], "engine_down")
+            with self.assertRaises(HTTPError) as health:
+                self.request("/health")
+            self.assertEqual(health.exception.code, 503)
+        finally:
+            self.engine._alive = True
+
+    def test_live_always_ok(self):
+        self.engine._alive = False
+        try:
+            with self.request("/live") as response:
+                self.assertEqual(json.load(response)["live"], True)
+        finally:
+            self.engine._alive = True
 
     def test_browser_preflight(self):
         request = Request(self.base + "/v1/chat/completions", method="OPTIONS", headers={

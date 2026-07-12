@@ -29,7 +29,7 @@ export default function App() {
   const [baseUrl, setBaseUrl] = useState(() => stored("colibri.baseUrl", "http://127.0.0.1:8000/v1"))
   const [apiKey, setApiKey] = useState(() => stored("colibri.apiKey", ""))
   const [models, setModels] = useState<string[]>([])
-  const [model, setModel] = useState(() => stored("colibri.model", "glm-5.2-colibri"))
+  const [model, setModel] = useState(() => stored("colibri.model", "mimo-v2.5-peng"))
   const [temperature, setTemperature] = useState(0.7)
   const [maxTokens, setMaxTokens] = useState(512)
   const [thinking, setThinking] = useState(false)
