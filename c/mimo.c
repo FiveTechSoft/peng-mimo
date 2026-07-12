@@ -1526,10 +1526,21 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     const float *base_cos = swa ? m->rope_swa_cos : m->rope_full_cos;
     const float *base_sin = swa ? m->rope_swa_sin : m->rope_full_sin;
     int half=rd/2;
+    /* F-11 fix: con ring SWA e batch S>1 la scrittura della posizione p+1 sovrascrive lo
+     * slot logico p+1-w, che sta ancora dentro la finestra di p (qualsiasi S>=2): scrivere
+     * tutto il chunk nel ring PRIMA dello scoring corrompe il prefill/verifica batch.
+     * Chunk corrente in scratch lineare; il ring resta storia (pos < pos_base); a fine
+     * scoring gli ultimi min(w,S) token del chunk vengono riversati nel ring. */
+    int wring=lyr_kv_rows(c,layer,m->max_t);
+    int ring_scratch = swa && c->sliding_window>0 && wring<m->max_t && S>1;
+    float *Ksc=NULL,*Vsc=NULL;
+    if(ring_scratch){ Ksc=falloc((int64_t)S*ks); Vsc=falloc((int64_t)S*vs); }
     for(int s=0;s<S;s++){
         int pos=pos_base+s; float *r=qkv+(int64_t)s*rowsz;
-        int pphy=kv_phys(c,layer,pos,m->max_t);
-        float *Kd=m->K[layer]+(int64_t)pphy*ks, *Vd=m->V[layer]+(int64_t)pphy*vs;
+        float *Kd,*Vd;
+        if(ring_scratch){ Kd=Ksc+(int64_t)s*ks; Vd=Vsc+(int64_t)s*vs; }
+        else { int pphy=kv_phys(c,layer,pos,m->max_t);
+               Kd=m->K[layer]+(int64_t)pphy*ks; Vd=m->V[layer]+(int64_t)pphy*vs; }
         memcpy(Kd, r+qs, ks*sizeof(float));
         for(int i=0;i<vs;i++) Vd[i]=r[qs+ks+i]*c->v_scale;
         const float *ct=base_cos+(size_t)pos*half;
@@ -1551,8 +1562,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         const float *q=qkv+(int64_t)s*rowsz+(int64_t)h*hd;
         float mx=-1e30f;
         for(int j=0;j<nt;j++){
-            int tphy=kv_phys(c,layer,lo+j,m->max_t);
-            const float *kt=Kc+(int64_t)tphy*ks+(int64_t)g*hd;
+            int t=lo+j; const float *kt;
+            if(ring_scratch && t>=pos_base) kt=Ksc+(int64_t)(t-pos_base)*ks+(int64_t)g*hd;
+            else { int tphy=kv_phys(c,layer,t,m->max_t); kt=Kc+(int64_t)tphy*ks+(int64_t)g*hd; }
             float a=0; int d=0;
 #if defined(__AVX2__)
             {
@@ -1581,8 +1593,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         float *cx=ctx+((int64_t)s*H+h)*vd;
         for(int d=0;d<vd;d++) cx[d]=0;
         for(int j=0;j<nt;j++){
-            int tphy=kv_phys(c,layer,lo+j,m->max_t);
-            const float *vt=Vc+(int64_t)tphy*vs+(int64_t)g*vd;
+            int t=lo+j; const float *vt;
+            if(ring_scratch && t>=pos_base) vt=Vsc+(int64_t)(t-pos_base)*vs+(int64_t)g*vd;
+            else { int tphy=kv_phys(c,layer,t,m->max_t); vt=Vc+(int64_t)tphy*vs+(int64_t)g*vd; }
             float a=sc[j]*inv; int d=0;
 #if defined(__AVX2__)
             {
@@ -1601,6 +1614,15 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             for(;d<vd;d++) cx[d]+=a*vt[d];
         }
         if(sc!=scb) free(sc);
+    }
+    if(ring_scratch){
+        int nkeep = S<wring ? S : wring;
+        for(int s=S-nkeep;s<S;s++){
+            int pphy=kv_phys(c,layer,pos_base+s,m->max_t);
+            memcpy(m->K[layer]+(int64_t)pphy*ks, Ksc+(int64_t)s*ks, ks*sizeof(float));
+            memcpy(m->V[layer]+(int64_t)pphy*vs, Vsc+(int64_t)s*vs, vs*sizeof(float));
+        }
+        free(Ksc); free(Vsc);
     }
     /* 4) concat teste [S, H*vd] -> o_proj */
     matmul_qt(out, ctx, &l->o, S);
@@ -2267,6 +2289,9 @@ static void run_score(Model *m, const char *path){
     kv_alloc(m,maxT);
     float *x=falloc((int64_t)maxT*D), *lo=falloc(c->vocab), *row=falloc(D);
     int *ids=malloc(maxT*sizeof(int));
+    /* SCORE_DUMP=<file>: una riga per richiesta con l'argmax di ogni posizione valutata
+     * (confronto top-1 agreement tra configurazioni TOPP/TOPK; non tocca l'output standard) */
+    FILE *fdmp = getenv("SCORE_DUMP") ? fopen(getenv("SCORE_DUMP"),"w") : NULL;
     rewind(f); char *ln=NULL; size_t cp=0; int nreq=0; double t0=now_s();
     while(getline(&ln,&cp,f)>0){
         char *p=ln; int ctxlen=strtol(p,&p,10), contlen=strtol(p,&p,10), T=ctxlen+contlen;
@@ -2279,12 +2304,15 @@ static void run_score(Model *m, const char *path){
             rmsnorm(row, x+(int64_t)pos*D, m->final_norm, D, c->eps);
             matmul_qt(lo,row,&m->lm_head,1);
             int am; lp += logprob_target(lo,c->vocab,ids[pos+1],&am); if(!am) greedy=0;
+            if(fdmp){ int b=0; for(int i=1;i<c->vocab;i++) if(lo[i]>lo[b]) b=i; fprintf(fdmp,"%d ",b); }
         }
+        if(fdmp){ fprintf(fdmp,"\n"); fflush(fdmp); }
         printf("%.6f %d %d\n", lp, contlen, greedy); fflush(stdout);
         if(++nreq%5==0) fprintf(stderr,"[score %d req | %.1fs | RSS %.2f GB | hit %.0f%%]\n",
             nreq, now_s()-t0, rss_gb(), (m->hits+m->miss)?100.0*m->hits/(m->hits+m->miss):0.0);
     }
     free(ln); free(ids); free(x); free(lo); free(row); fclose(f);
+    if(fdmp) fclose(fdmp);
 }
 
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out){

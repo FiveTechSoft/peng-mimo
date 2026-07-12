@@ -630,6 +630,32 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 39. SWA ring corrupted batch prefill — found by oracle, fixed (2026-07-12)
+
+**Symptom:** SCORE mode (teacher-forcing log-likelihood, built for the TOPP/TOPK quality matrix) returned ~uniform logprobs (~10 nats/token, ppl ≈ 25000) and argmax predictions that were pure noise (`。。。`, 0/767 top-1 on real MiMo).
+
+**Isolation (tiny oracle):** same request on `mimo_tiny_i4` vs `ref_mimo.json`:
+
+| gate | before fix | after fix | pre-§29 baseline |
+|---|---|---|---|
+| TF prefill vs oracle | **3/32** | **31/32** | 31/32 |
+| greedy 20 tok | 11/20 | **15/20** | 15/20 |
+| SCORE argmax vs oracle | 0/31 | **30/31** | n/a (new) |
+
+Bisect over worktrees: good at `187b452`, broken at `4596b8e` (§29, SWA KV ring).
+
+**Root cause:** `attention()` writes the whole chunk's K/V into the ring **before** the scoring loop. With ring active, position `p+1` writes slot `(p+1) % W`, evicting logical position `p+1−W` — which is still inside position `p`'s window. Any batch with `S ≥ 2` that crosses the window corrupts earlier in-batch positions. Decode (`S=1`) is untouched, and sequences shorter than `W` never wrap — which is why Rome-style short PROMPT runs (9–33 tok « W=128) looked fine and §29–§38 speed numbers stand, while any prefill > 128 tokens (long prompts, SERVE with history, TF/SCORE) silently produced garbage.
+
+**Fix (`c/mimo.c` `attention()`):** when `ring && S>1`, the current chunk's K/V goes to a linear scratch (`Ksc/Vsc`); scoring reads scratch for `t ≥ pos_base` and the ring for history; after scoring, the last `min(W,S)` rows are flushed into the ring. Decode path unchanged.
+
+**New tooling:**
+
+- `SCORE_DUMP=<file>` — per-position argmax dump in SCORE mode (top-1 agreement between configs).
+- `scripts/make_score_corpus.py` — fixed 768-tok prose + 768-tok code corpus → SCORE requests.
+- `scripts/bench_topp_ppl.sh` — perplexity matrix {BASE, TOPP 0.7/0.6/0.55/0.5, TOPK 6/5} for the expert-trim study.
+
+**Moral:** the token-exact oracle gate caught in minutes what "output looks plausible" missed all day. Long-prefill gate (S > W) should join the validation set — the tiny oracle only covers S=32 with W=8 by luck.
+
 ### 38. Physical pathpack (disk-order channels) + merged fadvise (2026-07-12)
 
 **Context:** After §37 (best **0.60 tok/s**), next levers named were *physical pathpack*, *attention*, and the **1.0 tok/s** gate. This entry is the attempt at **runtime physical pathpack** (no full 152 GB shard rewrite).
@@ -853,7 +879,9 @@ Fewer experts (TOPP 0.45) **hurt**: fewer VRAM hits (hot experts from usage miss
 
 **Physics (honest):** even if disk → 0 on the warm profile (~15.5+12.7+3.6 s / 21 tok) ≈ **0.66 tok/s**. **1.0 needs ~2× faster matmul+attn**, not only hit-rate. Soft ceiling on 23 GB + 3060 + WSL2 remains **~0.55–0.65** without more RAM or faster GEMV/attn.
 
-**Gate 1.0: FAIL** (best still §27 **0.57**). Ring is still correct: frees budget for SERVE/long CTX and multi-turn.
+**Gate 1.0: FAIL** (best still §27 **0.57**). Ring frees budget for SERVE/long CTX and multi-turn.
+
+> **Correction (§39):** the ring as landed here corrupted **batch prefill** for any chunk crossing the window (S ≥ 2, pos ≥ W). Short-prompt speed runs were unaffected (S « W=128), but long prefill/TF/SCORE produced garbage until the §39 fix (scratch chunk + ring flush).
 
 ### 28b. Product review F-01/F-02 (2026-07-12)
 

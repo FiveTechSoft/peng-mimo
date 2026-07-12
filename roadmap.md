@@ -20,6 +20,12 @@ GPU (`COLI_CUDA=1 CUDA_DENSE=1`); the speed dial is **expert hit-rate**,
 **Project best remains 0.60 tok/s** (§37). Physical pathpack is landed for sequential
 WILLNEED; did not raise the record. Latest big win was cutting hidden **other**.
 
+**Correctness (§39):** SWA ring (§29) corrupted any batch prefill crossing the
+window (S ≥ 2, pos ≥ W=128) — long prompts / TF / SCORE were garbage since
+`4596b8e`; short-prompt speed numbers stand. Fixed (scratch chunk + ring flush),
+tiny oracle back to pre-ring level (TF 31/32, greedy 15/20). SCORE mode +
+`SCORE_DUMP` now power the TOPP/TOPK quality matrix (`scripts/bench_topp_ppl.sh`).
+
 ### Stack landed (keep)
 
 - CUDA dense eager + **GPU-first** expert tier + `moe_acc` single-stream
@@ -92,6 +98,9 @@ Even at **0.60 tok/s**:
 - Tiny / fixture oracle TF + greedy
 - Identity DRAFT=0 vs n when MTP used
 - Convert atomic + revision
+- [ ] **Long-prefill gate (S > sliding_window)** — §39: the tiny oracle (S=32, W=8)
+  caught the SWA ring bug only by luck; add a fixture with prefill well past W
+- SCORE ppl matrix before/after any routing or attention change (`scripts/bench_topp_ppl.sh`)
 
 ## Explicit non-goals (measured dead ends)
 
