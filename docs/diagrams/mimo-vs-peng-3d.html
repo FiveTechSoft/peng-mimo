@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>MiMo vs peng-mimo — geometría 3D</title>
+  <title>MiMo vs peng-mimo — 3D geometry</title>
   <style>
     :root {
       --bg: #0b1220;
@@ -55,15 +55,15 @@
 <body>
   <canvas id="c"></canvas>
   <div class="ui">
-    <h1>Geometría MiMo ↔ peng</h1>
-    <p>Vista 3D instructiva. Misma arquitectura lógica; distinta <b>residencia física</b> de los tensores.</p>
+    <h1>MiMo ↔ peng geometry</h1>
+    <p>Interactive 3D view. Same logical architecture; different physical <b>tensor residency</b>.</p>
     <div class="tabs">
-      <button type="button" id="btn-mimo" class="active">MiMo lógico</button>
-      <button type="button" id="btn-peng">peng físico</button>
+      <button type="button" id="btn-mimo" class="active">Logical MiMo</button>
+      <button type="button" id="btn-peng">Physical peng</button>
     </div>
     <div id="desc" class="stat"></div>
     <div class="legend" id="legend"></div>
-    <p class="hint">Arrastra para orbitar · rueda zoom · SVG estáticos en el README:
+    <p class="hint">Drag to orbit · scroll to zoom · static SVGs in the README:
       <a href="mimo-geometry.svg">mimo-geometry.svg</a> ·
       <a href="peng-mimo-geometry.svg">peng-mimo-geometry.svg</a>
     </p>
@@ -243,17 +243,17 @@
       controls.target.set(0, 5, 0);
       camera.position.set(12, 9, 16);
       setPanel(
-        `MiMo-V2.5 · geometría lógica\n` +
-        `• 48 capas: 9 full (azul) + 39 SWA-128 (verde)\n` +
-        `• Capa 0 densa (ámbar); 1–47 MoE\n` +
-        `• 256 experts/capa, top-8 · ~15B activos/token\n` +
+        `MiMo-V2.5 · logical geometry\n` +
+        `• 48 layers: 9 full (blue) + 39 SWA-128 (green)\n` +
+        `• Dense layer 0 (amber); 1–47 MoE\n` +
+        `• 256 experts/layer, top-8 · ~15B active/token\n` +
         `• GQA: 64Q · 4KV full / 8KV SWA\n` +
-        `• QKV fuso · RoPE parcial · V×0.707`,
+        `• Fused QKV · partial RoPE · V×0.707`,
         [
           [COL.full, 'Full attention (9)'],
           [COL.swa, 'SWA-128 (39)'],
-          [COL.dense, 'Capa 0 MLP densa'],
-          [COL.moe, 'Experts activos (top-8)'],
+          [COL.dense, 'Layer 0 dense MLP'],
+          [COL.moe, 'Active experts (top-8)'],
         ]
       );
     }
@@ -289,7 +289,7 @@
       const dens = box(3.8, 1.0, 2.6, COL.cpu, 0.85);
       dens.position.set(-4.5, 5.3, 5.5);
       g.add(dens);
-      g.add(Object.assign(sprite('RAM pin / LRU / densas', '#93c5fd', 3.2), { position: new THREE.Vector3(-4.5, 6.6, 5.5) }));
+      g.add(Object.assign(sprite('RAM pin / LRU / dense', '#93c5fd', 3.2), { position: new THREE.Vector3(-4.5, 6.6, 5.5) }));
 
       // VRAM tower
       const vram = box(4.5, 4.2, 3.2, COL.vram, 0.5);
@@ -301,7 +301,7 @@
       const ge = box(3.8, 1.8, 2.6, 0x34d399, 0.9);
       ge.position.set(4.5, 3.7, 5.5);
       g.add(ge);
-      g.add(Object.assign(sprite('VRAM densas + gpu_pin', '#6ee7b7', 3.2), { position: new THREE.Vector3(4.5, 5.5, 5.5) }));
+      g.add(Object.assign(sprite('VRAM dense + gpu_pin', '#6ee7b7', 3.2), { position: new THREE.Vector3(4.5, 5.5, 5.5) }));
 
       // streaming arcs (disk -> RAM / VRAM)
       const curve1 = new THREE.QuadraticBezierCurve3(
@@ -335,26 +335,26 @@
         b.position.set(0, 1.8 + i * 0.16, 8.5);
         g.add(b);
       }
-      g.add(Object.assign(sprite('grafo lógico intacto', '#e2e8f0', 2.8), { position: new THREE.Vector3(0, 6.2, 8.5) }));
+      g.add(Object.assign(sprite('logical graph intact', '#e2e8f0', 2.8), { position: new THREE.Vector3(0, 6.2, 8.5) }));
 
       controls.target.set(0, 3, 3);
       camera.position.set(16, 11, 14);
       setPanel(
-        `peng-mimo · geometría física\n` +
-        `• Disco: container int4 (experts en shards)\n` +
-        `• RAM: densas + PIN aprendido + LRU (ecap)\n` +
-        `• VRAM: densas + ~522 experts GPU-first\n` +
-        `• Miss: pread → matmul; hit: sin I/O\n` +
+        `peng-mimo · physical geometry\n` +
+        `• Disk: int4 container (experts in shards)\n` +
+        `• RAM: dense + learned PIN + LRU (ecap)\n` +
+        `• VRAM: dense + ~522 GPU-first experts\n` +
+        `• Miss: pread → matmul; hit: no I/O\n` +
         `• SWA KV ring 128 · PREFETCH/PILOT/REPIN\n` +
-        `• Techo frío ~0.5–0.6 tok/s (23GB+3060)`,
+        `• Cold ceiling ~0.5–0.6 tok/s (23GB+3060)`,
         [
-          [COL.disk, 'Experts fríos en NVMe'],
-          [COL.pin, 'RAM pin / densas host'],
-          [COL.lru, 'LRU por capa'],
-          [COL.vram, 'VRAM densas + gpu_pin'],
+          [COL.disk, 'Cold experts on NVMe'],
+          [COL.pin, 'RAM pin / host dense'],
+          [COL.lru, 'Per-layer LRU'],
+          [COL.vram, 'VRAM dense + gpu_pin'],
           [COL.cpu, 'Compute host / CUDA'],
-          [COL.full, 'Capa full (lógica)'],
-          [COL.swa, 'Capa SWA (lógica)'],
+          [COL.full, 'Full layer (logical)'],
+          [COL.swa, 'SWA layer (logical)'],
         ]
       );
     }

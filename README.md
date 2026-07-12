@@ -82,7 +82,7 @@ How to read it:
 3. **GPU VRAM** keeps uploaded densas + complementary **gpu_pin** (~522 hottest experts on a 12 GB card) and runs `moe_acc` for decode.
 4. **Lookup order** per expert id: VRAM → RAM pin → LRU → disk. Prefetch / PILOT / REPIN only change *when* bytes move, not the math.
 
-> **Interactive 3D:** open [`docs/diagrams/mimo-vs-peng-3d.html`](docs/diagrams/mimo-vs-peng-3d.html) in a browser (needs network once for the Three.js CDN). Use the tabs *MiMo lógico* / *peng físico*.
+> **Interactive 3D:** open [`docs/diagrams/mimo-vs-peng-3d.html`](docs/diagrams/mimo-vs-peng-3d.html) in a browser (needs network once for the Three.js CDN). Use the tabs *Logical MiMo* / *Physical peng*.
 
 ## Method (colibri's): token-exact validation first
 
