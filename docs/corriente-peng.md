@@ -127,11 +127,20 @@ FLOW=1 FLOW_R=2 TRAJ=1 SERVE=1 … ./mimo 64 4 8
 | `pathpack_thaw` | WILLNEED ±`FLOW_R` neighbors of live experts |
 | `pathpack_rebuild` | greedy walk from traj edges + usage heat |
 | `FLOW=0` | off |
+| **`ENERGY`** | snow → **pure VRAM compute**: ignite pathpack channel heads on GPU after pin |
+| `ENERGY=0` | off · `-1`/unset with FLOW = auto free VRAM · `ENERGY=2` = 2 GB cap |
+
+After GPU-first heat pin + RAM pin, `pathpack_energy_ignite` walks packing **position 0,1,2…** across all layers and uploads non-resident channel experts until VRAM budget ends. That is weights **liberated as light** (`moe_acc`), not only page-cache thaw.
+
+```
+# stderr
+[ENERGY] liberated N channel experts -> VRAM +X.XX GB in T.Ts (pure compute; FLOW pathpack)
+```
 
 Measured on real SNAP: path order locality ~**4.5×** vs raw expert id order.  
-A future converter can **rewrite shard layout** to match this order (range readahead). Until then, FLOW still warms **logical** neighbors that co-activate even if disks stay id-ordered.
+A future converter can **rewrite shard layout** to match this order (range readahead). Until then, FLOW thaws logical neighbors; ENERGY materializes them on the GPU when free VRAM remains.
 
-**Invariant:** never changes tensor values or logits — only *when* pages are hinted.
+**Invariant:** never changes tensor values or logits — only *where* weights live for compute (host vs VRAM) and *when* pages are hinted.
 
 ### 5.3 Already in the engine (named)
 

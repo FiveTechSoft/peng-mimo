@@ -60,6 +60,7 @@ static long looka_hit=0, looka_tot=0;
 /* Trajectory bulk WILLNEED (TRAJ=): knobs only; impl after Model. */
 static int g_traj=-1, g_traj_k=8, g_traj_depth=2;
 static int g_flow=1, g_flow_r=2;                 /* FLOW pathpack channel thaw (Corriente) */
+static double g_energy_gb=-1;                    /* ENERGY: channel→VRAM (-1 auto, 0 off, >0 GB) */
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
@@ -189,6 +190,7 @@ static void traj_warm(Model *m, int k_per_layer);
 static void pathpack_thaw(Model *m, int layer, int eid, int *left);
 static void pathpack_path_set(const char *snap);
 static void pathpack_rebuild(Model *m);
+static void pathpack_energy_ignite(Model *m);
 static int pathpack_load(void);
 static int pathpack_save(void);
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
@@ -2703,6 +2705,86 @@ static void pathpack_thaw(Model *m, int layer, int eid, int *left){
         }
     }
 }
+/* ENERGY: liberate pathpack-channel snow into pure GPU compute (vram light).
+ * Walk packing order by *position* across layers (heads of every channel first),
+ * load+upload until ENERGY_GB / free VRAM exhausted. Complements GPU-first heat pin.
+ * ENERGY=0 off; unset/-1 = auto (use ~85% of free VRAM after pin); >0 = GB cap. */
+#ifdef COLI_CUDA
+static int expert_on_gpu(Model *m, int l, int eid){
+    if(!m->gpu_pin || !m->gpu_pin[l]) return 0;
+    for(int z=0;z<m->ngpin[l];z++) if(m->gpu_pin[l][z].eid==eid) return 1;
+    return 0;
+}
+static void pathpack_energy_ignite(Model *m){
+    if(!m || g_energy_gb==0 || g_flow<=0 || !g_cuda_enabled) return;
+    if(!m->gpu_pin || g_cuda_ndev<1) return;
+    Cfg *c=&m->c;
+    size_t free_b=0,total_b=0;
+    if(!coli_cuda_mem_info(g_cuda_devices[0],&free_b,&total_b)) return;
+    double headroom=0.35e9;
+    if(getenv("CUDA_HEADROOM_GB")) headroom=atof(getenv("CUDA_HEADROOM_GB"))*1e9;
+    double budget=(double)free_b-headroom;
+    if(budget<0.25e9){
+        fprintf(stderr,"[ENERGY] VRAM nearly full (free %.2f GB) — channel already light / pin owns GPU\n",
+                free_b/1e9);
+        return;
+    }
+    if(g_energy_gb>0 && g_energy_gb*1e9<budget) budget=g_energy_gb*1e9;
+    else if(g_energy_gb<0) budget*=0.85;         /* auto: most remaining free */
+    int max_pos=0;
+    for(int l=0;l<c->n_layers && l<TRAJ_LMAX;l++)
+        if(g_pp_n[l]>max_pos) max_pos=g_pp_n[l];
+    if(max_pos<1){
+        fprintf(stderr,"[ENERGY] no pathpack channels to ignite (run with TRAJ history)\n");
+        return;
+    }
+    double t0=now_s(); int n_new=0; int64_t spent=0;
+    for(int pos=0; pos<max_pos && spent<budget; pos++){
+        for(int l=0;l<c->n_layers && l<TRAJ_LMAX && spent<budget; l++){
+            if(!m->L[l].sparse || pos>=g_pp_n[l]) continue;
+            int eid=g_pp_ord[l][pos]; if(eid<0 || eid>=c->n_experts) continue;
+            if(expert_on_gpu(m,l,eid)) continue;
+            if(expert_resident(m,l,eid)) continue; /* already pin/LRU host — leave; GPU-first owns heat */
+            if(m->ngpin[l]>=4096) continue;
+            m->gpu_pin[l]=realloc(m->gpu_pin[l],(m->ngpin[l]+1)*sizeof(ESlot));
+            ESlot *s=&m->gpu_pin[l][m->ngpin[l]];
+            memset(s,0,sizeof(ESlot));
+            expert_load(m,l,eid,s);
+            int64_t need=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+            if(spent+need>budget){
+                free(s->slab); free(s->fslab); s->slab=NULL; s->fslab=NULL;
+                pos=max_pos; break;              /* budget full */
+            }
+            s->g.cuda_device=s->u.cuda_device=s->d.cuda_device=g_cuda_devices[0];
+            s->g.cuda_eligible=s->u.cuda_eligible=s->d.cuda_eligible=1;
+            if(qt_cuda_upload(&s->g) && qt_cuda_upload(&s->u) && qt_cuda_upload(&s->d)){
+                int64_t actual=(int64_t)coli_cuda_tensor_bytes(s->g.cuda)
+                                 +(int64_t)coli_cuda_tensor_bytes(s->u.cuda)
+                                 +(int64_t)coli_cuda_tensor_bytes(s->d.cuda);
+                m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
+                spent+=actual; n_new++;
+                expert_cpu_free(m,s);
+                s->g.gpu_only=s->u.gpu_only=s->d.gpu_only=1;
+                m->ngpin[l]++;
+            } else {
+                qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
+                free(s->slab); free(s->fslab); s->slab=NULL; s->fslab=NULL;
+                budget=spent;                    /* stop: device full */
+            }
+        }
+    }
+    if(n_new>0){
+        res_bits_rebuild_all(m);
+        fprintf(stderr,"[ENERGY] liberated %d channel experts -> VRAM +%.2f GB in %.1fs "
+                "(pure compute; FLOW pathpack)\n",
+                n_new, spent/1e9, now_s()-t0);
+    } else {
+        fprintf(stderr,"[ENERGY] no free VRAM for channel ignition (budget %.2f GB)\n", budget/1e9);
+    }
+}
+#else
+static void pathpack_energy_ignite(Model *m){ (void)m; }
+#endif
 static void traj_observe_layer(Model *m, int layer, const int *idx, int Ke){
     if(g_traj<=0 || !idx || Ke<1 || layer<0 || layer>=TRAJ_LMAX) return;
     if(Ke>64) Ke=64;
@@ -3579,6 +3661,12 @@ int main(int argc, char **argv){
     if(getenv("FLOW_R")){ g_flow_r=atoi(getenv("FLOW_R")); if(g_flow_r<1)g_flow_r=1; if(g_flow_r>8)g_flow_r=8; }
     if(g_flow>0)
         fprintf(stderr,"[FLOW] pathpack channel thaw on (R=%d; FLOW=0 off)\n", g_flow_r);
+    /* ENERGY: snow→VRAM pure compute along channels. Default auto when FLOW+CUDA. */
+    if(getenv("ENERGY")) g_energy_gb=atof(getenv("ENERGY"));
+    else g_energy_gb = (g_flow>0) ? -1.0 : 0.0;  /* -1 auto remaining VRAM; 0 off; >0 GB */
+    if(g_energy_gb!=0 && g_flow>0)
+        fprintf(stderr,"[ENERGY] channel ignition %s (ENERGY=0 off, ENERGY=n GB cap)\n",
+                g_energy_gb<0?"auto (free VRAM after pin)":"capped");
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.95f;  /* 0.95 = generation_config MiMo-V2.5 */
     g_looka = getenv("LOOKA")?1:0;                    /* PILOT accuracy measurement (no prefetch) */
@@ -3686,6 +3774,8 @@ int main(int argc, char **argv){
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
        * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
       cap_for_ram(&m, ram_env, ebits, est_ctx);
+      /* ENERGY: remaining VRAM → pure compute along pathpack channels (snow→light). */
+      if(g_flow>0 && g_energy_gb!=0) pathpack_energy_ignite(&m);
       /* After pin+cap: async WILLNEED from usage heat + loaded TRAJ while we still have
        * wall-clock before first prefill (SERVE READY / PROMPT encode). Free if cold. */
       if(g_traj>0){

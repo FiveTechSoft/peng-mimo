@@ -630,6 +630,18 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 35. ENERGY — channel snow → pure VRAM (2026-07-12)
+
+**Metaphor made real:** free weight potential into GPU compute.
+
+- After pin_load + pathpack: `pathpack_energy_ignite` walks packing **position** (heads of every layer channel first).
+- Loads non-resident experts, `qt_cuda_upload`, `expert_cpu_free` → `gpu_only` (same as GPU-first tier).
+- Budget: `ENERGY=-1` auto ≈ 85% free VRAM after pin (default with FLOW); `ENERGY=0` off; `ENERGY=n` GB cap.
+- Complements heat-based GPU-first (usage) with **channel-continuity** ignition (traj bed).
+- Log: `[ENERGY] liberated N channel experts -> VRAM +X GB …`
+
+Does not change tokens — only residency. Soft ceiling still disk/attn when VRAM already full from pin.
+
 ### 34. FLOW pathpack channel thaw (2026-07-12) — Corriente in the engine
 
 **Transcendence step:** stop WILLNEED by random expert id; thaw **along the habit channel**.
