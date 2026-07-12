@@ -639,14 +639,22 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 - `traj_observe_layer` while routing: Markov edges `tok[L][e→e']` and `lay[L][e→e'@L+1]`.
 - After each decode step: `traj_commit_prev` + `traj_warm` (sticky + heat + Markov unroll `TRAJ_DEPTH`).
 - Turn start: `heat_prefetch_top` also calls `traj_warm`.
+- **Persist:** `SNAP/.coli_traj` or `.coli_traj.<COLI_PROFILE>` (atomic write with `usage_save` each SERVE turn; load at boot).
 - Knobs: `TRAJ=0` off, `TRAJ_K=8`, `TRAJ_DEPTH=2`. `chat_peng` enables TRAJ by default.
 
 ```bash
-TRAJ=1 TRAJ_K=8 SERVE=1 … ./mimo 64 4 8
-# stderr: [TRAJ] bulk expert path WILLNEED on (K=8 depth=2; TRAJ=0 off)
+TRAJ=1 TRAJ_K=8 COLI_PROFILE=chat SERVE=1 … ./mimo 64 4 8
+# stderr: [TRAJ] bulk … on
+#         [TRAJ] loaded N edges from …/.coli_traj.chat   (2nd session)
+#         [TRAJ] saved N edges -> … (willneed_calls=…)
 ```
 
-**Expected win:** multi-turn / chat (learned routes) — higher hit, less expert-disk. Cold single-shot PROMPT gains little until heat accumulates.
+**Expected win:** multi-turn / chat across restarts — higher hit, less expert-disk. Cold single-shot PROMPT gains little until heat accumulates.
+
+**Smoke (2026-07-12, SNAP=/root/mimo25_i4, COLI_PROFILE=smoketest, TRAJ=1, NGEN=3 then NGEN=1):**
+
+- Session 1: planted 4 edges → `[TRAJ] loaded 4` → gen → `[TRAJ] saved 13532` (~215 KB).
+- Session 2: `[TRAJ] loaded 13532` → gen → `[TRAJ] saved 14004`. Atomic rename + profile path OK.
 
 ### 30. COLI_PROFILE + mem_watch polish (colibri #71 remainder, 2026-07-12)
 

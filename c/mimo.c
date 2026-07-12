@@ -2368,6 +2368,8 @@ static TrajEdge g_traj_lay[TRAJ_LMAX][TRAJ_EMAX][TRAJ_SUC];
 static int g_traj_prev[TRAJ_LMAX][64], g_traj_prev_n[TRAJ_LMAX];
 static int g_traj_have_prev=0;
 static long g_traj_warm_n=0;
+/* Profile name shared with usage_path_set / mem_watch (must precede traj_path_set). */
+static char g_profile[72];
 static void traj_bump(TrajEdge suc[TRAJ_SUC], int e2){
     if(e2<0 || e2>=TRAJ_EMAX) return;
     int slot=-1, empty=-1;
@@ -2381,6 +2383,70 @@ static void traj_bump(TrajEdge suc[TRAJ_SUC], int e2){
         suc[w].e=(int16_t)e2; suc[w].c=1; return;
     }
     if(suc[slot].c<UINT32_MAX) suc[slot].c++;
+}
+/* Insert/replace edge with absolute count (for disk load). */
+static void traj_set_edge(TrajEdge suc[TRAJ_SUC], int e2, uint32_t cnt){
+    if(e2<0 || e2>=TRAJ_EMAX || cnt==0) return;
+    int slot=-1, empty=-1, weak=0;
+    for(int i=0;i<TRAJ_SUC;i++){
+        if(suc[i].e==e2){ slot=i; break; }
+        if(suc[i].c==0 && empty<0) empty=i;
+        if(suc[i].c<suc[weak].c) weak=i;
+    }
+    if(slot>=0){ if(cnt>suc[slot].c) suc[slot].c=cnt; return; }
+    int dst = empty>=0 ? empty : weak;
+    if(empty<0 && cnt<=suc[weak].c) return; /* table full of stronger edges */
+    suc[dst].e=(int16_t)e2; suc[dst].c=cnt;
+}
+static char g_traj_path[2100]="";
+static void traj_path_set(const char *snap){
+    if(!snap||!*snap){ g_traj_path[0]=0; return; }
+    if(g_profile[0])
+        snprintf(g_traj_path,sizeof(g_traj_path),"%s/.coli_traj.%s",snap,g_profile);
+    else
+        snprintf(g_traj_path,sizeof(g_traj_path),"%s/.coli_traj",snap);
+}
+static int traj_save(void){
+    if(g_traj<=0 || !g_traj_path[0]) return 0;
+    char tmp[2200]; snprintf(tmp,sizeof(tmp),"%s.tmp",g_traj_path);
+    FILE *f=fopen(tmp,"w"); if(!f) return 0;
+    fprintf(f,"# coli_traj v1\n");
+    int edges=0;
+    for(int l=0;l<TRAJ_LMAX;l++)
+        for(int e=0;e<TRAJ_EMAX;e++)
+            for(int s=0;s<TRAJ_SUC;s++){
+                if(g_traj_tok[l][e][s].c){
+                    fprintf(f,"tok %d %d %d %u\n",l,e,(int)g_traj_tok[l][e][s].e,
+                            g_traj_tok[l][e][s].c);
+                    edges++;
+                }
+                if(g_traj_lay[l][e][s].c){
+                    fprintf(f,"lay %d %d %d %u\n",l,e,(int)g_traj_lay[l][e][s].e,
+                            g_traj_lay[l][e][s].c);
+                    edges++;
+                }
+            }
+    fclose(f);
+    if(rename(tmp,g_traj_path)!=0){ remove(tmp); return 0; }
+    if(edges>0)
+        fprintf(stderr,"[TRAJ] saved %d edges -> %s (willneed_calls=%ld)\n",
+                edges,g_traj_path,g_traj_warm_n);
+    return edges;
+}
+static int traj_load(void){
+    if(g_traj<=0 || !g_traj_path[0]) return 0;
+    FILE *f=fopen(g_traj_path,"r"); if(!f) return 0;
+    char line[256], kind[8]; int L,e0,e1; unsigned cnt; int n=0;
+    while(fgets(line,sizeof(line),f)){
+        if(line[0]=='#' || line[0]=='\n' || line[0]=='\r') continue;
+        if(sscanf(line,"%7s %d %d %d %u",kind,&L,&e0,&e1,&cnt)!=5) continue;
+        if(L<0||L>=TRAJ_LMAX||e0<0||e0>=TRAJ_EMAX||e1<0||e1>=TRAJ_EMAX||!cnt) continue;
+        if(kind[0]=='t' && kind[1]=='o'){ traj_set_edge(g_traj_tok[L][e0],e1,cnt); n++; }
+        else if(kind[0]=='l' && kind[1]=='a'){ traj_set_edge(g_traj_lay[L][e0],e1,cnt); n++; }
+    }
+    fclose(f);
+    if(n>0) fprintf(stderr,"[TRAJ] loaded %d edges from %s\n",n,g_traj_path);
+    return n;
 }
 static void traj_observe_layer(Model *m, int layer, const int *idx, int Ke){
     if(g_traj<=0 || !idx || Ke<1 || layer<0 || layer>=TRAJ_LMAX) return;
@@ -2530,7 +2596,6 @@ static void heat_prefetch_top(Model *m, int k_per_layer){
  * grow when free RAM returns. Dead band 3.5–6 GB free avoids thrashing.
  * MEMWATCH=0 disables. */
 static int g_memwatch=1;
-static char g_profile[72];   /* COLI_PROFILE / PENG_PROFILE; filled by usage_path_set */
 static double mem_available_gb(void);
 static int64_t expert_bytes_probe(Model *m, int ebits);
 static void eslot_release(ESlot *s){          /* free host backing of one LRU slot */
@@ -2842,6 +2907,7 @@ static void usage_path_set(const char *snap){
         snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage.%s",snap,g_profile);
     else
         snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
+    traj_path_set(snap);   /* same profile → .coli_traj[.name] */
 }
 static int64_t usage_load(Model *m, const char *path){
     FILE *f=fopen(path,"r"); if(!f) return 0;
@@ -2850,7 +2916,10 @@ static int64_t usage_load(Model *m, const char *path){
         if(l>=0&&l<c->n_layers&&e>=0&&e<c->n_experts&&m->eusage[l]){ m->eusage[l][e]+=cnt; tot+=cnt; }
     fclose(f); return tot;
 }
-static void usage_save(Model *m){ if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1); }
+static void usage_save(Model *m){
+    if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1);
+    traj_save();   /* persist Markov edges with the same cadence as usage */
+}
 
 /* HOT-STORE ("il redis del colibri'"): carica in RAM, UNA VOLTA e per sempre, i top expert
  * per frequenza d'uso misurata (file STATS di un run precedente), entro un budget in GB.
@@ -3271,6 +3340,7 @@ int main(int argc, char **argv){
           fprintf(stderr,"[PROFILE] COLI_PROFILE=%s -> %s\n", g_profile, g_usage_path);
       int64_t hist = usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] storia expert: %lld selezioni (%s)\n",(long long)hist,g_usage_path);
+      if(g_traj>0) traj_load();   /* warm Markov from previous sessions */
       int autopin = getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
       if(!getenv("PIN") && autopin && hist>=5000){
           /* quota pin ∝ confidence; at full history use 85% of expert budget (colibri #71;
