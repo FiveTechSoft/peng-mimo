@@ -54,7 +54,7 @@ Two static SVGs render on GitHub; open the HTML for an interactive Three.js orbi
 | View | What it shows | File |
 |---|---|---|
 | **MiMo logical** | Layer stack full/SWA, MoE top-8/256, dims, full vs window context | [`docs/diagrams/mimo-geometry.svg`](docs/diagrams/mimo-geometry.svg) |
-| **peng physical** | NVMe → RAM pin/LRU/KV → VRAM densas+gpu_pin, decode pipeline | [`docs/diagrams/peng-mimo-geometry.svg`](docs/diagrams/peng-mimo-geometry.svg) |
+| **peng physical** | NVMe → RAM pin/LRU/KV → VRAM dense+gpu_pin, decode pipeline | [`docs/diagrams/peng-mimo-geometry.svg`](docs/diagrams/peng-mimo-geometry.svg) |
 | **3D interactive** | Toggle MiMo stack ↔ peng memory map (drag / zoom) | [`docs/diagrams/mimo-vs-peng-3d.html`](docs/diagrams/mimo-vs-peng-3d.html) |
 
 #### 1) MiMo-V2.5 — logical geometry
@@ -78,8 +78,8 @@ How to read it:
 How to read it:
 
 1. **NVMe** holds the int4 container (~12 032 experts × ~12.6 MB). Cold miss ≈ multi‑GB of `pread` per token.
-2. **Host RAM** keeps densas (or residual host), **learned PIN**, **per-layer LRU**, and KV (SWA as a **ring of 128**).
-3. **GPU VRAM** keeps uploaded densas + complementary **gpu_pin** (~522 hottest experts on a 12 GB card) and runs `moe_acc` for decode.
+2. **Host RAM** keeps dense tensors (or residual host), **learned PIN**, **per-layer LRU**, and KV (SWA as a **ring of 128**).
+3. **GPU VRAM** keeps uploaded dense tensors + complementary **gpu_pin** (~522 hottest experts on a 12 GB card) and runs `moe_acc` for decode.
 4. **Lookup order** per expert id: VRAM → RAM pin → LRU → disk. Prefetch / PILOT / REPIN only change *when* bytes move, not the math.
 
 > **Interactive 3D:** open [`docs/diagrams/mimo-vs-peng-3d.html`](docs/diagrams/mimo-vs-peng-3d.html) in a browser (needs network once for the Three.js CDN). Use the tabs *Logical MiMo* / *Physical peng*.
