@@ -632,15 +632,55 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 ### 38. Physical pathpack (disk-order channels) + merged fadvise (2026-07-12)
 
-**Intent:** pathpack neighbors = nearby on NVMe, not random expert ids.
+**Context:** After §37 (best **0.60 tok/s**), next levers named were *physical pathpack*, *attention*, and the **1.0 tok/s** gate. This entry is the attempt at **runtime physical pathpack** (no full 152 GB shard rewrite).
 
-- `pathpack_rebuild`: sort habit experts by `(fd, off)` of `gate_proj` (**PHYSICAL**).
-- `st_prefetch_phys` / `expert_prefetch_list`: sort tensors, **merge ranges** within 2 MB, one `posix_fadvise` per span.
-- Miss path: bulk physical WILLNEED before `ov_submit` loaders.
-- `TRAJ_WARM_EVERY=3` under `TAO=1` (less AUX).
+#### Logical vs physical pathpack
 
-**Smoke (TEMP=0 NGEN=24 TAO, pin+GPU-first):** **0.50 tok/s** (disk 13.8 s, attn 10.2 s, matmul 5.0 s, other 16 s, traj_warm 0.5 s).  
-Did **not** beat §37 best **0.60**; keep physical packing for sequential I/O correctness, do not claim a new record. Full container **rewrite** still future work.
+| | Logical (§34) | Physical runtime (§38) | Full shard repack (future) |
+|--|---------------|------------------------|----------------------------|
+| Order | habit / Markov walk | **disk order** `(fd, off)` of habit experts | rewrite safetensors layout |
+| Prefetch | per-expert `fadvise` | **merged ranges** on same fd | sequential `pread` natural |
+| Tokens | bit-exact | bit-exact | bit-exact if values unchanged |
+| Cost | low | low–medium | high (hours + disk) |
+
+#### Code
+
+- **`expert_disk_key(m, layer, eid)`** — key from `gate_proj.weight` via `st_find` → `(fd << 48) | (off >> 8)`.
+- **`pathpack_rebuild`** — among experts with usage heat and/or TRAJ edges, **sort by disk key**; write `g_pp_ord` / `g_pp_pos`. Log: `[FLOW] pathpack rebuilt PHYSICAL …`.
+- **Boot:** always rebuild physical after usage/traj load, then `pathpack_save` → `SNAP/.coli_pathpack`.
+- **`st_prefetch_phys`** (`st.h`) — sort tensor list by `(fd, off)`, merge spans if same fd and gap ≤ **2 MB**, one `posix_fadvise(WILLNEED)` per merged span.
+- **`expert_prefetch` / `expert_prefetch_list`** — collect gate/up/down + `.qs`, then `st_prefetch_phys`.
+- **`pathpack_thaw`** — collect ±`FLOW_R` neighbors, one bulk list prefetch (not N separate storms).
+- **`ov_submit`** — before loaders run, physical WILLNEED of the miss set (still fills `ws[s]` in original miss-slot order for correct `ov_wait`).
+- **`TRAJ_WARM_EVERY=3`** default under `TAO=1` (was 2) to cut AUX further.
+
+#### Smoke (same box: WSL2, ~23 GB RAM, RTX 3060 12 GB, SNAP `/root/mimo25_i4` ext4)
+
+Protocol: `TAO=1 SPEED=1 PILOT=0 TEMP=0 COLI_CUDA=1 CUDA_DENSE=1 DIRECT=1 NGEN=24`  
+prompt ≈ `Write one short sentence about Rome.` · pin + GPU-first warm.
+
+| | §37 best (throttle) | §38 physical pathpack |
+|--|---------------------|------------------------|
+| **tok/s** | **0.60** (project best) | **0.50** |
+| hit-rate | ~54% | ~58% |
+| expert-disk | ~14.4 s | ~13.8 s |
+| attention | ~9.1 s | ~10.2 s |
+| expert-matmul | ~4.6 s | ~5.0 s |
+| other | ~5.9 s | ~16.0 s |
+| traj_warm (AUX) | ~3.8 s | ~0.5 s |
+
+**Verdict:** physical packing is **correct engineering** (neighbors ≈ nearby on media; merged WILLNEED). It did **not** set a new throughput record. **Do not claim 0.50 > 0.60.** Project best remains **0.60 tok/s** (§37 / README).
+
+**Why not faster here:** habit experts are still sparse in the shard; merging helps only when tensors are already near. Cold half of MoE work remains disk-bound. Extra bulk prefetch can add syscall/`other` noise. Full **container repack** (rewrite tensors in pathpack order) is still the real sequential layout win.
+
+#### Still needed for 1.0 on this box
+
+1. More host RAM (hit 50% → 80%+).  
+2. Optional offline **safetensor repack** by physical pathpack order.  
+3. Faster attention path (PROFILE attn ~9–10 s).  
+4. Native Linux (drop WSL I/O tax, §18).
+
+**Invariant:** I/O residency and fadvise order only — **no change to logits/tokens**.
 
 ### 37. PROFILE-AUX + throttle traj_warm/pathpack (2026-07-12)
 
