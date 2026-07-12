@@ -56,6 +56,20 @@ Two static SVGs render on GitHub; open the HTML for an interactive Three.js orbi
 | **MiMo logical** | Layer stack full/SWA, MoE top-8/256, dims, full vs window context | [`docs/diagrams/mimo-geometry.svg`](docs/diagrams/mimo-geometry.svg) |
 | **peng physical** | NVMe → RAM pin/LRU/KV → VRAM dense+gpu_pin, decode pipeline | [`docs/diagrams/peng-mimo-geometry.svg`](docs/diagrams/peng-mimo-geometry.svg) |
 | **3D interactive** | Toggle MiMo stack ↔ peng memory map (drag / zoom) | [`docs/diagrams/mimo-vs-peng-3d.html`](docs/diagrams/mimo-vs-peng-3d.html) |
+| **Corriente Peng** | Residual as river · MoE as vortices · NVMe as snow · mouth = lm_head | [`docs/diagrams/corriente-peng.svg`](docs/diagrams/corriente-peng.svg) · [manifesto](docs/corriente-peng.md) |
+
+#### 0) Corriente Peng — beyond the net (conception)
+
+<p align="center">
+  <img src="docs/diagrams/corriente-peng.svg" alt="Corriente Peng: residual river, full/SWA viscosities, MoE vortices, NVMe snow, estuary mouth" width="100%" />
+</p>
+
+MiMo is **one residual thread**; layers and experts are masks. Weights **resist and conduct** (snow → thaw → hold → shear → mouth). Habit (`.coli_traj` / `.coli_usage`) digs channels. See [`docs/corriente-peng.md`](docs/corriente-peng.md). Seed tool (I/O layout only, bit-exact values):
+
+```bash
+python3 c/scripts/path_pack_analyze.py --snap ~/mimo25_i4 --out /tmp/path_pack_order.json
+# mean_locality_ratio > 1 ⇒ co-activated experts pack tighter than id order
+```
 
 #### 1) MiMo-V2.5 — logical geometry
 
