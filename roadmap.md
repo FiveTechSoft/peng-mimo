@@ -1,81 +1,118 @@
-# roadmap — GPU (CUDA) acceleration plan
+# roadmap — GPU + Corriente speed plan
 
-Findings and experiments for GPU offload on the reference box (RTX 3060,
-12 GB VRAM + ~23 GB RAM, disk ~2.75 GB/s). Complements `findings.md` §19–§24.
-The engine runs with GPU (`COLI_CUDA=1 CUDA_DENSE=1`); the speed dial is expert
-hit-rate + bytes read from disk (not dense FLOPs).
+Findings and experiments on the reference box (RTX 3060 12 GB VRAM + ~23 GB
+RAM WSL2, disk ~2.75 GB/s). Complements `findings.md`. The engine runs with
+GPU (`COLI_CUDA=1 CUDA_DENSE=1`); the speed dial is **expert hit-rate**,
+**honest PROFILE**, and **not paying I/O tax in “other”**.
 
-## Current status (done + measured)
+## Current status (2026-07-12)
 
-- **CUDA toolkit** on WSL; build `make mimo CUDA=1 CUDA_ARCH=sm_86`. Gotcha:
-  `touch mimo.c backend_cuda.cu` before `make` when editing from Windows.
-- **Makefile**: `mimo` links `$(CUDA_OBJ)`; `-g -rdynamic` for Linux SEGV
-  backtraces.
-- **Eager dense upload** + free host; complementary VRAM expert tier (auto GB).
-- **Speed pack (§24):** fused SwiGLU, fast int4/int8 GEMV, sticky device-x,
-  attention AVX2, SERVE speed defaults, `chat_peng.py --bench/--fast`.
-- **cuda-test**: q8/q4/q2/f32 + fused SwiGLU ok on sm_86.
+### Best measured (full MiMo int4, pin + GPU-first)
 
-### Measured on full MiMo — `findings` §23–§24
+| run | setup | hit | disk | attn | matmul | other | tok/s |
+|---|---|---|---|---|---|---|---|
+| §25 PROMPT | GPU-first + moe_acc | ~60% | 8.9 s | — | ~16 s | — | **0.55** |
+| §32 SPEED | byte-strided GEMV + pin | ~60% | 10.6 s | 11 s | **4.9 s** | 20 s | **0.51** |
+| §37 TAO + throttle | TRAJ_WARM_EVERY=2, PATHPACK_EVERY=8 | 54% | 14.4 s | 9.1 s | 4.6 s | **5.9 s** | **0.60** |
 
-| run | setup | hit | expert-disk | tok/s | notes |
-|---|---|---|---|---|---|
-| §23 P0 PROMPT | eager free + complementary | 46.3% | 12.4 s / 24 tok | **0.50** | baseline |
-| §24 PROMPT | fuse/GEMV/AVX2 | 50.5% | 11.2 s | 0.43 | intermediate |
-| **§25 PROMPT** | **GPU-first + moe_acc + cap11** | **60%** | **8.9 s** | **0.55** | best so far |
-| §24 SERVE bench | `--bench --fast` (prefill in STAT) | ~43% | — | 0.21 med | not comparable |
+**Gate 1.0 tok/s: still FAIL.** Soft ceiling on this box **~0.55–0.65** tok/s.
+Latest win was cutting hidden **other** (pathpack rebuild + traj_warm every
+token), not inventing FLOPs.
 
-Target **1.0 tok/s**: FAIL. Best **0.55** PROMPT on 23 GB + RTX 3060 + WSL2.
+### Stack landed (keep)
 
-Bench helpers:
+- CUDA dense eager + **GPU-first** expert tier + `moe_acc` single-stream
+- Byte-strided int4 GEMV / fused gate+up
+- TRAJ Markov WILLNEED + **persist** `.coli_traj` + boot warm
+- **FLOW** pathpack channel thaw (`.coli_pathpack`)
+- **ENERGY** channel→VRAM when free VRAM remains
+- Expert **bitmaps** (`res_bits` / `pref_bits`)
+- **PROFILE-AUX:** `traj_warm | pathpack | persist`
+- **TAO=1** wu wei + φ/Fibonacci knobs; `scripts/start_peng.sh`
+- Docs: `corriente-peng.md`, `tao.md`, `sacred-geometry.md` + SVGs
 
-- `c/scripts/run_chat_bench.sh` — PROMPT + PROFILE
-- `c/scripts/run_speed_bench.sh` — `chat_peng.py --bench --fast`
-- `python3 c/chat_peng.py --bench --fast`
+### Bench helpers
+
+```bash
+# one-shot PROMPT + PROFILE
+TAO=1 SPEED=1 PILOT=0 SNAP=~/mimo25_i4 \
+  PROMPT='…' NGEN=24 COLI_CUDA=1 CUDA_DENSE=1 DIRECT=1 \
+  ./c/mimo 64 4 8
+
+# chat / auto env
+TAO=1 c/scripts/start_peng.sh chat
+c/scripts/run_speed_bench.sh
+python3 c/chat_peng.py --bench --fast
+```
+
+Watch: `tok/s`, `PROFILE`, **`PROFILE-AUX`**, hit-rate, RSS, GPU expert count.
 
 ## Remaining problem
 
-Hit ~50% still leaves half the expert work cold. Matmul wall ~16.5 s flat after
-fuse (structure ready; throughput not yet above §23). Attention improved
-(~15→13 s). Disk ~11 s. Path to 1.0 needs **higher hit** and/or **much faster**
-GPU expert path and/or more RAM / native Linux.
+Even at **0.60 tok/s**:
 
-WSL2 still burns host CPU on I/O (`findings` §18).
+1. **expert-disk ~14 s / 24 tok** — hit ~54% still cold half the time.
+2. **attention ~9 s** — next compute pole after matmul was fixed (~5 s).
+3. **traj_warm ~3.8 s** (AUX) — still non-trivial; try `TRAJ_WARM_EVERY=3` or off on single-shot.
+4. **WSL2 I/O CPU tax** (`findings` §18) — native Linux still on the path to 1.0.
 
-## Next experiments (priority order)
+## Next experiments (priority)
 
-### 1. Re-measure P0 — DONE ✅
-See §23.
+### A. Fit more experts (hit-rate) — main lever for 1.0
 
-### 2. Fuse + fast GEMV + moe_acc + GPU-first — DONE ✅ (§24–§25)
-PROMPT **0.55 tok/s**, hit 60%. Keep as default.
-- [ ] Restore honest `cuda-copy` timer under async streams.
-- [ ] Tensor-core / better tiled int4 GEMV (matmul still ~17 s).
+- [ ] Host **32–64 GB RAM** (architecture-level win)
+- [ ] **Physical pathpack repack** of shards (sequential readahead; bit-exact values)
+- [ ] int2 experts (`ebits=2`) + quality gate
+- [ ] Native Linux vs WSL2 I/O
+- [x] SWA ring KV, REPIN→VRAM, autopin 85%, bitmaps, FLOW/ENERGY
 
-### 3. Fit more experts (hit-rate) — NEXT for 1.0
-- Host **32–64 GB RAM** (biggest lever on this architecture).
-- `ebits=2` / int2 experts (half the bytes; validate quality).
-- REPIN over `gpu_pin` live ranking.
-- Parallel load of the VRAM tier.
-- SWA ring KV (~1.5 GB host back to expert cap).
-- Native Linux vs WSL2 I/O tax.
+### B. Attention / residual compute
 
-### 4. Residual correctness
-- Finding **#18**: post-MTP/v2 ~31/32 TF / 18/20 greedy on tiny int8.
-- Identity gate DRAFT=0 vs n on GPU runs.
+- [ ] Confirm all full/SWA attn on CUDA densas (no silent CPU)
+- [ ] Tensor-core / better tiled int4 GEMV if matmul rises again
+- [ ] Restore honest `cuda-copy` under async streams
 
-### 5. Product / tooling
-- [x] `chat_peng.py`: CUDA/PILOT/REPIN defaults, `--bench`, STAT protocol fix.
-- [x] `c/scripts/run_speed_bench.sh`.
-- [ ] Document QUALITY vs FAST in README briefly.
+### C. AUX / habit I/O (done enough for now)
 
-### 6. Note on `ds4` (antirez/DwarfStar)
-Confirms VRAM → RAM → NVMe hierarchy; not portable code for MiMo.
+- [x] PROFILE-AUX timers
+- [x] `TRAJ_WARM_EVERY` default 2 on SERVE/SPEED/TAO
+- [x] `PATHPACK_EVERY` default 8 on SPEED/TAO
+- [ ] Optional: skip traj_warm entirely for `PROMPT` single-shot (`TRAJ=0`)
 
-## Metrics to watch (always in `PROFILE` / header)
+### D. Product / docs
 
-- `tok/s` and **`expert-disk`** (PROMPT + PROFILE for kernel work).
-- SERVE STAT tok/s = decode / **(prefill+decode)** — do not mix with PROMPT.
-- **expert hit-rate**; complementary VRAM N vs RAM-pin M (**disjoint**).
-- **RSS** after eager dense; LRU `cap` per layer.
-- Gate: mediana ≥ 1.0 on a defined protocol (not yet met).
+- [x] `start_peng.sh`, `TAO=1`, Corriente / sacred geometry docs
+- [x] MiMo chat template, cancel/health API (earlier F-xx)
+- [ ] QUALITY vs FAST one-pager in README (brief)
+
+### E. Correctness gates (do not regress)
+
+- Tiny / fixture oracle TF + greedy
+- Identity DRAFT=0 vs n when MTP used
+- Convert atomic + revision
+
+## Explicit non-goals (measured dead ends)
+
+- Multi-stream GPU experts + atomic acc (slower on 3060)
+- Uncapped TRAJ_K / fadvise storm
+- `DRAFT=2` on cold disk
+- Forcing ENERGY when VRAM already full after GPU-first pin
+
+## Metrics protocol
+
+| Mode | What tok/s means |
+|---|---|
+| `PROMPT` + PROFILE | prefill+decode wall for NGEN (use for kernel/disk) |
+| SERVE STAT | often decode-focused; **do not mix** with PROMPT |
+| Hit-rate | `(hits)/(hits+miss)` experts |
+| Gate | mediana ≥ **1.0 tok/s** on a fixed protocol — **not met** |
+
+## Related docs
+
+| Doc | Role |
+|-----|------|
+| `findings.md` §25–§37 | measurements & change log |
+| `docs/corriente-peng.md` | residual-as-river design |
+| `docs/tao.md` | wu wei knobs |
+| `docs/sacred-geometry.md` | φ / Fibonacci mapping |
+| `docs/diagrams/*` | logical / physical / corriente / sacred SVGs |
