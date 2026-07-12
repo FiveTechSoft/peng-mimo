@@ -6,7 +6,8 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from openai_server import (APIError, APIServer, ClientCancelled, END, GenerationScheduler,
-                           generation_options, read_engine_turn, render_chat)
+                           generation_options, read_engine_turn, render_chat, render_chat_mimo,
+                           render_chat_glm, DEFAULT_MIMO_SYSTEM)
 
 
 class FakeEngine:
@@ -33,8 +34,8 @@ class BlockingEngine(FakeEngine):
 
 
 class TemplateTest(unittest.TestCase):
-    def test_renders_text_subset_of_official_template(self):
-        prompt = render_chat([
+    def test_renders_glm_legacy_template(self):
+        prompt = render_chat_glm([
             {"role": "system", "content": "System"},
             {"role": "developer", "content": "Developer"},
             {"role": "user", "content": [{"type": "text", "text": "Hi"}]},
@@ -48,15 +49,40 @@ class TemplateTest(unittest.TestCase):
             "<|assistant|><think></think>",
         )
 
+    def test_render_chat_default_is_mimo(self):
+        prompt = render_chat([{"role": "user", "content": "Hi"}], arch="mimo")
+        self.assertIn("<|im_start|>user\nHi<|im_end|>", prompt)
+        self.assertIn(DEFAULT_MIMO_SYSTEM, prompt)
+        self.assertTrue(prompt.endswith("<|im_start|>assistant\n<think></think>"))
+        self.assertNotIn("[gMASK]", prompt)
+
+    def test_renders_mimo_multiturn_and_thinking(self):
+        prompt = render_chat_mimo([
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "<think></think>A1"},
+            {"role": "user", "content": "Q2"},
+        ], enable_thinking=False)
+        self.assertEqual(
+            prompt,
+            f"<|im_start|>system\n{DEFAULT_MIMO_SYSTEM}<|im_end|>"
+            "<|im_start|>user\nQ1<|im_end|>"
+            "<|im_start|>assistant\n<think></think>A1<|im_end|>"
+            "<|im_start|>user\nQ2<|im_end|>"
+            "<|im_start|>assistant\n<think></think>",
+        )
+        open_think = render_chat_mimo([{"role": "user", "content": "Hi"}], enable_thinking=True)
+        self.assertTrue(open_think.endswith("<|im_start|>assistant\n"))
+        self.assertNotIn("<think></think>", open_think[open_think.rfind("assistant"):])
+
     def test_rejects_non_text_content(self):
         with self.assertRaisesRegex(APIError, "text message content only"):
             render_chat([{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": "x"}}
-            ]}])
+            ]}], arch="mimo")
 
-    def test_renders_thinking_prefix(self):
+    def test_renders_thinking_prefix_glm(self):
         self.assertEqual(
-            render_chat([{"role": "user", "content": "Hi"}], True, "high"),
+            render_chat([{"role": "user", "content": "Hi"}], True, "high", arch="glm"),
             "[gMASK]<sop><|system|>Reasoning Effort: High<|user|>Hi<|assistant|><think>",
         )
 
@@ -215,7 +241,10 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(body["choices"][0]["message"]["content"], "Héllo")
         self.assertEqual(body["usage"], {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9})
         self.assertIsNotNone(queue_wait)
-        self.assertIn("<|user|>Hi<|assistant|><think></think>", self.engine.calls[-1][0])
+        # Default arch is MiMo ChatML (not GLM [gMASK])
+        self.assertIn("<|im_start|>user\nHi<|im_end|>", self.engine.calls[-1][0])
+        self.assertIn("<|im_start|>assistant\n<think></think>", self.engine.calls[-1][0])
+        self.assertNotIn("[gMASK]", self.engine.calls[-1][0])
 
     def test_streaming_chat_completion(self):
         with self.request("/v1/chat/completions", {

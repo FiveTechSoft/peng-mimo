@@ -47,7 +47,7 @@ LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
 endif
 
-all: glm
+all: mimo
 
 glm: glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm $(LDFLAGS)
@@ -67,9 +67,9 @@ cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 olmoe: olmoe.c st.h json.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe $(LDFLAGS)
 
-# binario portabile da distribuire su altre macchine x86-64
+# binario portabile da distribuire su altre macchine x86-64 (peng: mimo)
 portable:
-	$(MAKE) glm ARCH=x86-64-v3
+	$(MAKE) mimo ARCH=x86-64-v3
 
 tests/test_json: tests/test_json.c json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -86,9 +86,13 @@ test-c: $(TEST_BINS)
 test-python:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
+# Dependency-light: build mimo + C tests + API template tests (no torch).
+check-core: mimo test-c
+	$(PYTHON) -m unittest tests.test_openai_server tests.test_template_overflow -v
+
 test: test-c test-python
 
-# Local validation: one portable CPU build and dependency-free tests.
+# Local validation: portable mimo + full test suite (needs Python deps for some tests).
 check:
 	$(MAKE) clean
 	$(MAKE) portable
@@ -98,4 +102,4 @@ clean:
 	rm -f olmoe glm mimo backend_cuda.o backend_cuda_test $(TEST_BINS)
 	rm -rf tests/__pycache__
 
-.PHONY: all cuda-test portable test-c test-python test check clean
+.PHONY: all cuda-test portable test-c test-python test check check-core clean

@@ -20,6 +20,8 @@ A MoE activates few parameters per token. In MiMo-V2.5: of 311B total only ~15B 
 
 Cost per cold token: 47 × 8 × 12.6 MB ≈ **4.7 GB of reads** → on the NVMe of the dev machine (2.75 GB/s measured on random 19 MB reads) the physical ceiling is **~0.6 tok/s**, improving with warm cache. It's not fast: it's a 311B model responding on a desktop machine.
 
+**SSD wear:** those numbers are almost entirely **reads**. Consumer NVMe endurance is rated in **terabytes written (TBW)**; heavy read streams do not consume TBW the way writes do. Sustained generation can heat the drive and throttle; keep the model on a local ext4/NVMe path (not `/mnt/c` VHDX) and expect multi‑TB *read* in long benches without meaningful write wear. Logs / `.coli_usage` writes are negligible.
+
 ## Why MiMo-V2.5
 
 Chosen after comparing candidates (GLM-5.2 744B, Hunyuan Hy3 295B, Qwen3.5-122B):

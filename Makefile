@@ -1,4 +1,4 @@
-.PHONY: all glm portable test check cuda-test clean
+.PHONY: all glm mimo portable test check check-core cuda-test clean
 
-all glm portable test check cuda-test clean:
+all glm mimo portable test check check-core cuda-test clean:
 	$(MAKE) -C c $@

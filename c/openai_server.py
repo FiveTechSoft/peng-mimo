@@ -151,8 +151,20 @@ def content_text(content, param):
     return "".join(parts)
 
 
-def render_chat(messages, enable_thinking=False, reasoning_effort=None):
-    """Render the text-only subset of the official GLM-5.2 chat template."""
+DEFAULT_MIMO_SYSTEM = "You are MiMo, a helpful AI assistant engineered by Xiaomi."
+
+
+def chat_arch(explicit=None):
+    """peng default: mimo. GLM template kept for legacy/colibri clients (PENG_ARCH=glm)."""
+    if explicit:
+        return explicit
+    return (os.environ.get("PENG_ARCH")
+            or os.environ.get("COLI_ARCH")
+            or "mimo").strip().lower()
+
+
+def render_chat_glm(messages, enable_thinking=False, reasoning_effort=None):
+    """Text-only subset of the official GLM-5.2 chat template (legacy)."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     prompt = ["[gMASK]<sop>"]
@@ -176,6 +188,54 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None):
     prompt.append("<|assistant|><think>" if enable_thinking else
                   "<|assistant|><think></think>")
     return "".join(prompt)
+
+
+def render_chat_mimo(messages, enable_thinking=False, reasoning_effort=None):
+    """ChatML MiMo-V2.5 template (matches c/mimo.c mimo_turn_render / HF apply_chat_template).
+
+    No newline between <|im_end|> and the next <|im_start|>. THINK=0 style:
+    generation prompt pre-fills empty <think></think> when enable_thinking is False.
+    """
+    del reasoning_effort  # MiMo path does not use GLM-style effort tags
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    parts = []
+    has_system = any(
+        isinstance(m, dict) and m.get("role") in ("system", "developer")
+        for m in messages
+    )
+    if not has_system:
+        parts.append(f"<|im_start|>system\n{DEFAULT_MIMO_SYSTEM}<|im_end|>")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        text = content_text(message.get("content"), f"messages.{index}.content")
+        if role in ("system", "developer"):
+            parts.append(f"<|im_start|>system\n{text}<|im_end|>")
+        elif role == "user":
+            parts.append(f"<|im_start|>user\n{text}<|im_end|>")
+        elif role == "assistant":
+            # History stays as model output (often already includes <think>…); close turn.
+            parts.append(f"<|im_start|>assistant\n{text}<|im_end|>")
+        else:
+            raise APIError(400, f"Unsupported message role: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+    if enable_thinking:
+        parts.append("<|im_start|>assistant\n")
+    else:
+        parts.append("<|im_start|>assistant\n<think></think>")
+    return "".join(parts)
+
+
+def render_chat(messages, enable_thinking=False, reasoning_effort=None, arch=None):
+    """Dispatch chat template: default MiMo (peng); PENG_ARCH=glm for legacy GLM."""
+    a = chat_arch(arch)
+    if a in ("glm", "glm52", "colibri"):
+        return render_chat_glm(messages, enable_thinking, reasoning_effort)
+    if a in ("mimo", "mimo_v2", "peng"):
+        return render_chat_mimo(messages, enable_thinking, reasoning_effort)
+    raise APIError(400, f"Unknown chat architecture {a!r} (use mimo or glm).", "arch")
 
 
 def generation_options(body, limit):
@@ -534,9 +594,11 @@ class APIHandler(BaseHTTPRequestHandler):
         self.generation(body, prompt, request_id, False)
 
 
-def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
-          cap=8, max_tokens=1024, engine=HERE / "glm", env=None, cors_origins=None,
+def serve(model, host="127.0.0.1", port=8000, model_id="mimo-v2.5-peng", api_key=None,
+          cap=8, max_tokens=1024, engine=None, env=None, cors_origins=None,
           max_queue=8, queue_timeout=300):
+    if engine is None:
+        engine = HERE / "mimo"
     if not 1 <= max_tokens:
         raise ValueError("max_tokens must be positive")
     if not 1 <= port <= 65535:
@@ -565,10 +627,13 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
-    parser.add_argument("--engine", default=str(HERE / "glm"))
+    parser.add_argument("--engine", default=os.environ.get("COLI_ENGINE", str(HERE / "mimo")),
+                        help="engine binary (default: ./mimo; legacy GLM: path to glm)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-id", default=os.environ.get("COLI_MODEL_ID", "glm-5.2-colibri"))
+    parser.add_argument("--model-id",
+                        default=os.environ.get("COLI_MODEL_ID",
+                                               os.environ.get("PENG_MODEL_ID", "mimo-v2.5-peng")))
     parser.add_argument("--api-key", default=os.environ.get("COLI_API_KEY"))
     parser.add_argument("--cors-origin", action="append", default=None,
                         help="allowed browser origin; repeat as needed (use '*' for any origin)")
