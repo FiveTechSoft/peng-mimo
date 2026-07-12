@@ -630,6 +630,19 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 34. FLOW pathpack channel thaw (2026-07-12) — Corriente in the engine
+
+**Transcendence step:** stop WILLNEED by random expert id; thaw **along the habit channel**.
+
+- `pathpack_rebuild` / `.coli_pathpack`: greedy order from TRAJ edges + usage heat per layer.
+- `pathpack_thaw(layer, eid)`: `posix_fadvise` neighbors ±`FLOW_R` (default 2) on that order.
+- Wired into sticky PREFETCH and `traj_warm`; rebuild+save with `usage_save`.
+- Knobs: `FLOW=1` (default with TRAJ/SERVE/SPEED), `FLOW=0` off, `FLOW_R=2`.
+- Analyzer: `python3 c/scripts/path_pack_analyze.py --snap …` also writes `.coli_pathpack`.
+- Manifesto/diagram: `docs/corriente-peng.md`, `docs/diagrams/corriente-peng.svg`.
+
+**Still I/O-only (bit-exact tokens).** Physical shard repack remains future work; logical channel thaw is live.
+
 ### 33. Expert bitmaps (2026-07-12) — the other map
 
 **Intuition:** lists of slots are the slow story. **Bits** are the real map.

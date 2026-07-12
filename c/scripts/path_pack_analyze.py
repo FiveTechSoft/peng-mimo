@@ -241,6 +241,20 @@ def main() -> int:
         )
     else:
         print(text)
+
+    # Native engine format for mimo.c pathpack_load (Corriente FLOW)
+    pp = os.path.join(snap, f".coli_pathpack.{args.profile}" if args.profile else ".coli_pathpack")
+    with open(pp, "w", encoding="utf-8") as f:
+        f.write("# coli_pathpack v1\n")
+        for L in sorted(report["layers"].keys(), key=int):
+            order = report["layers"][L]["order"]
+            if not order:
+                continue
+            f.write(f"{L} {len(order)}")
+            for e in order:
+                f.write(f" {e}")
+            f.write("\n")
+    print(f"wrote {pp} (engine FLOW pathpack)", file=sys.stderr)
     return 0
 
 

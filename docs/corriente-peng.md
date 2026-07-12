@@ -109,19 +109,29 @@ dense transformer
 
 [`docs/diagrams/corriente-peng.svg`](diagrams/corriente-peng.svg) — residual as river; full/SWA viscosities; MoE as vortices; NVMe as snow; mouth as estuary.
 
-### 5.2 Path-pack seed (I/O only, bit-exact)
+### 5.2 Path-pack + FLOW in the engine (I/O only, bit-exact)
 
 ```bash
-# Analyze habit channels from traj + usage; emit a packing order suggestion
-python3 c/scripts/path_pack_analyze.py \
-  --snap ~/mimo25_i4 \
-  --out /tmp/path_pack_order.json
+# Analyze habit channels; write SNAP/.coli_pathpack for the engine
+python3 c/scripts/path_pack_analyze.py --snap ~/mimo25_i4 --out /tmp/path_pack_order.json
+
+# Runtime: mimo loads pathpack (or rebuilds from traj/usage) and thaws *channel neighbors*
+FLOW=1 FLOW_R=2 TRAJ=1 SERVE=1 … ./mimo 64 4 8
+# stderr: [FLOW] pathpack loaded|rebuilt … (R=2)
+#         sticky / traj_warm call pathpack_thaw along the bed
 ```
 
-Output: per-layer expert order that **clusters co-activated experts** (from `.coli_traj` edges + `.coli_usage` heat).  
-A future converter pass can rewrite shard layout so `thaw` becomes **range readahead**, not N random seeks.
+| Piece | Role |
+|-------|------|
+| `.coli_pathpack` | per-layer expert order (habit channel) |
+| `pathpack_thaw` | WILLNEED ±`FLOW_R` neighbors of live experts |
+| `pathpack_rebuild` | greedy walk from traj edges + usage heat |
+| `FLOW=0` | off |
 
-**Invariant:** reordering bytes on disk must not change tensor *values* — only physical locality. Tokens stay identical.
+Measured on real SNAP: path order locality ~**4.5×** vs raw expert id order.  
+A future converter can **rewrite shard layout** to match this order (range readahead). Until then, FLOW still warms **logical** neighbors that co-activate even if disks stay id-ordered.
+
+**Invariant:** never changes tensor values or logits — only *when* pages are hinted.
 
 ### 5.3 Already in the engine (named)
 

@@ -59,6 +59,7 @@ static int  pilot_pred_kt[256];
 static long looka_hit=0, looka_tot=0;
 /* Trajectory bulk WILLNEED (TRAJ=): knobs only; impl after Model. */
 static int g_traj=-1, g_traj_k=8, g_traj_depth=2;
+static int g_flow=1, g_flow_r=2;                 /* FLOW pathpack channel thaw (Corriente) */
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
@@ -185,6 +186,11 @@ typedef struct {
 static void traj_observe_layer(Model *m, int layer, const int *idx, int Ke);
 static void traj_commit_prev(Model *m);
 static void traj_warm(Model *m, int k_per_layer);
+static void pathpack_thaw(Model *m, int layer, int eid, int *left);
+static void pathpack_path_set(const char *snap);
+static void pathpack_rebuild(Model *m);
+static int pathpack_load(void);
+static int pathpack_save(void);
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
 static double now_s(void);               /* monotonic seconds; defined below CUDA helpers */
 /* DRAFT must be visible before cuda_upload_dense_all (MTP densas only when >0). */
@@ -1862,8 +1868,14 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     Cfg *c=&m->c; int D=c->hidden;
     /* Sticky next-token: experts used for this layer on the previous token are a
      * strong prior for the same layer on the next token (~40%+ baseline; free). */
-    if(g_spec && g_prefetch && l->sparse && m->enr[li]>0)
-        for(int z=0;z<m->enr[li];z++) expert_prefetch(m,li,m->eroute[li][z]);
+    if(g_spec && g_prefetch && l->sparse && m->enr[li]>0){
+        int left=16;
+        for(int z=0;z<m->enr[li];z++){
+            int e=m->eroute[li][z];
+            expert_prefetch(m,li,e);
+            if(g_flow>0) pathpack_thaw(m,li,e,&left);  /* channel neighbors */
+        }
+    }
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->in_ln, D, c->eps);
     attention(m,l,li,nrm,S,pos_base,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
@@ -2504,6 +2516,193 @@ static int traj_load(void){
     if(n>0) fprintf(stderr,"[TRAJ] loaded %d edges from %s\n",n,g_traj_path);
     return n;
 }
+
+/* ---- PATH PACK / FLOW (Corriente Peng) -------------------------------------------
+ * Order experts per layer by habit affinity (traj edges + usage heat). Thaw WILLNEED
+ * along the channel (neighbors of the live vortex), not random ids.
+ * File: SNAP/.coli_pathpack[.profile]  — I/O locality only; never changes tokens.
+ * FLOW=0 off; FLOW_R=2 neighbor radius; rebuild from live traj after load/save. */
+static int16_t g_pp_pos[TRAJ_LMAX][TRAJ_EMAX];   /* expert -> index in order (-1 none) */
+static int16_t g_pp_ord[TRAJ_LMAX][TRAJ_EMAX];   /* packing order */
+static int g_pp_n[TRAJ_LMAX];
+static char g_pp_path[2100]="";
+static long g_flow_thaw_n=0;
+static void pathpack_path_set(const char *snap){
+    if(!snap||!*snap){ g_pp_path[0]=0; return; }
+    if(g_profile[0])
+        snprintf(g_pp_path,sizeof(g_pp_path),"%s/.coli_pathpack.%s",snap,g_profile);
+    else
+        snprintf(g_pp_path,sizeof(g_pp_path),"%s/.coli_pathpack",snap);
+}
+static void pathpack_clear(void){
+    for(int l=0;l<TRAJ_LMAX;l++){
+        g_pp_n[l]=0;
+        for(int e=0;e<TRAJ_EMAX;e++){ g_pp_pos[l][e]=-1; g_pp_ord[l][e]=-1; }
+    }
+}
+static int pathpack_save(void){
+    if(g_flow<=0 || !g_pp_path[0]) return 0;
+    char tmp[2200]; snprintf(tmp,sizeof(tmp),"%s.tmp",g_pp_path);
+    FILE *f=fopen(tmp,"w"); if(!f) return 0;
+    fprintf(f,"# coli_pathpack v1\n");
+    int layers=0, nodes=0;
+    for(int l=0;l<TRAJ_LMAX;l++){
+        if(g_pp_n[l]<1) continue;
+        fprintf(f,"%d %d",l,g_pp_n[l]);
+        for(int i=0;i<g_pp_n[l];i++) fprintf(f," %d",(int)g_pp_ord[l][i]);
+        fprintf(f,"\n");
+        layers++; nodes+=g_pp_n[l];
+    }
+    fclose(f);
+    if(rename(tmp,g_pp_path)!=0){ remove(tmp); return 0; }
+    if(layers>0)
+        fprintf(stderr,"[FLOW] pathpack saved %d layers %d nodes -> %s\n",
+                layers,nodes,g_pp_path);
+    return layers;
+}
+static int pathpack_load(void){
+    if(g_flow<=0 || !g_pp_path[0]) return 0;
+    FILE *f=fopen(g_pp_path,"r"); if(!f) return 0;
+    pathpack_clear();
+    char line[4096]; int layers=0;
+    while(fgets(line,sizeof(line),f)){
+        if(line[0]=='#' || line[0]=='\n' || line[0]=='\r') continue;
+        char *p=line; int L=-1, n=0;
+        if(sscanf(p,"%d %d",&L,&n)!=2) continue;
+        if(L<0||L>=TRAJ_LMAX||n<1||n>TRAJ_EMAX) continue;
+        /* skip two ints */
+        while(*p&&*p==' ') p++; while(*p&&*p!=' ') p++; while(*p==' ') p++;
+        while(*p&&*p!=' ') p++; while(*p==' ') p++;
+        int got=0;
+        for(int i=0;i<n && *p;i++){
+            int e=-1; char *end=p;
+            e=(int)strtol(p,&end,10); if(end==p) break; p=end;
+            while(*p==' ') p++;
+            if(e<0||e>=TRAJ_EMAX) continue;
+            g_pp_ord[L][got]=(int16_t)e;
+            g_pp_pos[L][e]=(int16_t)got;
+            got++;
+        }
+        g_pp_n[L]=got; if(got>0) layers++;
+    }
+    fclose(f);
+    if(layers>0) fprintf(stderr,"[FLOW] pathpack loaded %d layers from %s (R=%d)\n",
+                         layers,g_pp_path,g_flow_r);
+    return layers;
+}
+/* Rebuild packing from live TRAJ + eusage (greedy channel walk). */
+static void pathpack_rebuild(Model *m){
+    if(g_flow<=0 || !m) return;
+    Cfg *c=&m->c;
+    pathpack_clear();
+    int layers=0;
+    for(int l=0;l<c->n_layers && l<TRAJ_LMAX;l++){
+        if(!m->L[l].sparse) continue;
+        int E=c->n_experts; if(E>TRAJ_EMAX) E=TRAJ_EMAX;
+        /* affinity[e0][e1] compressed: only top via sparse bumps on score from heat */
+        float heat[TRAJ_EMAX];
+        for(int e=0;e<E;e++){
+            uint32_t h = (m->eusage && m->eusage[l]) ? m->eusage[l][e] : 0;
+            if(m->eheat && m->eheat[l] && m->eheat[l][e]>h) h=m->eheat[l][e];
+            heat[e]=(float)h;
+        }
+        /* Build sparse adjacency list: for each e, best partners from traj */
+        int16_t nbr[TRAJ_EMAX][8]; float nw[TRAJ_EMAX][8];
+        for(int e=0;e<E;e++){ for(int k=0;k<8;k++){ nbr[e][k]=-1; nw[e][k]=0; } }
+        for(int e0=0;e0<E;e0++){
+            for(int s=0;s<TRAJ_SUC;s++){
+                TrajEdge ed=g_traj_tok[l][e0][s];
+                if(!ed.c || ed.e<0 || ed.e>=E) continue;
+                float w=(float)ed.c;
+                /* insert into e0's list and e1's list */
+                for(int pass=0;pass<2;pass++){
+                    int a=pass?ed.e:e0, b=pass?e0:(int)ed.e;
+                    int slot=-1, weak=0;
+                    for(int k=0;k<8;k++){
+                        if(nbr[a][k]==b){ nw[a][k]+=w; slot=k; break; }
+                        if(nbr[a][k]<0){ slot=k; break; }
+                        if(nw[a][k]<nw[a][weak]) weak=k;
+                    }
+                    if(slot>=0 && nbr[a][slot]<0){ nbr[a][slot]=(int16_t)b; nw[a][slot]=w; }
+                    else if(slot<0 && w>nw[a][weak]){ nbr[a][weak]=(int16_t)b; nw[a][weak]=w; }
+                    else if(slot>=0 && nbr[a][slot]==b){ /* already added */ }
+                }
+            }
+            for(int s=0;s<TRAJ_SUC;s++){
+                TrajEdge ed=g_traj_lay[l][e0][s];
+                if(!ed.c || ed.e<0 || ed.e>=E) continue;
+                float w=0.5f*(float)ed.c;
+                int b=ed.e;
+                int slot=-1, weak=0;
+                for(int k=0;k<8;k++){
+                    if(nbr[e0][k]==b){ nw[e0][k]+=w; slot=k; break; }
+                    if(nbr[e0][k]<0){ slot=k; break; }
+                    if(nw[e0][k]<nw[e0][weak]) weak=k;
+                }
+                if(slot>=0 && nbr[e0][slot]<0){ nbr[e0][slot]=(int16_t)b; nw[e0][slot]=w; }
+                else if(slot<0 && w>nw[e0][weak]){ nbr[e0][weak]=(int16_t)b; nw[e0][weak]=w; }
+            }
+        }
+        char seen[TRAJ_EMAX]; memset(seen,0,sizeof(seen));
+        int n=0;
+        /* seed: hottest expert with any heat or any neighbor */
+        for(;;){
+            int seed=-1; float bh=-1.f;
+            for(int e=0;e<E;e++) if(!seen[e] && heat[e]>bh){ bh=heat[e]; seed=e; }
+            if(seed<0 || bh<=0){
+                /* any unseen with neighbors */
+                seed=-1;
+                for(int e=0;e<E && seed<0;e++) if(!seen[e] && nbr[e][0]>=0) seed=e;
+                if(seed<0) break;
+            }
+            int cur=seed;
+            while(cur>=0 && n<E){
+                if(seen[cur]) break;
+                seen[cur]=1;
+                g_pp_ord[l][n]=(int16_t)cur;
+                g_pp_pos[l][cur]=(int16_t)n;
+                n++;
+                int best=-1; float bw=-1.f;
+                for(int k=0;k<8;k++){
+                    int b=nbr[cur][k]; if(b<0||seen[b]) continue;
+                    if(nw[cur][k]>bw){ bw=nw[cur][k]; best=b; }
+                }
+                if(best<0){
+                    /* jump to hottest unseen connected component seed */
+                    break;
+                }
+                cur=best;
+            }
+        }
+        g_pp_n[l]=n; if(n>0) layers++;
+    }
+    if(layers>0)
+        fprintf(stderr,"[FLOW] pathpack rebuilt from traj/usage (%d layers, R=%d)\n",
+                layers,g_flow_r);
+}
+/* Thaw packing neighbors of eid on this layer (channel flow). */
+static void pathpack_thaw(Model *m, int layer, int eid, int *left){
+    if(g_flow<=0 || !m || !left || *left<=0) return;
+    if(layer<0||layer>=TRAJ_LMAX||eid<0||eid>=TRAJ_EMAX) return;
+    int pos=g_pp_pos[layer][eid]; if(pos<0) return;
+    int n=g_pp_n[layer]; if(n<1) return;
+    int R=g_flow_r<1?1:(g_flow_r>8?8:g_flow_r);
+    for(int d=1;d<=R && *left>0;d++){
+        if(pos-d>=0){
+            int e=g_pp_ord[layer][pos-d];
+            if(e>=0 && !expert_resident(m,layer,e)){
+                expert_prefetch(m,layer,e); g_flow_thaw_n++; (*left)--;
+            }
+        }
+        if(*left<=0) break;
+        if(pos+d<n){
+            int e=g_pp_ord[layer][pos+d];
+            if(e>=0 && !expert_resident(m,layer,e)){
+                expert_prefetch(m,layer,e); g_flow_thaw_n++; (*left)--;
+            }
+        }
+    }
+}
 static void traj_observe_layer(Model *m, int layer, const int *idx, int Ke){
     if(g_traj<=0 || !idx || Ke<1 || layer<0 || layer>=TRAJ_LMAX) return;
     if(Ke>64) Ke=64;
@@ -2606,6 +2805,7 @@ static void traj_warm(Model *m, int k_per_layer){
         /* Sticky: boost scores; prefetch only strongest 2 L→L+1 successors per sticky. */
         for(int i=0;i<nsticky;i++){
             int e0=sticky[i]; if(e0<0||e0>=E) continue;
+            pathpack_thaw(m,l,e0,&left);         /* FLOW: thaw along packing channel */
             for(int s=0;s<TRAJ_SUC;s++){
                 TrajEdge ed=g_traj_tok[l][e0][s];
                 if(ed.c==0 || ed.e<0 || ed.e>=E) continue;
@@ -3012,6 +3212,7 @@ static void usage_path_set(const char *snap){
     else
         snprintf(g_usage_path,sizeof(g_usage_path),"%s/.coli_usage",snap);
     traj_path_set(snap);   /* same profile → .coli_traj[.name] */
+    pathpack_path_set(snap); /* Corriente: .coli_pathpack[.name] */
 }
 static int64_t usage_load(Model *m, const char *path){
     FILE *f=fopen(path,"r"); if(!f) return 0;
@@ -3023,6 +3224,7 @@ static int64_t usage_load(Model *m, const char *path){
 static void usage_save(Model *m){
     if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1);
     traj_save();   /* persist Markov edges with the same cadence as usage */
+    if(g_flow>0){ pathpack_rebuild(m); pathpack_save(); }
 }
 
 /* HOT-STORE ("il redis del colibri'"): carica in RAM, UNA VOLTA e per sempre, i top expert
@@ -3371,6 +3573,12 @@ int main(int argc, char **argv){
     if(g_traj>0)
         fprintf(stderr,"[TRAJ] bulk expert path WILLNEED on (K=%d depth=%d; TRAJ=0 off)\n",
                 g_traj_k, g_traj_depth);
+    /* FLOW: path-pack channel thaw (Corriente Peng). Default ON with TRAJ/SERVE/SPEED. */
+    if(getenv("FLOW")) g_flow=atoi(getenv("FLOW"));
+    else g_flow = (g_traj>0 || serve_mode || speed_mode) ? 1 : 0;
+    if(getenv("FLOW_R")){ g_flow_r=atoi(getenv("FLOW_R")); if(g_flow_r<1)g_flow_r=1; if(g_flow_r>8)g_flow_r=8; }
+    if(g_flow>0)
+        fprintf(stderr,"[FLOW] pathpack channel thaw on (R=%d; FLOW=0 off)\n", g_flow_r);
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.95f;  /* 0.95 = generation_config MiMo-V2.5 */
     g_looka = getenv("LOOKA")?1:0;                    /* PILOT accuracy measurement (no prefetch) */
@@ -3462,6 +3670,9 @@ int main(int argc, char **argv){
       int64_t hist = usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] storia expert: %lld selezioni (%s)\n",(long long)hist,g_usage_path);
       if(g_traj>0) traj_load();   /* warm Markov from previous sessions */
+      if(g_flow>0){
+          if(pathpack_load()<1) pathpack_rebuild(&m);  /* file or live traj/usage */
+      }
       int autopin = getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
       if(!getenv("PIN") && autopin && hist>=5000){
           /* quota pin ∝ confidence; at full history use 85% of expert budget (colibri #71;
