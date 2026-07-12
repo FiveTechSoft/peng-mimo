@@ -1,0 +1,249 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 920" width="1100" height="920" role="img" aria-labelledby="title desc">
+  <title id="title">MiMo-V2.5 geometry — logical architecture</title>
+  <desc id="desc">Hybrid full/SWA GQA stack with dense layer 0 and MoE layers 1–47 (256 experts, top-8).</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0b1220"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="fullG" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#1d4ed8"/>
+      <stop offset="100%" stop-color="#3b82f6"/>
+    </linearGradient>
+    <linearGradient id="swaG" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0f766e"/>
+      <stop offset="100%" stop-color="#14b8a6"/>
+    </linearGradient>
+    <linearGradient id="moeG" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+    <linearGradient id="denseG" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#b45309"/>
+      <stop offset="100%" stop-color="#f59e0b"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.45"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#94a3b8"/>
+    </marker>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M24 0 H0 V24" fill="none" stroke="#1f2937" stroke-width="0.6"/>
+    </pattern>
+  </defs>
+
+  <rect width="1100" height="920" fill="url(#bg)"/>
+  <rect width="1100" height="920" fill="url(#grid)" opacity="0.5"/>
+
+  <!-- Header -->
+  <text x="40" y="42" fill="#f8fafc" font-family="ui-sans-serif,system-ui,Segoe UI,sans-serif" font-size="26" font-weight="700">MiMo-V2.5 — geometría lógica del modelo</text>
+  <text x="40" y="68" fill="#94a3b8" font-family="ui-sans-serif,system-ui,Segoe UI,sans-serif" font-size="14">311B parámetros · ~15B activos/token · 48 capas · sin shared expert · QKV fusionado · RoPE parcial</text>
+
+  <!-- Legend -->
+  <g transform="translate(40,88)">
+    <rect width="1020" height="52" rx="10" fill="#0f172a" stroke="#334155"/>
+    <rect x="16" y="16" width="18" height="18" rx="3" fill="url(#fullG)"/>
+    <text x="42" y="30" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">Full attn (9) · GQA 64Q/4KV · θ=10M · KV a todo el contexto</text>
+    <rect x="430" y="16" width="18" height="18" rx="3" fill="url(#swaG)"/>
+    <text x="456" y="30" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">SWA-128 (39) · GQA 64Q/8KV · θ=10k · sink bias · ventana 128</text>
+    <rect x="820" y="16" width="18" height="18" rx="3" fill="url(#moeG)"/>
+    <text x="846" y="30" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">MoE top-8/256</text>
+  </g>
+
+  <!-- Token / dims strip -->
+  <g transform="translate(40,156)" filter="url(#soft)">
+    <rect width="240" height="150" rx="12" fill="#0f172a" stroke="#475569"/>
+    <text x="16" y="28" fill="#38bdf8" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700">DIMENSIONES</text>
+    <text x="16" y="52" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">hidden D = 4096</text>
+    <text x="16" y="72" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">Q heads = 64</text>
+    <text x="16" y="92" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">head_dim K = 192 · V = 128</text>
+    <text x="16" y="112" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">RoPE parcial 64 dims (NeoX)</text>
+    <text x="16" y="132" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">vocab ≈ 152 576 · V×0.707</text>
+  </g>
+
+  <g transform="translate(300,156)" filter="url(#soft)">
+    <rect width="280" height="150" rx="12" fill="#0f172a" stroke="#475569"/>
+    <text x="16" y="28" fill="#a78bfa" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700">MoE (capas 1–47)</text>
+    <text x="16" y="52" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">E = 256 experts / capa</text>
+    <text x="16" y="72" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">K = top-8 activos (router sigmoid)</text>
+    <text x="16" y="92" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">inter expert = 2048 · SwiGLU</text>
+    <text x="16" y="112" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">sin shared expert</text>
+    <text x="16" y="132" fill="#cbd5e1" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12">47 × 256 = 12 032 experts totales</text>
+  </g>
+
+  <g transform="translate(600,156)" filter="url(#soft)">
+    <rect width="220" height="150" rx="12" fill="#0f172a" stroke="#475569"/>
+    <text x="16" y="28" fill="#fbbf24" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700">CAPA 0 DENSA</text>
+    <text x="16" y="52" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">MLP densa inter = 16384</text>
+    <text x="16" y="72" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">siempre residente</text>
+    <text x="16" y="92" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">attn full (índice 0)</text>
+    <text x="16" y="112" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">QKV fuso + o_proj</text>
+    <text x="16" y="132" fill="#94a3b8" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12">no MoE</text>
+  </g>
+
+  <g transform="translate(840,156)" filter="url(#soft)">
+    <rect width="220" height="150" rx="12" fill="#0f172a" stroke="#475569"/>
+    <text x="16" y="28" fill="#34d399" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700">ACTIVOS / TOKEN</text>
+    <text x="16" y="58" fill="#f8fafc" font-family="ui-sans-serif,system-ui,sans-serif" font-size="22" font-weight="700">~15B</text>
+    <text x="16" y="84" fill="#94a3b8" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">de 311B totales</text>
+    <text x="16" y="112" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">≈ densas + 47×8 FFN</text>
+    <text x="16" y="132" fill="#94a3b8" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12">router elige 8 de 256</text>
+  </g>
+
+  <!-- Layer stack schematic -->
+  <text x="40" y="340" fill="#f1f5f9" font-family="ui-sans-serif,system-ui,sans-serif" font-size="16" font-weight="700">Pila de 48 capas (patrón híbrido full / SWA)</text>
+  <text x="40" y="360" fill="#64748b" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12">Full en índices 0,5,11,17,23,29,35,41,47 · el resto SWA-128</text>
+
+  <!-- Mini stack of 48 cells as a bar -->
+  <g transform="translate(40,375)">
+    <!-- generate 48 blocks via repeated rects - full pattern known -->
+    <!-- Pattern: F S S S S F S S S S S F ... based on README -->
+    <!-- indices full: 0,5,11,17,23,29,35,41,47 -->
+    <g id="stack">
+      <!-- row of 48 -->
+      <g font-family="ui-monospace,Consolas,monospace" font-size="8" fill="#94a3b8">
+        <!-- We'll draw programmatically-like with explicit rects -->
+      </g>
+    </g>
+  </g>
+
+  <!-- Explicit 48 layer strip -->
+  <g transform="translate(40,380)">
+    <!-- helper: full indices as blue, rest teal; layer 0 also gold border for dense -->
+    <!-- i=0 full+dense -->
+    <rect x="0" y="0" width="20" height="36" rx="3" fill="url(#fullG)" stroke="#f59e0b" stroke-width="2"/>
+    <text x="4" y="48" fill="#64748b" font-family="ui-monospace,Consolas,monospace" font-size="8">0</text>
+    <!-- 1-4 SWA -->
+    <rect x="22" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="44" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="66" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="88" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <!-- 5 full -->
+    <rect x="110" y="0" width="20" height="36" rx="3" fill="url(#fullG)"/>
+    <!-- 6-10 SWA -->
+    <rect x="132" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="154" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="176" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="198" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="220" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <!-- 11 full -->
+    <rect x="242" y="0" width="20" height="36" rx="3" fill="url(#fullG)"/>
+    <!-- 12-16 -->
+    <rect x="264" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="286" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="308" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="330" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="352" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <!-- 17 full -->
+    <rect x="374" y="0" width="20" height="36" rx="3" fill="url(#fullG)"/>
+    <!-- 18-22 -->
+    <rect x="396" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="418" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="440" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="462" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="484" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <!-- 23 full -->
+    <rect x="506" y="0" width="20" height="36" rx="3" fill="url(#fullG)"/>
+    <!-- 24-28 -->
+    <rect x="528" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="550" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="572" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="594" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="616" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <!-- 29 full -->
+    <rect x="638" y="0" width="20" height="36" rx="3" fill="url(#fullG)"/>
+    <!-- 30-34 -->
+    <rect x="660" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="682" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="704" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="726" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="748" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <!-- 35 full -->
+    <rect x="770" y="0" width="20" height="36" rx="3" fill="url(#fullG)"/>
+    <!-- 36-40 -->
+    <rect x="792" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="814" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="836" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="858" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="880" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <!-- 41 full -->
+    <rect x="902" y="0" width="20" height="36" rx="3" fill="url(#fullG)"/>
+    <!-- 42-46 -->
+    <rect x="924" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="946" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="968" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/><rect x="990" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <rect x="1012" y="0" width="20" height="36" rx="3" fill="url(#swaG)"/>
+    <!-- 47 full -->
+    <rect x="1034" y="0" width="20" height="36" rx="3" fill="url(#fullG)"/>
+    <text x="1036" y="48" fill="#64748b" font-family="ui-monospace,Consolas,monospace" font-size="8">47</text>
+  </g>
+  <text x="40" y="450" fill="#64748b" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">borde dorado = capa 0 densa · azul = full attention · verde = SWA · capas 1–47 también son MoE (no dibujado en la tira)</text>
+
+  <!-- Single layer anatomy -->
+  <text x="40" y="490" fill="#f1f5f9" font-family="ui-sans-serif,system-ui,sans-serif" font-size="16" font-weight="700">Anatomía de una capa MoE (1–47)</text>
+
+  <g transform="translate(40,510)" filter="url(#soft)">
+    <!-- flow boxes -->
+    <rect x="0" y="40" width="100" height="70" rx="10" fill="#1e293b" stroke="#64748b"/>
+    <text x="50" y="70" text-anchor="middle" fill="#f8fafc" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="700">x ∈ ℝᴰ</text>
+    <text x="50" y="90" text-anchor="middle" fill="#94a3b8" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">hidden</text>
+
+    <path d="M110 75 H140" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="150" y="20" width="160" height="110" rx="10" fill="#1e3a5f" stroke="#3b82f6"/>
+    <text x="230" y="48" text-anchor="middle" fill="#93c5fd" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="700">Attention (GQA)</text>
+    <text x="230" y="70" text-anchor="middle" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">QKV fuso → RoPE parcial</text>
+    <text x="230" y="88" text-anchor="middle" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">softmax (+ sink si SWA)</text>
+    <text x="230" y="106" text-anchor="middle" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">o_proj → residual</text>
+
+    <path d="M320 75 H350" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="360" y="20" width="140" height="110" rx="10" fill="#3b0764" stroke="#a855f7"/>
+    <text x="430" y="52" text-anchor="middle" fill="#e9d5ff" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="700">Router</text>
+    <text x="430" y="74" text-anchor="middle" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">sigmoid · noaux_tc</text>
+    <text x="430" y="94" text-anchor="middle" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">top-8 de 256</text>
+    <text x="430" y="114" text-anchor="middle" fill="#c4b5fd" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">pesos wₖ</text>
+
+    <path d="M510 75 H540" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <!-- experts cloud -->
+    <rect x="550" y="0" width="320" height="150" rx="12" fill="#1a1030" stroke="#7c3aed" stroke-dasharray="4 3"/>
+    <text x="710" y="24" text-anchor="middle" fill="#d8b4fe" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="700">256 experts · 8 activos (ej.)</text>
+    <!-- expert boxes -->
+    <rect x="570" y="40" width="52" height="40" rx="6" fill="url(#moeG)" opacity="0.95"/>
+    <text x="596" y="64" text-anchor="middle" fill="#fff" font-size="10" font-family="ui-sans-serif,system-ui,sans-serif">e₁₂</text>
+    <rect x="632" y="40" width="52" height="40" rx="6" fill="url(#moeG)"/>
+    <text x="658" y="64" text-anchor="middle" fill="#fff" font-size="10" font-family="ui-sans-serif,system-ui,sans-serif">e₄₄</text>
+    <rect x="694" y="40" width="52" height="40" rx="6" fill="url(#moeG)"/>
+    <text x="720" y="64" text-anchor="middle" fill="#fff" font-size="10" font-family="ui-sans-serif,system-ui,sans-serif">e₉₁</text>
+    <rect x="756" y="40" width="52" height="40" rx="6" fill="url(#moeG)"/>
+    <text x="782" y="64" text-anchor="middle" fill="#fff" font-size="10" font-family="ui-sans-serif,system-ui,sans-serif">e…</text>
+    <rect x="570" y="90" width="52" height="40" rx="6" fill="#312e81" opacity="0.5"/>
+    <rect x="632" y="90" width="52" height="40" rx="6" fill="#312e81" opacity="0.35"/>
+    <rect x="694" y="90" width="52" height="40" rx="6" fill="#312e81" opacity="0.25"/>
+    <rect x="756" y="90" width="52" height="40" rx="6" fill="#312e81" opacity="0.2"/>
+    <text x="710" y="142" text-anchor="middle" fill="#94a3b8" font-size="10" font-family="ui-sans-serif,system-ui,sans-serif">inactivos (248) no se evalúan</text>
+
+    <path d="M880 75 H910" stroke="#94a3b8" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="920" y="40" width="120" height="70" rx="10" fill="#14532d" stroke="#22c55e"/>
+    <text x="980" y="70" text-anchor="middle" fill="#bbf7d0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="700">Σ wₖ·FFNₖ</text>
+    <text x="980" y="92" text-anchor="middle" fill="#86efac" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">+ residual</text>
+  </g>
+
+  <!-- Expert FFN detail -->
+  <g transform="translate(40,690)" filter="url(#soft)">
+    <rect width="500" height="180" rx="12" fill="#0f172a" stroke="#475569"/>
+    <text x="16" y="28" fill="#c4b5fd" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700">FFN de un expert (SwiGLU)</text>
+    <text x="16" y="52" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">gate_proj : D → I  (I = 2048)</text>
+    <text x="16" y="74" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">up_proj   : D → I</text>
+    <text x="16" y="96" fill="#e2e8f0" font-family="ui-sans-serif,system-ui,sans-serif" font-size="13">down_proj : I → D</text>
+    <text x="16" y="124" fill="#94a3b8" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12">y = down( silu(gate(x)) ⊙ up(x) )</text>
+    <text x="16" y="150" fill="#64748b" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12">En FP8 original: bloques 128×128 · o_proj de attn fuera de FP8 (bf16)</text>
+    <text x="16" y="170" fill="#64748b" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12">Pesos conceptuales: 3 matrices por expert × 12 032 experts ≈ grueso del modelo</text>
+  </g>
+
+  <g transform="translate(560,690)" filter="url(#soft)">
+    <rect width="500" height="180" rx="12" fill="#0f172a" stroke="#475569"/>
+    <text x="16" y="28" fill="#67e8f9" font-family="ui-monospace,Consolas,monospace" font-size="12" font-weight="700">Atención full vs SWA (vista de contexto)</text>
+    <!-- full -->
+    <text x="16" y="56" fill="#93c5fd" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="700">Full (9 capas)</text>
+    <rect x="16" y="68" width="220" height="16" rx="3" fill="#1e3a8a"/>
+    <rect x="16" y="68" width="220" height="16" rx="3" fill="#3b82f6" opacity="0.85"/>
+    <text x="16" y="104" fill="#94a3b8" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">atiende todo el historial [0 … pos]</text>
+    <!-- swa -->
+    <text x="16" y="132" fill="#5eead4" font-family="ui-sans-serif,system-ui,sans-serif" font-size="12" font-weight="700">SWA-128 (39 capas)</text>
+    <rect x="16" y="144" width="220" height="16" rx="3" fill="#134e4a"/>
+    <rect x="120" y="144" width="116" height="16" rx="3" fill="#14b8a6"/>
+    <text x="16" y="176" fill="#94a3b8" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">solo [pos−127 … pos] + sink logit</text>
+  </g>
+
+  <text x="40" y="900" fill="#475569" font-family="ui-sans-serif,system-ui,sans-serif" font-size="11">Fuente: config/official modeling MiMo-V2.5 · README peng · findings.md · diagram: docs/diagrams/mimo-geometry.svg</text>
+</svg>

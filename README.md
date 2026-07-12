@@ -45,6 +45,43 @@ MiMo-V2.5 maximizes colibri reuse: router, FP8→int4 converter, streaming, AVX2
 
 Nice consequence of sliding window: 39 of 48 layers need KV-cache of only 128 tokens — long context comes almost free in RAM compared to a full-attention model.
 
+### Geometry diagrams (logical MiMo vs physical peng)
+
+Two static SVGs render on GitHub; open the HTML for an interactive Three.js orbit view (CDN, no build).
+
+| View | What it shows | File |
+|---|---|---|
+| **MiMo logical** | Layer stack full/SWA, MoE top-8/256, dims, full vs window context | [`docs/diagrams/mimo-geometry.svg`](docs/diagrams/mimo-geometry.svg) |
+| **peng physical** | NVMe → RAM pin/LRU/KV → VRAM densas+gpu_pin, decode pipeline | [`docs/diagrams/peng-mimo-geometry.svg`](docs/diagrams/peng-mimo-geometry.svg) |
+| **3D interactive** | Toggle MiMo stack ↔ peng memory map (drag / zoom) | [`docs/diagrams/mimo-vs-peng-3d.html`](docs/diagrams/mimo-vs-peng-3d.html) |
+
+#### 1) MiMo-V2.5 — logical geometry
+
+<p align="center">
+  <img src="docs/diagrams/mimo-geometry.svg" alt="MiMo-V2.5 logical geometry: hybrid full/SWA layers, dense layer 0, MoE experts top-8 of 256" width="100%" />
+</p>
+
+How to read it:
+
+1. **Strip of 48 layers** — blue = full attention (sees the whole history); teal = SWA-128 (last 128 tokens + sink); gold border on layer 0 = dense MLP (not MoE).
+2. **Per MoE layer** — after GQA attention, a **router** picks 8 of 256 experts; only those FFNs run (SwiGLU gate/up/down).
+3. **Active compute** — ~15B of 311B parameters per token; the other experts exist only as weights, not FLOPs.
+
+#### 2) peng-mimo — physical geometry (same math, different residency)
+
+<p align="center">
+  <img src="docs/diagrams/peng-mimo-geometry.svg" alt="peng-mimo physical geometry: NVMe experts, RAM pin/LRU, GPU VRAM tier, decode pipeline" width="100%" />
+</p>
+
+How to read it:
+
+1. **NVMe** holds the int4 container (~12 032 experts × ~12.6 MB). Cold miss ≈ multi‑GB of `pread` per token.
+2. **Host RAM** keeps densas (or residual host), **learned PIN**, **per-layer LRU**, and KV (SWA as a **ring of 128**).
+3. **GPU VRAM** keeps uploaded densas + complementary **gpu_pin** (~522 hottest experts on a 12 GB card) and runs `moe_acc` for decode.
+4. **Lookup order** per expert id: VRAM → RAM pin → LRU → disk. Prefetch / PILOT / REPIN only change *when* bytes move, not the math.
+
+> **Interactive 3D:** open [`docs/diagrams/mimo-vs-peng-3d.html`](docs/diagrams/mimo-vs-peng-3d.html) in a browser (needs network once for the Three.js CDN). Use the tabs *MiMo lógico* / *peng físico*.
+
 ## Method (colibri's): token-exact validation first
 
 Nothing is taken for granted without reproducing **bit for bit** the tokens from the reference implementation (`transformers` + official `modeling_mimo_v2.py`):

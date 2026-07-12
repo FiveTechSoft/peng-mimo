@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 980" width="1100" height="980" role="img" aria-labelledby="title desc">
+  <title id="title">peng-mimo geometry — physical layout on consumer hardware</title>
+  <desc id="desc">How MiMo-V2.5 is mapped onto NVMe, host RAM pin/LRU, and GPU VRAM by the peng engine.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0a0f1a"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="diskG" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#334155"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="ramG" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1d4ed8"/>
+      <stop offset="100%" stop-color="#1e3a8a"/>
+    </linearGradient>
+    <linearGradient id="vramG" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#059669"/>
+      <stop offset="100%" stop-color="#064e3b"/>
+    </linearGradient>
+    <linearGradient id="cpuG" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#b45309"/>
+      <stop offset="100%" stop-color="#f59e0b"/>
+    </linearGradient>
+    <linearGradient id="flow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.2"/>
+      <stop offset="50%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#22d3ee" stop-opacity="0.2"/>
+    </linearGradient>
+    <filter id="soft" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#000" flood-opacity="0.5"/>
+    </filter>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#67e8f9"/>
+    </marker>
+    <marker id="arrY" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#fbbf24"/>
+    </marker>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <path d="M28 0 H0 V28" fill="none" stroke="#1e293b" stroke-width="0.7"/>
+    </pattern>
+  </defs>
+
+  <rect width="1100" height="980" fill="url(#bg)"/>
+  <rect width="1100" height="980" fill="url(#grid)" opacity="0.45"/>
+
+  <text x="40" y="40" fill="#f8fafc" font-family="ui-sans-serif,system-ui,Segoe UI,sans-serif" font-size="26" font-weight="700">peng-mimo — geometría física en hardware de consumo</text>
+  <text x="40" y="66" fill="#94a3b8" font-family="ui-sans-serif,system-ui,sans-serif" font-size="14">Misma matemática que MiMo · pesos int4 en disco · densas en RAM/VRAM · experts en cascada VRAM → RAM pin → LRU → NVMe</text>
+
+  <!-- Hardware box legend -->
+  <g transform="translate(40,86)">
+    <rect width="1020" height="44" rx="10" fill="#0f172a" stroke="#334155"/>
+    <rect x="18" y="13" width="16" height="16" rx="3" fill="#475569"/>
+    <text x="42" y="26" fill="#e2e8f0" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">NVMe (~152–165 GB container)</text>
+    <rect x="280" y="13" width="16" height="16" rx="3" fill="#2563eb"/>
+    <text x="304" y="26" fill="#e2e8f0" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">Host RAM (~16–24 GB útiles)</text>
+    <rect x="530" y="13" width="16" height="16" rx="3" fill="#059669"/>
+    <text x="554" y="26" fill="#e2e8f0" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">GPU VRAM (p.ej. 12 GB 3060)</text>
+    <rect x="800" y="13" width="16" height="16" rx="3" fill="#f59e0b"/>
+    <text x="824" y="26" fill="#e2e8f0" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">Compute CPU/CUDA</text>
+  </g>
+
+  <!-- Three storage columns -->
+  <g transform="translate(40,150)" filter="url(#soft)">
+    <!-- DISK -->
+    <rect width="320" height="420" rx="16" fill="url(#diskG)" stroke="#64748b" stroke-width="1.5"/>
+    <text x="20" y="36" fill="#f1f5f9" font-size="18" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">① NVMe / container</text>
+    <text x="20" y="58" fill="#94a3b8" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">safetensors shards · O_DIRECT pread</text>
+
+    <rect x="18" y="78" width="284" height="70" rx="8" fill="#1e293b" stroke="#475569"/>
+    <text x="30" y="102" fill="#fbbf24" font-size="12" font-weight="700" font-family="ui-monospace,Consolas,monospace">12 032 experts int4</text>
+    <text x="30" y="122" fill="#cbd5e1" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">~12.6 MB / expert (g+u+d + qs)</text>
+    <text x="30" y="140" fill="#94a3b8" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">≈ 152 GB del artefacto HF</text>
+
+    <rect x="18" y="164" width="284" height="56" rx="8" fill="#1e293b" stroke="#475569"/>
+    <text x="30" y="188" fill="#93c5fd" font-size="12" font-weight="700" font-family="ui-monospace,Consolas,monospace">config · tokenizer · meta</text>
+    <text x="30" y="208" fill="#94a3b8" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">pequeño · se lee al arranque</text>
+
+    <rect x="18" y="236" width="284" height="90" rx="8" fill="#0c4a6e" stroke="#38bdf8" stroke-dasharray="4 3"/>
+    <text x="30" y="262" fill="#7dd3fc" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">Cold miss path</text>
+    <text x="30" y="284" fill="#e0f2fe" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">expert_load → pread ~19 MB</text>
+    <text x="30" y="304" fill="#e0f2fe" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">→ slab en RAM (o upload VRAM)</text>
+
+    <text x="20" y="360" fill="#64748b" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">Física: 47×8×12.6 MB ≈ 4.7 GB / token frío</text>
+    <text x="20" y="380" fill="#64748b" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">@ 2.75 GB/s O_DIRECT → techo ~0.6 tok/s</text>
+    <text x="20" y="400" fill="#475569" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">si todo miss (hit caliente mejora mucho)</text>
+  </g>
+
+  <g transform="translate(390,150)" filter="url(#soft)">
+    <!-- RAM -->
+    <rect width="320" height="420" rx="16" fill="url(#ramG)" stroke="#60a5fa" stroke-width="1.5"/>
+    <text x="20" y="36" fill="#f1f5f9" font-size="18" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">② Host RAM</text>
+    <text x="20" y="58" fill="#bfdbfe" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">presupuesto auto (MemAvailable)</text>
+
+    <rect x="18" y="78" width="284" height="58" rx="8" fill="#172554" stroke="#93c5fd"/>
+    <text x="30" y="100" fill="#fde68a" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">Densas (post free GPU)</text>
+    <text x="30" y="120" fill="#e2e8f0" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">attn / norm / embed / lm_head · int8/f32</text>
+
+    <rect x="18" y="150" width="284" height="70" rx="8" fill="#1e3a8a" stroke="#60a5fa"/>
+    <text x="30" y="174" fill="#bfdbfe" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">PIN hot-store (aprendido)</text>
+    <text x="30" y="194" fill="#e2e8f0" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">~360–430 experts · .coli_usage</text>
+    <text x="30" y="210" fill="#93c5fd" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">nunca se evictan (salvo REPIN)</text>
+
+    <rect x="18" y="236" width="284" height="70" rx="8" fill="#1e40af" stroke="#93c5fd"/>
+    <text x="30" y="260" fill="#bfdbfe" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">LRU por capa (ecap)</text>
+    <text x="30" y="280" fill="#e2e8f0" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">cap ~11–13 · mem_watch dinámico</text>
+    <text x="30" y="296" fill="#93c5fd" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">miss → load → promote</text>
+
+    <rect x="18" y="322" width="284" height="56" rx="8" fill="#312e81" stroke="#a78bfa"/>
+    <text x="30" y="346" fill="#e9d5ff" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">KV cache</text>
+    <text x="30" y="366" fill="#c4b5fd" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">Full = lineal · SWA = ring 128 (F-11)</text>
+
+    <text x="20" y="400" fill="#93c5fd" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">ws[64] working-set temporal en prefill</text>
+  </g>
+
+  <g transform="translate(740,150)" filter="url(#soft)">
+    <!-- VRAM -->
+    <rect width="320" height="420" rx="16" fill="url(#vramG)" stroke="#34d399" stroke-width="1.5"/>
+    <text x="20" y="36" fill="#f1f5f9" font-size="18" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">③ GPU VRAM</text>
+    <text x="20" y="58" fill="#a7f3d0" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">COLI_CUDA · CUDA_DENSE · GPU-first</text>
+
+    <rect x="18" y="78" width="284" height="70" rx="8" fill="#064e3b" stroke="#6ee7b7"/>
+    <text x="30" y="102" fill="#d1fae5" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">Densas en device</text>
+    <text x="30" y="122" fill="#a7f3d0" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">upload eager · free host ~4.7 GB</text>
+    <text x="30" y="138" fill="#6ee7b7" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">QKV / o_proj / dense MLP / …</text>
+
+    <rect x="18" y="164" width="284" height="90" rx="8" fill="#065f46" stroke="#34d399"/>
+    <text x="30" y="190" fill="#d1fae5" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">gpu_pin (complementario)</text>
+    <text x="30" y="210" fill="#a7f3d0" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">~522 experts más calientes</text>
+    <text x="30" y="228" fill="#a7f3d0" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">~6.6 GB budget auto (3060 12 GB)</text>
+    <text x="30" y="246" fill="#6ee7b7" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">gpu_only: sin copia host</text>
+
+    <rect x="18" y="270" width="284" height="80" rx="8" fill="#022c22" stroke="#10b981" stroke-dasharray="4 3"/>
+    <text x="30" y="296" fill="#6ee7b7" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">moe_acc (decode S=1)</text>
+    <text x="30" y="316" fill="#a7f3d0" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">1× H2D x · N× swiglu async</text>
+    <text x="30" y="334" fill="#a7f3d0" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">1× D2H y por capa MoE</text>
+
+    <text x="20" y="380" fill="#6ee7b7" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">GEMV int4/int8 fused gate+up</text>
+    <text x="20" y="400" fill="#047857" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">CPU path si expert solo en RAM</text>
+  </g>
+
+  <!-- Arrows between columns -->
+  <path d="M360 300 H385" stroke="#67e8f9" stroke-width="2.5" marker-end="url(#arr)"/>
+  <path d="M710 300 H735" stroke="#67e8f9" stroke-width="2.5" marker-end="url(#arr)"/>
+  <text x="365" y="288" fill="#67e8f9" font-size="10" font-family="ui-sans-serif,system-ui,sans-serif">miss</text>
+  <text x="715" y="288" fill="#67e8f9" font-size="10" font-family="ui-sans-serif,system-ui,sans-serif">hot</text>
+
+  <!-- Token pipeline -->
+  <text x="40" y="600" fill="#f1f5f9" font-size="16" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">Pipeline por token (decode) — lo que hace peng con la geometría MiMo</text>
+
+  <g transform="translate(40,620)" filter="url(#soft)">
+    <rect width="1020" height="200" rx="14" fill="#0f172a" stroke="#334155"/>
+
+    <!-- steps -->
+    <rect x="20" y="30" width="130" height="90" rx="10" fill="#1e293b" stroke="#64748b"/>
+    <text x="85" y="60" text-anchor="middle" fill="#f8fafc" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">1. Embed</text>
+    <text x="85" y="82" text-anchor="middle" fill="#94a3b8" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">token → ℝᴰ</text>
+    <text x="85" y="100" text-anchor="middle" fill="#64748b" font-size="10" font-family="ui-sans-serif,system-ui,sans-serif">RAM/VRAM</text>
+
+    <path d="M155 75 H175" stroke="#fbbf24" stroke-width="2" marker-end="url(#arrY)"/>
+
+    <rect x="180" y="20" width="160" height="110" rx="10" fill="#1e3a5f" stroke="#3b82f6"/>
+    <text x="260" y="48" text-anchor="middle" fill="#93c5fd" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">2. ×48 capas</text>
+    <text x="260" y="70" text-anchor="middle" fill="#e2e8f0" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">attn (full o ring SWA)</text>
+    <text x="260" y="90" text-anchor="middle" fill="#e2e8f0" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">router → 8 experts</text>
+    <text x="260" y="110" text-anchor="middle" fill="#94a3b8" font-size="10" font-family="ui-sans-serif,system-ui,sans-serif">lookup VRAM→PIN→LRU→disk</text>
+
+    <path d="M345 75 H365" stroke="#fbbf24" stroke-width="2" marker-end="url(#arrY)"/>
+
+    <rect x="370" y="20" width="200" height="110" rx="10" fill="#3b0764" stroke="#a855f7"/>
+    <text x="470" y="48" text-anchor="middle" fill="#e9d5ff" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">3. Expert FFN</text>
+    <text x="470" y="70" text-anchor="middle" fill="#e2e8f0" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">GPU: moe_acc async</text>
+    <text x="470" y="90" text-anchor="middle" fill="#e2e8f0" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">CPU: matmul int4 (IDOT)</text>
+    <text x="470" y="110" text-anchor="middle" fill="#c4b5fd" font-size="10" font-family="ui-sans-serif,system-ui,sans-serif">overlap GPU || CPU (#71)</text>
+
+    <path d="M575 75 H595" stroke="#fbbf24" stroke-width="2" marker-end="url(#arrY)"/>
+
+    <rect x="600" y="30" width="140" height="90" rx="10" fill="#14532d" stroke="#22c55e"/>
+    <text x="670" y="60" text-anchor="middle" fill="#bbf7d0" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">4. lm_head</text>
+    <text x="670" y="82" text-anchor="middle" fill="#86efac" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">logits |V|</text>
+    <text x="670" y="100" text-anchor="middle" fill="#64748b" font-size="10" font-family="ui-sans-serif,system-ui,sans-serif">sample / greedy</text>
+
+    <path d="M745 75 H765" stroke="#fbbf24" stroke-width="2" marker-end="url(#arrY)"/>
+
+    <rect x="770" y="30" width="220" height="90" rx="10" fill="#422006" stroke="#f59e0b"/>
+    <text x="880" y="55" text-anchor="middle" fill="#fde68a" font-size="12" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">5. Anticipación I/O</text>
+    <text x="880" y="78" text-anchor="middle" fill="#fef3c7" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">PREFETCH sticky · PILOT L+1</text>
+    <text x="880" y="98" text-anchor="middle" fill="#fcd34d" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">heat_prefetch · REPIN VRAM</text>
+
+    <text x="30" y="160" fill="#94a3b8" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">
+      Cuantización: experts int4 (container) · densas int8 típico · I/O embed/lm_head alto · bit-exact en perfil exact (oracle tiny)
+    </text>
+    <text x="30" y="182" fill="#64748b" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">
+      Cascada de residencia (por capa, por expert id): gpu_pin → pin RAM → ecache LRU → pread disco · tiers disjuntos
+    </text>
+  </g>
+
+  <!-- Comparison callout -->
+  <g transform="translate(40,840)" filter="url(#soft)">
+    <rect width="500" height="100" rx="12" fill="#0f172a" stroke="#475569"/>
+    <text x="16" y="28" fill="#f87171" font-size="13" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">Geometría lógica MiMo</text>
+    <text x="16" y="52" fill="#e2e8f0" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">“Todo el modelo es un grafo denso de tensores en memoria”</text>
+    <text x="16" y="74" fill="#94a3b8" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">311B en VRAM/RAM unificada (servidor / card grande)</text>
+  </g>
+  <g transform="translate(560,840)" filter="url(#soft)">
+    <rect width="500" height="100" rx="12" fill="#0f172a" stroke="#22c55e"/>
+    <text x="16" y="28" fill="#4ade80" font-size="13" font-weight="700" font-family="ui-sans-serif,system-ui,sans-serif">Geometría física peng</text>
+    <text x="16" y="52" fill="#e2e8f0" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">“Solo ~15B de trabajo + caché de experts calientes”</text>
+    <text x="16" y="74" fill="#94a3b8" font-size="12" font-family="ui-sans-serif,system-ui,sans-serif">desktop 16–32 GB RAM + 12 GB VRAM + NVMe · ~0.5–0.6 tok/s frío</text>
+  </g>
+
+  <text x="40" y="965" fill="#475569" font-size="11" font-family="ui-sans-serif,system-ui,sans-serif">peng-mimo · docs/diagrams/peng-mimo-geometry.svg · números típicos de findings §25–§29 (RTX 3060 12 GB · ~23 GB RAM)</text>
+</svg>

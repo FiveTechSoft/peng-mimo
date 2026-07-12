@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MiMo vs peng-mimo — geometría 3D</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: #0f172ae6;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --full: #3b82f6;
+      --swa: #14b8a6;
+      --moe: #a855f7;
+      --disk: #64748b;
+      --vram: #10b981;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+      font-family: ui-sans-serif, system-ui, Segoe UI, sans-serif; overflow: hidden; }
+    #c { position: absolute; inset: 0; }
+    .ui {
+      position: absolute; z-index: 2; left: 16px; top: 16px; width: min(380px, 92vw);
+      background: var(--panel); border: 1px solid #334155; border-radius: 14px;
+      padding: 14px 16px; backdrop-filter: blur(10px); max-height: calc(100vh - 32px); overflow: auto;
+    }
+    h1 { font-size: 1.05rem; margin: 0 0 6px; }
+    p { margin: 0 0 10px; color: var(--muted); font-size: 0.85rem; line-height: 1.4; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+    button {
+      flex: 1; border: 1px solid #475569; background: #1e293b; color: var(--text);
+      border-radius: 10px; padding: 10px 8px; cursor: pointer; font-weight: 600; font-size: 0.85rem;
+    }
+    button.active { border-color: var(--accent); background: #0c4a6e; color: #e0f2fe; }
+    button:hover { filter: brightness(1.1); }
+    .legend { display: grid; grid-template-columns: 14px 1fr; gap: 6px 10px; align-items: center;
+      font-size: 0.8rem; margin-top: 8px; }
+    .sw { width: 14px; height: 14px; border-radius: 3px; }
+    .hint { margin-top: 12px; font-size: 0.75rem; color: #64748b; }
+    a { color: var(--accent); }
+    .stat { font-family: ui-monospace, Consolas, monospace; font-size: 0.78rem; color: #cbd5e1;
+      background: #020617; border-radius: 8px; padding: 8px 10px; margin-top: 10px; line-height: 1.45; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div class="ui">
+    <h1>Geometría MiMo ↔ peng</h1>
+    <p>Vista 3D instructiva. Misma arquitectura lógica; distinta <b>residencia física</b> de los tensores.</p>
+    <div class="tabs">
+      <button type="button" id="btn-mimo" class="active">MiMo lógico</button>
+      <button type="button" id="btn-peng">peng físico</button>
+    </div>
+    <div id="desc" class="stat"></div>
+    <div class="legend" id="legend"></div>
+    <p class="hint">Arrastra para orbitar · rueda zoom · SVG estáticos en el README:
+      <a href="mimo-geometry.svg">mimo-geometry.svg</a> ·
+      <a href="peng-mimo-geometry.svg">peng-mimo-geometry.svg</a>
+    </p>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const canvas = document.getElementById('c');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setClearColor(0x0b1220, 1);
+
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.Fog(0x0b1220, 28, 70);
+
+    const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 200);
+    camera.position.set(14, 10, 18);
+
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true;
+    controls.target.set(0, 3, 0);
+
+    scene.add(new THREE.AmbientLight(0x88aacc, 0.55));
+    const key = new THREE.DirectionalLight(0xffffff, 1.1);
+    key.position.set(8, 16, 10);
+    scene.add(key);
+    const fill = new THREE.DirectionalLight(0x38bdf8, 0.35);
+    fill.position.set(-10, 4, -6);
+    scene.add(fill);
+
+    const grid = new THREE.GridHelper(40, 40, 0x1e293b, 0x172033);
+    grid.position.y = -0.02;
+    scene.add(grid);
+
+    // Full attention indices for 48-layer MiMo pattern
+    const FULL = new Set([0, 5, 11, 17, 23, 29, 35, 41, 47]);
+    const COL = {
+      full: 0x3b82f6,
+      swa: 0x14b8a6,
+      dense: 0xf59e0b,
+      moe: 0xa855f7,
+      disk: 0x475569,
+      pin: 0x2563eb,
+      lru: 0x6366f1,
+      vram: 0x10b981,
+      cpu: 0xf59e0b,
+      cold: 0x1e293b,
+    };
+
+    let root = new THREE.Group();
+    scene.add(root);
+    let mode = 'mimo';
+
+    function clearRoot() {
+      scene.remove(root);
+      root.traverse(o => {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) {
+          if (Array.isArray(o.material)) o.material.forEach(m => m.dispose());
+          else o.material.dispose();
+        }
+      });
+      root = new THREE.Group();
+      scene.add(root);
+    }
+
+    function box(w, h, d, color, opacity = 1) {
+      const g = new THREE.BoxGeometry(w, h, d);
+      const m = new THREE.MeshStandardMaterial({
+        color, transparent: opacity < 1, opacity,
+        roughness: 0.45, metalness: 0.15,
+      });
+      return new THREE.Mesh(g, m);
+    }
+
+    function makeLabelTexture(text, color = '#e2e8f0') {
+      const c = document.createElement('canvas');
+      c.width = 512; c.height = 128;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      ctx.fillStyle = 'rgba(15,23,42,0.0)';
+      ctx.fillRect(0, 0, c.width, c.height);
+      ctx.font = 'bold 36px system-ui,sans-serif';
+      ctx.fillStyle = color;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(text, 256, 64);
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+
+    function sprite(text, color, scale = 2.2) {
+      const mat = new THREE.SpriteMaterial({
+        map: makeLabelTexture(text, color),
+        transparent: true, depthWrite: false,
+      });
+      const s = new THREE.Sprite(mat);
+      s.scale.set(scale, scale * 0.28, 1);
+      return s;
+    }
+
+    function buildMimo() {
+      clearRoot();
+      const g = root;
+      // vertical stack of 48 layers
+      const n = 48;
+      for (let i = 0; i < n; i++) {
+        const y = i * 0.22;
+        const isFull = FULL.has(i);
+        const isDense0 = i === 0;
+        const color = isDense0 ? COL.dense : (isFull ? COL.full : COL.swa);
+        const layer = box(4.2, 0.16, 2.4, color, 0.95);
+        layer.position.set(0, y, 0);
+        g.add(layer);
+
+        // MoE fan for sparse layers (all except 0 conceptually)
+        if (i > 0 && i % 4 === 0) {
+          const moe = box(1.1, 0.12, 1.1, COL.moe, 0.85);
+          moe.position.set(3.2, y, 0);
+          g.add(moe);
+          // tiny expert dots
+          for (let e = 0; e < 8; e++) {
+            const ang = (e / 8) * Math.PI * 2;
+            const d = box(0.18, 0.08, 0.18, COL.moe, 0.7);
+            d.position.set(3.2 + Math.cos(ang) * 0.85, y, Math.sin(ang) * 0.85);
+            g.add(d);
+          }
+        }
+      }
+
+      // Attention type banners
+      const fullPlate = box(5.2, 0.05, 0.35, COL.full, 0.5);
+      fullPlate.position.set(0, 47 * 0.22 + 0.5, -2.0);
+      g.add(fullPlate);
+
+      // Embed / lm_head
+      const emb = box(4.2, 0.35, 2.4, 0x64748b, 0.9);
+      emb.position.set(0, -0.6, 0);
+      g.add(emb);
+      const head = box(4.2, 0.35, 2.4, 0x94a3b8, 0.9);
+      head.position.set(0, 47 * 0.22 + 0.8, 0);
+      g.add(head);
+
+      const t0 = sprite('embed', '#94a3b8', 2.4);
+      t0.position.set(-3.5, -0.6, 0); g.add(t0);
+      const t1 = sprite('lm_head', '#94a3b8', 2.4);
+      t1.position.set(-3.5, 47 * 0.22 + 0.8, 0); g.add(t1);
+      const t2 = sprite('48 layers · hybrid GQA', '#e2e8f0', 3.6);
+      t2.position.set(0, 47 * 0.22 + 1.6, 0); g.add(t2);
+      const t3 = sprite('MoE top-8 / 256', '#d8b4fe', 2.8);
+      t3.position.set(4.8, 5, 0); g.add(t3);
+
+      // Context rings for SWA vs full
+      const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(1.6, 0.06, 8, 48),
+        new THREE.MeshStandardMaterial({ color: COL.swa, emissive: COL.swa, emissiveIntensity: 0.2 })
+      );
+      ring.rotation.x = Math.PI / 2;
+      ring.position.set(-6.5, 4, 0);
+      g.add(ring);
+      const disk = new THREE.Mesh(
+        new THREE.CircleGeometry(2.4, 48),
+        new THREE.MeshStandardMaterial({ color: COL.full, transparent: true, opacity: 0.25, side: THREE.DoubleSide })
+      );
+      disk.rotation.x = -Math.PI / 2;
+      disk.position.set(-6.5, 2.2, 0);
+      g.add(disk);
+      const tc = sprite('SWA ring 128', '#5eead4', 2.2);
+      tc.position.set(-6.5, 5.5, 0); g.add(tc);
+      const tf = sprite('Full KV', '#93c5fd', 2.0);
+      tf.position.set(-6.5, 1.4, 0); g.add(tf);
+
+      controls.target.set(0, 5, 0);
+      camera.position.set(12, 9, 16);
+      setPanel(
+        `MiMo-V2.5 · geometría lógica\n` +
+        `• 48 capas: 9 full (azul) + 39 SWA-128 (verde)\n` +
+        `• Capa 0 densa (ámbar); 1–47 MoE\n` +
+        `• 256 experts/capa, top-8 · ~15B activos/token\n` +
+        `• GQA: 64Q · 4KV full / 8KV SWA\n` +
+        `• QKV fuso · RoPE parcial · V×0.707`,
+        [
+          [COL.full, 'Full attention (9)'],
+          [COL.swa, 'SWA-128 (39)'],
+          [COL.dense, 'Capa 0 MLP densa'],
+          [COL.moe, 'Experts activos (top-8)'],
+        ]
+      );
+    }
+
+    function buildPeng() {
+      clearRoot();
+      const g = root;
+
+      // Disk base
+      const disk = box(14, 0.5, 8, COL.disk, 0.95);
+      disk.position.set(0, 0.25, 0);
+      g.add(disk);
+      // many expert "cells" on disk
+      for (let i = 0; i < 80; i++) {
+        const x = -6 + (i % 16) * 0.78;
+        const z = -3 + Math.floor(i / 16) * 0.9;
+        const c = box(0.55, 0.18, 0.55, 0x334155, 0.85);
+        c.position.set(x, 0.6, z);
+        g.add(c);
+      }
+      g.add(Object.assign(sprite('NVMe · 12 032 experts int4', '#cbd5e1', 4.5), { position: new THREE.Vector3(0, 1.3, -4.2) }));
+
+      // RAM tower
+      const ram = box(4.5, 5.5, 3.2, COL.pin, 0.55);
+      ram.position.set(-4.5, 3.5, 5.5);
+      g.add(ram);
+      const pin = box(3.8, 1.4, 2.6, 0x1d4ed8, 0.95);
+      pin.position.set(-4.5, 2.2, 5.5);
+      g.add(pin);
+      const lru = box(3.8, 1.1, 2.6, COL.lru, 0.9);
+      lru.position.set(-4.5, 3.8, 5.5);
+      g.add(lru);
+      const dens = box(3.8, 1.0, 2.6, COL.cpu, 0.85);
+      dens.position.set(-4.5, 5.3, 5.5);
+      g.add(dens);
+      g.add(Object.assign(sprite('RAM pin / LRU / densas', '#93c5fd', 3.2), { position: new THREE.Vector3(-4.5, 6.6, 5.5) }));
+
+      // VRAM tower
+      const vram = box(4.5, 4.2, 3.2, COL.vram, 0.5);
+      vram.position.set(4.5, 2.9, 5.5);
+      g.add(vram);
+      const gd = box(3.8, 1.2, 2.6, 0x059669, 0.95);
+      gd.position.set(4.5, 2.0, 5.5);
+      g.add(gd);
+      const ge = box(3.8, 1.8, 2.6, 0x34d399, 0.9);
+      ge.position.set(4.5, 3.7, 5.5);
+      g.add(ge);
+      g.add(Object.assign(sprite('VRAM densas + gpu_pin', '#6ee7b7', 3.2), { position: new THREE.Vector3(4.5, 5.5, 5.5) }));
+
+      // streaming arcs (disk -> RAM / VRAM)
+      const curve1 = new THREE.QuadraticBezierCurve3(
+        new THREE.Vector3(0, 0.8, 0),
+        new THREE.Vector3(-2, 4, 2),
+        new THREE.Vector3(-4.5, 3.0, 4.2)
+      );
+      const curve2 = new THREE.QuadraticBezierCurve3(
+        new THREE.Vector3(0, 0.8, 0),
+        new THREE.Vector3(2, 4, 2),
+        new THREE.Vector3(4.5, 3.2, 4.2)
+      );
+      for (const curve of [curve1, curve2]) {
+        const pts = curve.getPoints(40);
+        const geo = new THREE.BufferGeometry().setFromPoints(pts);
+        const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: 0x22d3ee }));
+        g.add(line);
+      }
+      g.add(Object.assign(sprite('pread miss', '#67e8f9', 2.2), { position: new THREE.Vector3(0, 3.5, 1.5) }));
+
+      // compute node
+      const cpu = box(3, 1.2, 2, COL.cpu, 0.9);
+      cpu.position.set(0, 7.2, 5.5);
+      g.add(cpu);
+      g.add(Object.assign(sprite('matmul CPU || CUDA moe_acc', '#fde68a', 3.8), { position: new THREE.Vector3(0, 8.3, 5.5) }));
+
+      // layer stack mini (logical still there)
+      for (let i = 0; i < 24; i++) {
+        const isFull = FULL.has(i * 2);
+        const b = box(1.6, 0.12, 0.7, isFull ? COL.full : COL.swa, 0.8);
+        b.position.set(0, 1.8 + i * 0.16, 8.5);
+        g.add(b);
+      }
+      g.add(Object.assign(sprite('grafo lógico intacto', '#e2e8f0', 2.8), { position: new THREE.Vector3(0, 6.2, 8.5) }));
+
+      controls.target.set(0, 3, 3);
+      camera.position.set(16, 11, 14);
+      setPanel(
+        `peng-mimo · geometría física\n` +
+        `• Disco: container int4 (experts en shards)\n` +
+        `• RAM: densas + PIN aprendido + LRU (ecap)\n` +
+        `• VRAM: densas + ~522 experts GPU-first\n` +
+        `• Miss: pread → matmul; hit: sin I/O\n` +
+        `• SWA KV ring 128 · PREFETCH/PILOT/REPIN\n` +
+        `• Techo frío ~0.5–0.6 tok/s (23GB+3060)`,
+        [
+          [COL.disk, 'Experts fríos en NVMe'],
+          [COL.pin, 'RAM pin / densas host'],
+          [COL.lru, 'LRU por capa'],
+          [COL.vram, 'VRAM densas + gpu_pin'],
+          [COL.cpu, 'Compute host / CUDA'],
+          [COL.full, 'Capa full (lógica)'],
+          [COL.swa, 'Capa SWA (lógica)'],
+        ]
+      );
+    }
+
+    function setPanel(text, legend) {
+      document.getElementById('desc').textContent = text;
+      const leg = document.getElementById('legend');
+      leg.innerHTML = '';
+      for (const [c, label] of legend) {
+        const sw = document.createElement('div');
+        sw.className = 'sw';
+        sw.style.background = '#' + c.toString(16).padStart(6, '0');
+        const t = document.createElement('div');
+        t.textContent = label;
+        leg.append(sw, t);
+      }
+    }
+
+    function setMode(m) {
+      mode = m;
+      document.getElementById('btn-mimo').classList.toggle('active', m === 'mimo');
+      document.getElementById('btn-peng').classList.toggle('active', m === 'peng');
+      if (m === 'mimo') buildMimo();
+      else buildPeng();
+    }
+
+    document.getElementById('btn-mimo').onclick = () => setMode('mimo');
+    document.getElementById('btn-peng').onclick = () => setMode('peng');
+
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    setMode('mimo');
+
+    (function anim() {
+      requestAnimationFrame(anim);
+      root.rotation.y += 0.0012;
+      controls.update();
+      renderer.render(scene, camera);
+    })();
+  </script>
+</body>
+</html>
