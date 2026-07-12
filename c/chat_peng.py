@@ -80,6 +80,9 @@ def build_env(args) -> dict:
         "I4S": os.environ.get("I4S", "1"),
         "OVERLAP": os.environ.get("OVERLAP", "1"),
         "MEMWATCH": os.environ.get("MEMWATCH", "1"),
+        "TRAJ": os.environ.get("TRAJ", "1"),
+        "TRAJ_K": os.environ.get("TRAJ_K", "8"),
+        "TRAJ_DEPTH": os.environ.get("TRAJ_DEPTH", "2"),
     })
     # Domain heat map (colibri #71): chat vs code vs … do not share pin history
     prof = getattr(args, "profile", None) or os.environ.get("COLI_PROFILE") or os.environ.get("PENG_PROFILE")

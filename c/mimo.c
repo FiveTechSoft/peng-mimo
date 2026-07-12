@@ -57,6 +57,8 @@ static void *pilot_m=NULL;                        /* Model* (defined later); cas
 static int  pilot_pred[256][64];                  /* LOOKA: predicted top-K per layer */
 static int  pilot_pred_kt[256];
 static long looka_hit=0, looka_tot=0;
+/* Trajectory bulk WILLNEED (TRAJ=): knobs only; impl after Model. */
+static int g_traj=-1, g_traj_k=8, g_traj_depth=2;
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
@@ -175,6 +177,9 @@ typedef struct {
     int rope_cap, rope_rd_full, rope_rd_swa;
 } Model;
 
+static void traj_observe_layer(Model *m, int layer, const int *idx, int Ke);
+static void traj_commit_prev(Model *m);
+static void traj_warm(Model *m, int k_per_layer);
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
 static double now_s(void);               /* monotonic seconds; defined below CUDA helpers */
 /* DRAFT must be visible before cuda_upload_dense_all (MTP densas only when >0). */
@@ -1529,6 +1534,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             m->eusage[layer][idx[kk]]++;
             if(m->eheat[layer][idx[kk]]<UINT32_MAX) m->eheat[layer][idx[kk]]++;
         }
+        /* Trajectory: learn co-activations (I/O predictor; lossless) */
+        if(g_traj>0 && s==S-1) traj_observe_layer(m, layer, idx, Ke);
         if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
         for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
@@ -1817,6 +1824,11 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
         layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
+    }
+    /* Snapshot routes for next-token Markov; warm predicted path for the next step. */
+    if(g_traj>0){
+        traj_commit_prev(m);
+        if(S==1) traj_warm(m, g_traj_k);   /* decode: prepare next token */
     }
     free(nrm); free(tmp);
 }
@@ -2343,9 +2355,150 @@ static int repin_pick_gpu(Model *m, RepinCand *out, int maxc){
     return nb;
 }
 #endif
+/* ---- TRAJECTORY predictor (I/O only, never changes tokens) ----------------------------
+ * Learn co-activations: (1) same layer next token, (2) layer L → L+1 same token.
+ * Bulk WILLNEED the predicted path so cold misses become warm hits.
+ * Env: TRAJ=1 (default ON in SERVE), TRAJ_K=8, TRAJ_DEPTH=2, TRAJ=0 off. */
+#define TRAJ_LMAX 128
+#define TRAJ_EMAX 256
+#define TRAJ_SUC  8
+typedef struct { int16_t e; uint32_t c; } TrajEdge;
+static TrajEdge g_traj_tok[TRAJ_LMAX][TRAJ_EMAX][TRAJ_SUC];
+static TrajEdge g_traj_lay[TRAJ_LMAX][TRAJ_EMAX][TRAJ_SUC];
+static int g_traj_prev[TRAJ_LMAX][64], g_traj_prev_n[TRAJ_LMAX];
+static int g_traj_have_prev=0;
+static long g_traj_warm_n=0;
+static void traj_bump(TrajEdge suc[TRAJ_SUC], int e2){
+    if(e2<0 || e2>=TRAJ_EMAX) return;
+    int slot=-1, empty=-1;
+    for(int i=0;i<TRAJ_SUC;i++){
+        if(suc[i].e==e2){ slot=i; break; }
+        if(suc[i].c==0 && empty<0) empty=i;
+    }
+    if(slot<0){
+        if(empty>=0){ suc[empty].e=(int16_t)e2; suc[empty].c=1; return; }
+        int w=0; for(int i=1;i<TRAJ_SUC;i++) if(suc[i].c<suc[w].c) w=i;
+        suc[w].e=(int16_t)e2; suc[w].c=1; return;
+    }
+    if(suc[slot].c<UINT32_MAX) suc[slot].c++;
+}
+static void traj_observe_layer(Model *m, int layer, const int *idx, int Ke){
+    if(g_traj<=0 || !idx || Ke<1 || layer<0 || layer>=TRAJ_LMAX) return;
+    if(Ke>64) Ke=64;
+    if(layer>0 && m->L[layer-1].sparse && m->enr[layer-1]>0){
+        int lp=layer-1; int n0=m->enr[lp]; if(n0>64) n0=64;
+        for(int i=0;i<n0;i++){
+            int e0=m->eroute[lp][i]; if(e0<0||e0>=TRAJ_EMAX) continue;
+            for(int j=0;j<Ke;j++) traj_bump(g_traj_lay[lp][e0], idx[j]);
+        }
+    }
+    if(g_traj_have_prev && g_traj_prev_n[layer]>0){
+        int n0=g_traj_prev_n[layer]; if(n0>64) n0=64;
+        for(int i=0;i<n0;i++){
+            int e0=g_traj_prev[layer][i]; if(e0<0||e0>=TRAJ_EMAX) continue;
+            for(int j=0;j<Ke;j++) traj_bump(g_traj_tok[layer][e0], idx[j]);
+        }
+    }
+}
+static void traj_commit_prev(Model *m){
+    if(g_traj<=0 || !m) return;
+    Cfg *c=&m->c;
+    for(int l=0;l<c->n_layers && l<TRAJ_LMAX;l++){
+        if(!m->L[l].sparse){ g_traj_prev_n[l]=0; continue; }
+        int n=m->enr[l]; if(n<0) n=0; if(n>64) n=64;
+        g_traj_prev_n[l]=n;
+        for(int i=0;i<n;i++) g_traj_prev[l][i]=m->eroute[l][i];
+    }
+    g_traj_have_prev=1;
+}
+static void traj_warm(Model *m, int k_per_layer){
+    if(g_traj<=0 || !m || k_per_layer<1) return;
+    Cfg *c=&m->c;
+    int kk=k_per_layer<32?k_per_layer:32;
+    int depth=g_traj_depth<1?1:(g_traj_depth>4?4:g_traj_depth);
+    for(int l=0;l<c->n_layers && l<TRAJ_LMAX;l++){
+        if(!m->L[l].sparse) continue;
+        int E=c->n_experts; if(E>TRAJ_EMAX) E=TRAJ_EMAX;
+        float score[TRAJ_EMAX];
+        for(int e=0;e<E;e++){
+            uint32_t h = (m->eheat && m->eheat[l]) ? m->eheat[l][e]
+                        : (m->eusage && m->eusage[l] ? m->eusage[l][e] : 0);
+            score[e]=(float)h;
+        }
+        int nsticky=0; int sticky[64];
+        if(m->enr[l]>0){
+            nsticky=m->enr[l]<64?m->enr[l]:64;
+            for(int i=0;i<nsticky;i++){
+                sticky[i]=m->eroute[l][i];
+                if(sticky[i]>=0 && sticky[i]<E) score[sticky[i]] += 1e7f;
+            }
+        } else if(g_traj_prev_n[l]>0){
+            nsticky=g_traj_prev_n[l]<64?g_traj_prev_n[l]:64;
+            for(int i=0;i<nsticky;i++){
+                sticky[i]=g_traj_prev[l][i];
+                if(sticky[i]>=0 && sticky[i]<E) score[sticky[i]] += 1e7f;
+            }
+        }
+        for(int i=0;i<nsticky;i++){
+            int e0=sticky[i]; if(e0<0||e0>=E) continue;
+            for(int s=0;s<TRAJ_SUC;s++){
+                TrajEdge ed=g_traj_tok[l][e0][s];
+                if(ed.c==0 || ed.e<0 || ed.e>=E) continue;
+                score[ed.e] += 100.f * (float)ed.c;
+            }
+            if(l+1<c->n_layers && m->L[l+1].sparse){
+                for(int s=0;s<TRAJ_SUC;s++){
+                    TrajEdge ed=g_traj_lay[l][e0][s];
+                    if(ed.c==0 || ed.e<0 || ed.e>=c->n_experts || ed.e>=TRAJ_EMAX) continue;
+                    expert_prefetch(m, l+1, ed.e);
+                    g_traj_warm_n++;
+                }
+            }
+        }
+        int frontier[32]; int nf=0;
+        for(int t=0;t<kk && t<32;t++){
+            int best=-1; float bv=-1.f;
+            for(int e=0;e<E;e++){
+                int skip=0; for(int j=0;j<nf;j++) if(frontier[j]==e){skip=1;break;}
+                if(skip) continue;
+                if(score[e]>bv){ bv=score[e]; best=e; }
+            }
+            if(best<0 || bv<=0) break;
+            frontier[nf++]=best;
+        }
+        for(int d=1;d<depth;d++){
+            int nadd=nf;
+            for(int i=0;i<nadd;i++){
+                int e0=frontier[i];
+                for(int s=0;s<TRAJ_SUC;s++){
+                    TrajEdge ed=g_traj_tok[l][e0][s];
+                    if(ed.c==0 || ed.e<0 || ed.e>=E) continue;
+                    score[ed.e] += (50.f/(float)d) * (float)ed.c;
+                }
+            }
+            nf=0;
+            for(int t=0;t<kk && t<32;t++){
+                int best=-1; float bv=-1.f;
+                for(int e=0;e<E;e++){
+                    int skip=0; for(int j=0;j<nf;j++) if(frontier[j]==e){skip=1;break;}
+                    if(skip) continue;
+                    if(score[e]>bv){ bv=score[e]; best=e; }
+                }
+                if(best<0 || bv<=0) break;
+                frontier[nf++]=best;
+            }
+        }
+        for(int i=0;i<nf;i++){
+            if(expert_resident(m,l,frontier[i])) continue;
+            expert_prefetch(m,l,frontier[i]);
+            g_traj_warm_n++;
+        }
+    }
+}
+
 /* Proactive cache warm (literature: ProMoE / FineMoE heat maps): WILLNEED the
  * hottest non-resident experts per layer so the next tokens hit page cache.
- * Pure I/O hint — free if already warm. */
+ * Pure I/O hint — free if already warm. Also runs trajectory bulk warm (TRAJ). */
 static void heat_prefetch_top(Model *m, int k_per_layer){
     if(!m || k_per_layer<1) return;
     Cfg *c=&m->c;
@@ -2367,6 +2520,8 @@ static void heat_prefetch_top(Model *m, int k_per_layer){
             expert_prefetch(m,l,best);
         }
     }
+    /* Trajectory bulk: sticky + heat + Markov successors across layers/tokens */
+    if(g_traj>0) traj_warm(m, g_traj_k>k_per_layer?g_traj_k:k_per_layer);
 }
 
 /* ---- RAM DINAMICA a runtime (colibri #71 / Fase 4) ----
@@ -3018,6 +3173,14 @@ int main(int argc, char **argv){
     }
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):(serve_mode?32:0);
     g_memwatch = getenv("MEMWATCH")?atoi(getenv("MEMWATCH")):1;  /* #71: adapt ecap each SERVE turn */
+    /* Trajectory bulk WILLNEED: default ON for SERVE (multi-turn hit); off for oracle/TF */
+    if(getenv("TRAJ")) g_traj=atoi(getenv("TRAJ"));
+    else g_traj = serve_mode ? 1 : 0;
+    if(getenv("TRAJ_K")){ g_traj_k=atoi(getenv("TRAJ_K")); if(g_traj_k<1)g_traj_k=1; if(g_traj_k>32)g_traj_k=32; }
+    if(getenv("TRAJ_DEPTH")){ g_traj_depth=atoi(getenv("TRAJ_DEPTH")); if(g_traj_depth<1)g_traj_depth=1; if(g_traj_depth>4)g_traj_depth=4; }
+    if(g_traj>0)
+        fprintf(stderr,"[TRAJ] bulk expert path WILLNEED on (K=%d depth=%d; TRAJ=0 off)\n",
+                g_traj_k, g_traj_depth);
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.95f;  /* 0.95 = generation_config MiMo-V2.5 */
     g_looka = getenv("LOOKA")?1:0;                    /* PILOT accuracy measurement (no prefetch) */

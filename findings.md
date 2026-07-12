@@ -630,6 +630,24 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 31. Trajectory bulk WILLNEED (2026-07-12) — predictive expert path
+
+**Idea:** learn which experts co-activate (same layer next token + layer L→L+1), then bulk `posix_fadvise(WILLNEED)` the predicted path so disk misses become warm hits. **I/O only — never changes tokens.**
+
+**Code (`TRAJ=1` default ON in SERVE):**
+
+- `traj_observe_layer` while routing: Markov edges `tok[L][e→e']` and `lay[L][e→e'@L+1]`.
+- After each decode step: `traj_commit_prev` + `traj_warm` (sticky + heat + Markov unroll `TRAJ_DEPTH`).
+- Turn start: `heat_prefetch_top` also calls `traj_warm`.
+- Knobs: `TRAJ=0` off, `TRAJ_K=8`, `TRAJ_DEPTH=2`. `chat_peng` enables TRAJ by default.
+
+```bash
+TRAJ=1 TRAJ_K=8 SERVE=1 … ./mimo 64 4 8
+# stderr: [TRAJ] bulk expert path WILLNEED on (K=8 depth=2; TRAJ=0 off)
+```
+
+**Expected win:** multi-turn / chat (learned routes) — higher hit, less expert-disk. Cold single-shot PROMPT gains little until heat accumulates.
+
 ### 30. COLI_PROFILE + mem_watch polish (colibri #71 remainder, 2026-07-12)
 
 **Code:**
