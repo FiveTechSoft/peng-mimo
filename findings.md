@@ -655,6 +655,7 @@ TRAJ=1 TRAJ_K=8 COLI_PROFILE=chat SERVE=1 … ./mimo 64 4 8
 
 - Session 1: planted 4 edges → `[TRAJ] loaded 4` → gen → `[TRAJ] saved 13532` (~215 KB).
 - Session 2: `[TRAJ] loaded 13532` → gen → `[TRAJ] saved 14004`. Atomic rename + profile path OK.
+- **Boot warm:** after pin+cap, `heat_prefetch_top` + Markov-without-sticky → `[TRAJ] boot warm +1848 hints` before first prefill. Session reload: `loaded 14004` then boot warm then save.
 
 ### 30. COLI_PROFILE + mem_watch polish (colibri #71 remainder, 2026-07-12)
 

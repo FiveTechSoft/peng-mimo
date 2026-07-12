@@ -2505,6 +2505,37 @@ static void traj_warm(Model *m, int k_per_layer){
                 if(sticky[i]>=0 && sticky[i]<E) score[sticky[i]] += 1e7f;
             }
         }
+        /* Cold boot / first token: no sticky yet — still use persisted Markov mass so
+         * WILLNEED runs while pin/setup finishes (page cache ready before prefill). */
+        if(nsticky==0){
+            for(int e0=0;e0<E;e0++){
+                for(int s=0;s<TRAJ_SUC;s++){
+                    TrajEdge ed=g_traj_tok[l][e0][s];
+                    if(ed.c && ed.e>=0 && ed.e<E){
+                        score[ed.e] += 80.f * (float)ed.c;
+                        score[e0]   += 8.f  * (float)ed.c; /* source likely active too */
+                    }
+                }
+            }
+            /* WILLNEED strongest L→L+1 edges from any source (boot has no sticky). */
+            {
+                int best_e[32]; uint32_t best_c[32]; int nb=0;
+                for(int e0=0;e0<E;e0++) for(int s=0;s<TRAJ_SUC;s++){
+                    TrajEdge el=g_traj_lay[l][e0][s];
+                    if(el.c==0 || el.e<0 || el.e>=c->n_experts || el.e>=TRAJ_EMAX) continue;
+                    if(nb<32){ best_e[nb]=el.e; best_c[nb]=(uint32_t)el.c; nb++; }
+                    else {
+                        int w=0; for(int i=1;i<32;i++) if(best_c[i]<best_c[w]) w=i;
+                        if((uint32_t)el.c>best_c[w]){ best_e[w]=el.e; best_c[w]=(uint32_t)el.c; }
+                    }
+                }
+                for(int i=0;i<nb;i++){
+                    if(expert_resident(m,l+1,best_e[i])) continue;
+                    expert_prefetch(m,l+1,best_e[i]);
+                    g_traj_warm_n++;
+                }
+            }
+        }
         for(int i=0;i<nsticky;i++){
             int e0=sticky[i]; if(e0<0||e0>=E) continue;
             for(int s=0;s<TRAJ_SUC;s++){
@@ -3353,7 +3384,17 @@ int main(int argc, char **argv){
       }
       /* SEMPRE: senza clamp la LRU cresce fino a cap*76 layer = decine di GB -> OOM-kill.
        * RAM_GB assente o <=0 = budget automatico da MemAvailable. */
-      cap_for_ram(&m, ram_env, ebits, est_ctx); }
+      cap_for_ram(&m, ram_env, ebits, est_ctx);
+      /* After pin+cap: async WILLNEED from usage heat + loaded TRAJ while we still have
+       * wall-clock before first prefill (SERVE READY / PROMPT encode). Free if cold. */
+      if(g_traj>0){
+          long w0=g_traj_warm_n;
+          heat_prefetch_top(&m, g_traj_k>4?g_traj_k:4);
+          if(g_traj_warm_n>w0)
+              fprintf(stderr,"[TRAJ] boot warm +%ld hints (total willneed_calls=%ld)\n",
+                      g_traj_warm_n-w0, g_traj_warm_n);
+      }
+    }
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
