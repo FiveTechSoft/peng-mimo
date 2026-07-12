@@ -61,6 +61,9 @@ static long looka_hit=0, looka_tot=0;
 static int g_traj=-1, g_traj_k=8, g_traj_depth=2;
 static int g_flow=1, g_flow_r=2;                 /* FLOW pathpack channel thaw (Corriente) */
 static double g_energy_gb=-1;                    /* ENERGY: channel→VRAM (-1 auto, 0 off, >0 GB) */
+static int g_traj_warm_every=1;                  /* decode: run traj_warm every N tokens (2=half cost) */
+static int g_pp_every=4;                         /* rebuild pathpack every N usage_save (not each) */
+static int g_pp_save_i=0;
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
@@ -175,6 +178,7 @@ typedef struct {
     uint64_t n_fw, n_emit;                       /* metodo E: forward de decode / token emessi */
     double t_edisk, t_emm, t_attn, t_head;       /* profiling: dove va il tempo (sempre attivo) */
     double t_router, t_cuda_copy;                 /* fine-grained profile: router + PCIe copy (CUDA) */
+    double t_traj_warm, t_pathpack, t_persist;   /* was hidden in PROFILE "other" */
     int64_t resident_bytes;
     /* tabella RoPE precalcolata: gli angoli dipendono SOLO da (pos, j, tipo-layer),
      * non dalla testa. La ricomputazione con powf() costava ~100k chiamate/token; qui
@@ -1904,7 +1908,16 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
     /* Snapshot routes for next-token Markov; warm predicted path for the next step. */
     if(g_traj>0){
         traj_commit_prev(m);
-        if(S==1) traj_warm(m, g_traj_k);   /* decode: prepare next token */
+        if(S==1){
+            /* Stride: every N decode steps (TRAJ_WARM_EVERY / g_traj_warm_every). */
+            static unsigned warm_seq;
+            int every=g_traj_warm_every<1?1:g_traj_warm_every;
+            if((++warm_seq % (unsigned)every)==0){
+                double tw0=now_s();
+                traj_warm(m, g_traj_k);
+                m->t_traj_warm += now_s()-tw0;
+            }
+        }
     }
     free(nrm); free(tmp);
 }
@@ -2242,9 +2255,14 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
 }
 
 static void profile_print(Model *m, double elapsed){
-    double accounted=m->t_edisk+m->t_emm+m->t_attn+m->t_head;
+    double io_aux=m->t_traj_warm+m->t_pathpack+m->t_persist;
+    double accounted=m->t_edisk+m->t_emm+m->t_attn+m->t_head+io_aux;
+    double other=elapsed-accounted; if(other<0) other=0;
     printf("PROFILE: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs | lm_head %.3fs | other %.3fs\n",
-        m->t_edisk,m->t_emm,m->t_attn,m->t_head,elapsed-accounted);
+        m->t_edisk,m->t_emm,m->t_attn,m->t_head,other);
+    if(io_aux>1e-4)
+        printf("PROFILE-AUX: traj_warm %.3fs | pathpack %.3fs | persist %.3fs (was in other)\n",
+            m->t_traj_warm,m->t_pathpack,m->t_persist);
 #ifdef COLI_CUDA
     if(g_cuda_enabled){
         double copy=coli_cuda_copy_seconds()-m->t_cuda_copy; if(copy<0) copy=0;
@@ -2264,6 +2282,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
     float *logit=step(m,full,np-1,0); free(logit);
     m->hits=m->miss=m->ereq=m->gpu_expert_calls=0;
     m->t_edisk=m->t_emm=m->t_attn=m->t_head=0;
+    m->t_traj_warm=m->t_pathpack=m->t_persist=0;
     m->t_router=0;
 #ifdef COLI_CUDA
     m->t_cuda_copy = g_cuda_enabled ? coli_cuda_copy_seconds() : 0;
@@ -2306,6 +2325,8 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     m->t_cuda_copy = g_cuda_enabled ? coli_cuda_copy_seconds() : 0;
 #endif
     m->t_router=0;
+    m->t_edisk=m->t_emm=m->t_attn=m->t_head=0;
+    m->t_traj_warm=m->t_pathpack=m->t_persist=0;
     double t=now_s();
     float *logit=step(m,pids,np,0);
     EmitStream es={&T,m,t,0,0};
@@ -2972,7 +2993,11 @@ static void heat_prefetch_top(Model *m, int k_per_layer){
         }
     }
     /* Trajectory bulk: sticky + heat + Markov successors across layers/tokens */
-    if(g_traj>0) traj_warm(m, g_traj_k>k_per_layer?g_traj_k:k_per_layer);
+    if(g_traj>0){
+        double tw0=now_s();
+        traj_warm(m, g_traj_k>k_per_layer?g_traj_k:k_per_layer);
+        m->t_traj_warm += now_s()-tw0;
+    }
 }
 
 /* ---- RAM DINAMICA a runtime (colibri #71 / Fase 4) ----
@@ -3308,9 +3333,24 @@ static int64_t usage_load(Model *m, const char *path){
     fclose(f); return tot;
 }
 static void usage_save(Model *m){
+    /* Persist usage + traj always; pathpack rebuild throttled (was hiding in PROFILE other). */
+    double t0=now_s();
     if(g_usage_path[0]) stats_dump_q(m,g_usage_path,1);
-    traj_save();   /* persist Markov edges with the same cadence as usage */
-    if(g_flow>0){ pathpack_rebuild(m); pathpack_save(); }
+    traj_save();
+    if(m) m->t_persist += now_s()-t0;
+    if(g_flow>0){
+        g_pp_save_i++;
+        int every=g_pp_every<1?1:g_pp_every;
+        int empty=1;
+        for(int l=0;l<TRAJ_LMAX;l++) if(g_pp_n[l]>0){ empty=0; break; }
+        int force=getenv("PATHPACK_FORCE")&&atoi(getenv("PATHPACK_FORCE"));
+        if(empty || force || (g_pp_save_i % every)==0){
+            double tp0=now_s();
+            pathpack_rebuild(m);
+            pathpack_save();
+            if(m) m->t_pathpack += now_s()-tp0;
+        }
+    }
 }
 
 /* HOT-STORE ("il redis del colibri'"): carica in RAM, UNA VOLTA e per sempre, i top expert
@@ -3675,6 +3715,23 @@ int main(int argc, char **argv){
         fprintf(stderr,"[FLOW] pathpack channel thaw on (R=%d; FLOW=0 off)\n", g_flow_r);
     if(tao_mode && g_flow>0 && !getenv("TRAJ_BUDGET"))
         g_traj_pref_budget=55;                   /* Fibonacci fadvise budget */
+    /* Throttle hot-path cost that was inflating PROFILE "other". */
+    if(getenv("TRAJ_WARM_EVERY")){
+        g_traj_warm_every=atoi(getenv("TRAJ_WARM_EVERY"));
+        if(g_traj_warm_every<1) g_traj_warm_every=1;
+        if(g_traj_warm_every>8) g_traj_warm_every=8;
+    } else if(speed_mode || tao_mode || serve_mode) g_traj_warm_every=2;
+    if(getenv("PATHPACK_EVERY")){
+        g_pp_every=atoi(getenv("PATHPACK_EVERY"));
+        if(g_pp_every<1) g_pp_every=1;
+        if(g_pp_every>64) g_pp_every=64;
+    } else if(tao_mode || speed_mode) g_pp_every=8;
+    else g_pp_every=4;
+    if(g_traj>0 && g_traj_warm_every>1)
+        fprintf(stderr,"[TRAJ] warm every %d decode step(s) (TRAJ_WARM_EVERY=)\n", g_traj_warm_every);
+    if(g_flow>0)
+        fprintf(stderr,"[FLOW] pathpack rebuild every %d save(s) (PATHPACK_EVERY=; PATHPACK_FORCE=1)\n",
+                g_pp_every);
     /* ENERGY: snow→VRAM pure compute along channels. Default auto when FLOW+CUDA. */
     if(getenv("ENERGY")) g_energy_gb=atof(getenv("ENERGY"));
     else g_energy_gb = (g_flow>0) ? -1.0 : 0.0;  /* -1 auto remaining VRAM; 0 off; >0 GB */

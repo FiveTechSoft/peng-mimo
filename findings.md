@@ -630,6 +630,34 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 37. PROFILE-AUX + throttle traj_warm/pathpack (2026-07-12)
+
+**Problem:** NGEN=24 TAO run at 0.40 tok/s had `other ≈ 28 s` (~half wall) unaccounted.
+
+**Code:**
+
+- Model timers: `t_traj_warm`, `t_pathpack`, `t_persist` → `PROFILE-AUX: …`
+- `TRAJ_WARM_EVERY` (default **2** on SERVE/SPEED/TAO): traj_warm only every N decode steps.
+- `PATHPACK_EVERY` (default **8** SPEED/TAO, else 4): skip full pathpack rebuild on every `usage_save`; `PATHPACK_FORCE=1` forces rebuild.
+
+```bash
+# see where former "other" went
+… ./mimo 64 4 8
+# PROFILE: …
+# PROFILE-AUX: traj_warm X | pathpack Y | persist Z
+```
+
+**Smoke (TAO=1 SPEED=1 PILOT=0 NGEN=24 Rome, pin+GPU-first, 2026-07-12):**
+
+| | Before throttle | After |
+|--|-----------------|-------|
+| tok/s | 0.40 | **0.60** |
+| other | ~28 s | **5.9 s** |
+| traj_warm (AUX) | (hidden) | **3.8 s** |
+| pathpack in-gen | every save | **0** (throttled) |
+
+Residual other ~6 s + disk 14 s + attn 9 s still dominate; next lever = attn GPU + disk hit, or `TRAJ_WARM_EVERY=3`.
+
 ### 36. TAO=1 — wu wei + sacred geometry (2026-07-12)
 
 Meta-profile: flow with the residual, do not force; harmonic knobs when unset.
