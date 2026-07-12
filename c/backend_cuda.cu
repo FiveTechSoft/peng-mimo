@@ -133,12 +133,13 @@ __global__ static void quant_gemv_i4(float *y, const float *x, const uint8_t *we
     for (int s = 0; s < S; s++) {
         const float *xs = shx + s * I;
         float sum = 0.0f;
-        /* 32 lanes × 2 nibble-pairs via 1 byte each step of 32 bytes of weights
-         * covering 64 activations when unrolled — simple lane-strided over i. */
-        for (int i = lane; i < I; i += 32) {
-            uint8_t v = wrow[i >> 1];
-            float w = (float)(((i & 1) ? (v >> 4) : (v & 15)) - 8);
-            sum += xs[i] * w;
+        /* Byte-strided: one weight load → two nibble MACs (half global weight traffic). */
+        for (int b = lane; b < rb; b += 32) {
+            uint8_t v = wrow[b];
+            int i0 = b << 1;
+            sum += xs[i0] * (float)((int)(v & 15) - 8);
+            if (i0 + 1 < I)
+                sum += xs[i0 + 1] * (float)((int)(v >> 4) - 8);
         }
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
@@ -197,13 +198,18 @@ __global__ static void quant_gate_up_silu_i4(float *mid, const float *x,
     for (int s = 0; s < S; s++) {
         const float *xs = shx + s * D;
         float sg_acc = 0.0f, su_acc = 0.0f;
-        for (int i = lane; i < D; i += 32) {
-            uint8_t vg = rg[i >> 1], vu = ru[i >> 1];
-            float wg_ = (float)(((i & 1) ? (vg >> 4) : (vg & 15)) - 8);
-            float wu_ = (float)(((i & 1) ? (vu >> 4) : (vu & 15)) - 8);
-            float xv = xs[i];
-            sg_acc += xv * wg_;
-            su_acc += xv * wu_;
+        /* Byte-strided dual nibble (same as quant_gemv_i4). */
+        for (int b = lane; b < rb; b += 32) {
+            uint8_t vg = rg[b], vu = ru[b];
+            int i0 = b << 1;
+            float x0 = xs[i0];
+            sg_acc += x0 * (float)((int)(vg & 15) - 8);
+            su_acc += x0 * (float)((int)(vu & 15) - 8);
+            if (i0 + 1 < D) {
+                float x1 = xs[i0 + 1];
+                sg_acc += x1 * (float)((int)(vg >> 4) - 8);
+                su_acc += x1 * (float)((int)(vu >> 4) - 8);
+            }
         }
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {

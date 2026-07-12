@@ -630,6 +630,29 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 32. SPEED unity (2026-07-12) — GEMV denser + lean TRAJ + profile
+
+**Goal:** give peng-mimo a coherent speed body without fadvise storms.
+
+| Change | Why |
+|---|---|
+| **int4 GEMV / gate+up byte-strided** | one weight load → two nibble MACs; expert-matmul **16.4s → ~4.9s** on NGEN=24 |
+| **CUDA_HEADROOM 0.35 GB** (was 0.5) | pack more GPU-first experts on 12 GB; `CUDA_HEADROOM_GB=` |
+| **TRAJ budget** | max ~64 `expert_prefetch`/warm (boot 128); top-2 lay edges only — uncapped TRAJ_K=16 caused ~1300 pref/token → `other` >> compute |
+| **SPEED=1** | `TOPP=0.55`, TRAJ lean K=6, REPIN=32; optional `TOPK=6` |
+| **REPIN I/O → t_edisk** | honest PROFILE (was hiding in `other`) |
+| **chat_peng --fast** | sets `SPEED=1` |
+
+```bash
+SPEED=1 TRAJ=1 PILOT=0 COLI_CUDA=1 CUDA_DENSE=1 DIRECT=1 \
+  PROMPT='Write one short sentence about Rome.' NGEN=24 ./mimo 64 4 8
+# 2026-07-12: 0.51 tok/s | hit 60% | disk 10.6s | matmul 4.9s | attn 11.1s | other 20s
+# GPU-first 534 exp / 6.7 GB + RAM pin ~9 GB from .coli_usage
+python3 c/chat_peng.py --fast --profile chat
+```
+
+**Soft ceiling still ~0.55–0.65** on 23 GB + 3060 + WSL2; 1.0 needs more RAM / native Linux / faster attn. Matmul is no longer the long pole when experts are warm.
+
 ### 31. Trajectory bulk WILLNEED (2026-07-12) — predictive expert path
 
 **Idea:** learn which experts co-activate (same layer next token + layer L→L+1), then bulk `posix_fadvise(WILLNEED)` the predicted path so disk misses become warm hits. **I/O only — never changes tokens.**

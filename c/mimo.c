@@ -2477,12 +2477,28 @@ static void traj_commit_prev(Model *m){
     }
     g_traj_have_prev=1;
 }
+/* Cap posix_fadvise storm: each expert_prefetch ≈ 6 fadvise; WSL tax is real.
+ * Measured: uncapped TRAJ_K=16 → ~1300 prefetches/token → "other" >> disk+matmul. */
+static int g_traj_pref_budget=64;  /* max expert_prefetch calls per traj_warm */
+static void traj_pref(Model *m, int layer, int eid, int *left){
+    if(!left || *left<=0) return;
+    if(expert_resident(m,layer,eid)) return;
+    expert_prefetch(m,layer,eid);
+    g_traj_warm_n++;
+    (*left)--;
+}
 static void traj_warm(Model *m, int k_per_layer){
     if(g_traj<=0 || !m || k_per_layer<1) return;
     Cfg *c=&m->c;
-    int kk=k_per_layer<32?k_per_layer:32;
-    int depth=g_traj_depth<1?1:(g_traj_depth>4?4:g_traj_depth);
-    for(int l=0;l<c->n_layers && l<TRAJ_LMAX;l++){
+    int kk=k_per_layer<8?k_per_layer:8;          /* hard cap: fan-out beyond 8 is syscall waste */
+    int depth=g_traj_depth<1?1:(g_traj_depth>2?2:g_traj_depth); /* depth>2 rarely pays */
+    int budget=g_traj_pref_budget;
+    if(getenv("TRAJ_BUDGET")){
+        budget=atoi(getenv("TRAJ_BUDGET"));
+        if(budget<8) budget=8; if(budget>256) budget=256;
+    }
+    int left=budget;
+    for(int l=0;l<c->n_layers && l<TRAJ_LMAX && left>0;l++){
         if(!m->L[l].sparse) continue;
         int E=c->n_experts; if(E>TRAJ_EMAX) E=TRAJ_EMAX;
         float score[TRAJ_EMAX];
@@ -2505,37 +2521,33 @@ static void traj_warm(Model *m, int k_per_layer){
                 if(sticky[i]>=0 && sticky[i]<E) score[sticky[i]] += 1e7f;
             }
         }
-        /* Cold boot / first token: no sticky yet — still use persisted Markov mass so
-         * WILLNEED runs while pin/setup finishes (page cache ready before prefill). */
+        /* Cold boot / first token: Markov mass into scores (prefetch only top-K below). */
         if(nsticky==0){
             for(int e0=0;e0<E;e0++){
                 for(int s=0;s<TRAJ_SUC;s++){
                     TrajEdge ed=g_traj_tok[l][e0][s];
                     if(ed.c && ed.e>=0 && ed.e<E){
                         score[ed.e] += 80.f * (float)ed.c;
-                        score[e0]   += 8.f  * (float)ed.c; /* source likely active too */
+                        score[e0]   += 8.f  * (float)ed.c;
                     }
                 }
             }
-            /* WILLNEED strongest L→L+1 edges from any source (boot has no sticky). */
+            /* Strongest L→L+1 only (top 4), not all edges. */
             {
-                int best_e[32]; uint32_t best_c[32]; int nb=0;
+                int best_e[4]; uint32_t best_c[4]; int nb=0;
                 for(int e0=0;e0<E;e0++) for(int s=0;s<TRAJ_SUC;s++){
                     TrajEdge el=g_traj_lay[l][e0][s];
                     if(el.c==0 || el.e<0 || el.e>=c->n_experts || el.e>=TRAJ_EMAX) continue;
-                    if(nb<32){ best_e[nb]=el.e; best_c[nb]=(uint32_t)el.c; nb++; }
+                    if(nb<4){ best_e[nb]=el.e; best_c[nb]=(uint32_t)el.c; nb++; }
                     else {
-                        int w=0; for(int i=1;i<32;i++) if(best_c[i]<best_c[w]) w=i;
+                        int w=0; for(int i=1;i<4;i++) if(best_c[i]<best_c[w]) w=i;
                         if((uint32_t)el.c>best_c[w]){ best_e[w]=el.e; best_c[w]=(uint32_t)el.c; }
                     }
                 }
-                for(int i=0;i<nb;i++){
-                    if(expert_resident(m,l+1,best_e[i])) continue;
-                    expert_prefetch(m,l+1,best_e[i]);
-                    g_traj_warm_n++;
-                }
+                for(int i=0;i<nb && left>0;i++) traj_pref(m,l+1,best_e[i],&left);
             }
         }
+        /* Sticky: boost scores; prefetch only strongest 2 L→L+1 successors per sticky. */
         for(int i=0;i<nsticky;i++){
             int e0=sticky[i]; if(e0<0||e0>=E) continue;
             for(int s=0;s<TRAJ_SUC;s++){
@@ -2544,16 +2556,20 @@ static void traj_warm(Model *m, int k_per_layer){
                 score[ed.e] += 100.f * (float)ed.c;
             }
             if(l+1<c->n_layers && m->L[l+1].sparse){
+                /* pick top-2 lay edges by count for this source */
+                int e_best[2]={-1,-1}; uint32_t c_best[2]={0,0};
                 for(int s=0;s<TRAJ_SUC;s++){
                     TrajEdge ed=g_traj_lay[l][e0][s];
                     if(ed.c==0 || ed.e<0 || ed.e>=c->n_experts || ed.e>=TRAJ_EMAX) continue;
-                    expert_prefetch(m, l+1, ed.e);
-                    g_traj_warm_n++;
+                    if(ed.c>c_best[0]){ c_best[1]=c_best[0]; e_best[1]=e_best[0];
+                                        c_best[0]=(uint32_t)ed.c; e_best[0]=ed.e; }
+                    else if(ed.c>c_best[1]){ c_best[1]=(uint32_t)ed.c; e_best[1]=ed.e; }
                 }
+                for(int j=0;j<2 && left>0;j++) if(e_best[j]>=0) traj_pref(m,l+1,e_best[j],&left);
             }
         }
-        int frontier[32]; int nf=0;
-        for(int t=0;t<kk && t<32;t++){
+        int frontier[8]; int nf=0;
+        for(int t=0;t<kk && t<8;t++){
             int best=-1; float bv=-1.f;
             for(int e=0;e<E;e++){
                 int skip=0; for(int j=0;j<nf;j++) if(frontier[j]==e){skip=1;break;}
@@ -2574,7 +2590,7 @@ static void traj_warm(Model *m, int k_per_layer){
                 }
             }
             nf=0;
-            for(int t=0;t<kk && t<32;t++){
+            for(int t=0;t<kk && t<8;t++){
                 int best=-1; float bv=-1.f;
                 for(int e=0;e<E;e++){
                     int skip=0; for(int j=0;j<nf;j++) if(frontier[j]==e){skip=1;break;}
@@ -2585,11 +2601,7 @@ static void traj_warm(Model *m, int k_per_layer){
                 frontier[nf++]=best;
             }
         }
-        for(int i=0;i<nf;i++){
-            if(expert_resident(m,l,frontier[i])) continue;
-            expert_prefetch(m,l,frontier[i]);
-            g_traj_warm_n++;
-        }
+        for(int i=0;i<nf && left>0;i++) traj_pref(m,l,frontier[i],&left);
     }
 }
 
@@ -2700,6 +2712,7 @@ static void repin_pass(Model *m){
         uint32_t old_heat=m->eheat[cd[b].l][old], new_heat=m->eheat[cd[b].l][cd[b].eid];
         double t0=now_s();
         expert_load(m,cd[b].l,cd[b].eid,s);
+        m->t_edisk += now_s()-t0;                /* REPIN I/O belongs in disk, not "other" */
         fprintf(stderr,"[REPIN] RAM layer %d: out %d (heat=%u) <- in %d (heat=%u) in %.0f ms\n",
             cd[b].l,old,old_heat,cd[b].eid,new_heat,(now_s()-t0)*1e3);
     }
@@ -2732,6 +2745,7 @@ static void repin_pass(Model *m){
                 m->gpu_expert_bytes+=now_gpu; m->gpu_expert_count++;
                 expert_cpu_free(m,s);
                 s->g.gpu_only=s->u.gpu_only=s->d.gpu_only=1;
+                m->t_edisk += now_s()-t0;
                 fprintf(stderr,"[REPIN] VRAM layer %d: out %d (heat=%u) <- in %d (heat=%u) in %.0f ms\n",
                     gd[b].l,old,old_heat,gd[b].eid,new_heat,(now_s()-t0)*1e3);
             } else {
@@ -3029,7 +3043,14 @@ static void pin_load(Model *m, const char *statspath, double gb){
         double remaining[COLI_CUDA_MAX_DEVICES]={0}, placed_b[COLI_CUDA_MAX_DEVICES]={0};
         int placed_n[COLI_CUDA_MAX_DEVICES]={0};
         double safe_total=0;
-        const double headroom=0.5e9;
+        /* 0.35 GB headroom (was 0.5): pack more hot experts on 12 GB cards; override
+         * via CUDA_HEADROOM_GB. OOM still guarded by cudaMalloc fail → remaining=0. */
+        double headroom = 0.35e9;
+        if(getenv("CUDA_HEADROOM_GB")){
+            headroom = atof(getenv("CUDA_HEADROOM_GB"))*1e9;
+            if(headroom<0.1e9) headroom=0.1e9;
+            if(headroom>2e9) headroom=2e9;
+        }
         for(int i=0;i<g_cuda_ndev;i++){
             size_t free_b=0,total_b=0;
             if(coli_cuda_mem_info(g_cuda_devices[i],&free_b,&total_b)){
@@ -3251,13 +3272,20 @@ int main(int argc, char **argv){
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     /* SERVE/chat: speed-oriented defaults (override with env). Oracle/TF keep exact path. */
     int serve_mode = getenv("SERVE") && atoi(getenv("SERVE"));
+    /* SPEED=1: unity profile — fewer experts/token, tighter I/O anticipatory stack.
+     * Does not change matmul math (TOPK only shrinks routed set). Chat --fast sets it. */
+    int speed_mode = getenv("SPEED") && atoi(getenv("SPEED"));
+    if(speed_mode)
+        fprintf(stderr,"[SPEED] profile on (TOPK/TRAJ/REPIN/TOPP defaults tightened; env overrides win)\n");
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
     /* sticky next-token WILLNEED: auto ON for SERVE / when PILOT is on */
     if(getenv("PREFETCH")) g_prefetch=atoi(getenv("PREFETCH"));
     else g_prefetch = (serve_mode || (getenv("PILOT") && atoi(getenv("PILOT")))) ? 1 : 0;
-    g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
-    g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
+    if(getenv("TOPK")) g_topk=atoi(getenv("TOPK"));
+    else g_topk = 0;                             /* full topk; TOPK=6 optional (quality trade) */
+    if(getenv("TOPP")) g_topp=atof(getenv("TOPP"));
+    else g_topp = speed_mode ? 0.55 : 0;         /* SPEED: nucleus trim (measured stack) */
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
     g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* draft per forward; -1 = auto dopo il
@@ -3271,12 +3299,14 @@ int main(int argc, char **argv){
       if(e) g_i4s=atoi(e);
       else if(serve_mode) g_i4s=1;   /* chat default; CUDA path may force I4S=1 below */
     }
-    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):(serve_mode?32:0);
+    /* REPIN: SERVE/SPEED every 32 tok (mid-gen load is expensive on WSL if too eager) */
+    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):(serve_mode||speed_mode?32:0);
     g_memwatch = getenv("MEMWATCH")?atoi(getenv("MEMWATCH")):1;  /* #71: adapt ecap each SERVE turn */
     /* Trajectory bulk WILLNEED: default ON for SERVE (multi-turn hit); off for oracle/TF */
     if(getenv("TRAJ")) g_traj=atoi(getenv("TRAJ"));
-    else g_traj = serve_mode ? 1 : 0;
-    if(getenv("TRAJ_K")){ g_traj_k=atoi(getenv("TRAJ_K")); if(g_traj_k<1)g_traj_k=1; if(g_traj_k>32)g_traj_k=32; }
+    else g_traj = (serve_mode || speed_mode) ? 1 : 0;
+    if(getenv("TRAJ_K")){ g_traj_k=atoi(getenv("TRAJ_K")); if(g_traj_k<1)g_traj_k=1; if(g_traj_k>8)g_traj_k=8; }
+    else g_traj_k = (speed_mode || serve_mode) ? 6 : 8;  /* lean: more K was fadvise storm */
     if(getenv("TRAJ_DEPTH")){ g_traj_depth=atoi(getenv("TRAJ_DEPTH")); if(g_traj_depth<1)g_traj_depth=1; if(g_traj_depth>4)g_traj_depth=4; }
     if(g_traj>0)
         fprintf(stderr,"[TRAJ] bulk expert path WILLNEED on (K=%d depth=%d; TRAJ=0 off)\n",
@@ -3389,7 +3419,9 @@ int main(int argc, char **argv){
        * wall-clock before first prefill (SERVE READY / PROMPT encode). Free if cold. */
       if(g_traj>0){
           long w0=g_traj_warm_n;
+          int bud0=g_traj_pref_budget; g_traj_pref_budget=128; /* boot: one-shot, allow more */
           heat_prefetch_top(&m, g_traj_k>4?g_traj_k:4);
+          g_traj_pref_budget=bud0;
           if(g_traj_warm_n>w0)
               fprintf(stderr,"[TRAJ] boot warm +%ld hints (total willneed_calls=%ld)\n",
                       g_traj_warm_n-w0, g_traj_warm_n);

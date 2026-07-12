@@ -8,7 +8,7 @@ Bench de tok/s (meta 1.0 por defecto):
   # en chat interactivo:  /bench   o  /bench 3
 
 Perfiles (env o flags):
-  --fast     maxima velocidad (CUDA, TOPP=0.55, TEMP=0.7, PILOT, REPIN)
+  --fast     SPEED=1 (TOPP=0.55, TRAJ lean, REPIN=32, CUDA GEMV+stack)
   --quality  mas anclado (TEMP=0.4, TOPP=0.85) — mas lento
   --profile NAME  heat map aislado: SNAP/.coli_usage.NAME (COLI_PROFILE)
   default    equilibrio calidad+velocidad
@@ -49,15 +49,18 @@ def build_env(args) -> dict:
 
     # Speed profile defaults — user/env always wins if already set
     if args.fast:
-        # Fewer experts/token; anticipatory I/O ON; avoid PILOT_DEPTH=2 (CPU tax)
+        # SPEED=1: measured winner stack + lean TRAJ (no fadvise storm)
         temp_d, nuc_d, topp_d = "0.7", "0.9", "0.55"
         topk_d, draft_d, pdepth = "0", "0", "1"
+        repin_d, trajk_d, speed_d = "32", "6", "1"
     elif args.quality:
         temp_d, nuc_d, topp_d = "0.4", "0.85", "0.85"
         topk_d, draft_d, pdepth = "0", "0", "1"
+        repin_d, trajk_d, speed_d = "32", "6", "0"
     else:
         temp_d, nuc_d, topp_d = "0.6", "0.9", "0.60"
         topk_d, draft_d, pdepth = "0", "0", "1"
+        repin_d, trajk_d, speed_d = "32", "6", "0"
 
     env = dict(os.environ)
     env.update({
@@ -76,13 +79,15 @@ def build_env(args) -> dict:
         "PILOT": os.environ.get("PILOT", "1"),
         "PILOT_DEPTH": os.environ.get("PILOT_DEPTH", pdepth),
         "PREFETCH": os.environ.get("PREFETCH", "1"),
-        "REPIN": os.environ.get("REPIN", "32"),
+        "REPIN": os.environ.get("REPIN", repin_d),
         "I4S": os.environ.get("I4S", "1"),
         "OVERLAP": os.environ.get("OVERLAP", "1"),
         "MEMWATCH": os.environ.get("MEMWATCH", "1"),
         "TRAJ": os.environ.get("TRAJ", "1"),
-        "TRAJ_K": os.environ.get("TRAJ_K", "8"),
+        "TRAJ_K": os.environ.get("TRAJ_K", trajk_d),
         "TRAJ_DEPTH": os.environ.get("TRAJ_DEPTH", "2"),
+        "SPEED": os.environ.get("SPEED", speed_d),
+        "PIN_FRAC": os.environ.get("PIN_FRAC", "0.90" if args.fast else "0.85"),
     })
     # Domain heat map (colibri #71): chat vs code vs … do not share pin history
     prof = getattr(args, "profile", None) or os.environ.get("COLI_PROFILE") or os.environ.get("PENG_PROFILE")
