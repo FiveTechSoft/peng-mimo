@@ -298,6 +298,46 @@ static void st_prefetch(shards *S, const char *name) {
     if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
 }
 
+/* Physical readahead: sort tensors by (fd, off), merge adjacent/nearby ranges, one
+ * fadvise per merged span. Beats N random WILLNEEDs when experts share a shard. */
+static void st_prefetch_phys(shards *S, st_tensor **ts, int n) {
+    if (!S || !ts || n < 1) return;
+    if (n == 1) {
+        if (ts[0]) posix_fadvise(ts[0]->fd, ts[0]->off, ts[0]->nbytes, POSIX_FADV_WILLNEED);
+        return;
+    }
+    /* insertion sort by fd then off (n is small: pathpack radius * 6 tensors) */
+    for (int i = 1; i < n; i++) {
+        st_tensor *v = ts[i]; int j = i - 1;
+        while (j >= 0 && ts[j] && v &&
+               (ts[j]->fd > v->fd || (ts[j]->fd == v->fd && ts[j]->off > v->off))) {
+            ts[j + 1] = ts[j]; j--;
+        }
+        /* also bubble nulls to end */
+        if (!v) { /* keep nulls at end via simple skip in merge */ }
+        ts[j + 1] = v;
+    }
+    const int64_t gap = 2 * 1024 * 1024; /* merge if within 2 MB on same fd */
+    int i = 0;
+    while (i < n) {
+        while (i < n && !ts[i]) i++;
+        if (i >= n) break;
+        int fd = ts[i]->fd;
+        int64_t lo = ts[i]->off, hi = ts[i]->off + ts[i]->nbytes;
+        int k = i + 1;
+        while (k < n && ts[k] && ts[k]->fd == fd) {
+            int64_t a = ts[k]->off, b = ts[k]->off + ts[k]->nbytes;
+            if (a > hi + gap) break;
+            if (a < lo) lo = a;
+            if (b > hi) hi = b;
+            k++;
+        }
+        if (hi > lo) posix_fadvise(fd, lo, hi - lo, POSIX_FADV_WILLNEED);
+        i = k;
+    }
+    (void)S;
+}
+
 /* legge un tensore in un buffer float32 fornito dal chiamante.
  * out_cap = numero di float disponibili in `out` (F-01: no write past end).
  * drop=1 -> fadvise DONTNEED (streaming expert). */

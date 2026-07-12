@@ -1323,6 +1323,14 @@ static int expert_resident(Model *m, int l, int eid){
     }
     return emap_test(emap_row(m->res_bits,l), eid);
 }
+/* Disk sort key for physical pathpack / miss order: (fd, byte offset) of gate weights. */
+static int64_t expert_disk_key(Model *m, int layer, int eid){
+    char nm[300];
+    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.gate_proj.weight",layer,eid);
+    st_tensor *t=st_find(&m->S,nm);
+    if(!t) return ((int64_t)1<<62)|(int64_t)(eid&0xffff);
+    return ((int64_t)(t->fd & 0xffff)<<48) | ((t->off>>8) & 0xffffffffffffLL);
+}
 /* prefetch asincrono dei pesi di un expert (e delle sue scale .qs): avvia il readahead
  * cosi' le letture sincrone successive trovano la page-cache calda.
  * Bitmap path: skip if already resident OR already hinted this epoch (no fadvise storm). */
@@ -1336,10 +1344,37 @@ static void expert_prefetch(Model *m, int layer, int eid){
     }
     char nm[300];
     const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
+    st_tensor *ts[6]; int nt=0;
     for(int k=0;k<3;k++){
-        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s",layer,eid,suf[k]); st_prefetch(&m->S,nm);
-        char qs[320]; snprintf(qs,sizeof(qs),"%s.qs",nm); st_prefetch(&m->S,qs);
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s",layer,eid,suf[k]);
+        st_tensor *t=st_find(&m->S,nm); if(t) ts[nt++]=t;
+        char qs[320]; snprintf(qs,sizeof(qs),"%s.qs",nm);
+        t=st_find(&m->S,qs); if(t) ts[nt++]=t;
     }
+    if(nt) st_prefetch_phys(&m->S, ts, nt);
+}
+/* Prefetch many experts with one physical merge pass (pathpack channel / miss set). */
+static void expert_prefetch_list(Model *m, int layer, const int *eids, int ne){
+    if(!m || !eids || ne<1) return;
+    st_tensor *ts[256]; int nt=0;
+    char nm[300];
+    const char *suf[3]={"gate_proj.weight","up_proj.weight","down_proj.weight"};
+    for(int i=0;i<ne && nt<250;i++){
+        int eid=eids[i]; if(eid<0) continue;
+        if(emap_ok(m,layer,eid)){
+            uint64_t *rb=emap_row(m->res_bits,layer);
+            uint64_t *pb=emap_row(m->pref_bits,layer);
+            if(emap_test(rb,eid) || emap_test(pb,eid)) continue;
+            emap_set(pb,eid);
+        }
+        for(int k=0;k<3 && nt<250;k++){
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s",layer,eid,suf[k]);
+            st_tensor *t=st_find(&m->S,nm); if(t) ts[nt++]=t;
+            char qs[320]; snprintf(qs,sizeof(qs),"%s.qs",nm);
+            t=st_find(&m->S,qs); if(t && nt<250) ts[nt++]=t;
+        }
+    }
+    if(nt) st_prefetch_phys(&m->S, ts, nt);
 }
 
 /* === OVERLAP: pipeline load/compute DENTRO il layer ==================================
@@ -1404,6 +1439,12 @@ static unsigned ov_submit(Model *m,int layer,const int *eids,const int *missk,in
         for(int i=0;i<g_overlap_t;i++){ pthread_t t;
             if(pthread_create(&t,NULL,ov_worker,NULL)==0) pthread_detach(t); }
         ov_started=1;   /* se qualche create fallisse: ov_wait sa eseguire i job da solo */
+    }
+    /* Physical WILLNEED for the miss set (merged ranges) before loaders pread. */
+    {
+        int pe[64]; int np=0;
+        for(int q=0;q<nmiss && np<64;q++) pe[np++]=eids[missk[q]];
+        if(np) expert_prefetch_list(m,layer,pe,np);
     }
     unsigned b=ov_total;
     for(int q=0;q<nmiss;q++){
@@ -2613,7 +2654,8 @@ static int pathpack_load(void){
                          layers,g_pp_path,g_flow_r);
     return layers;
 }
-/* Rebuild packing from live TRAJ + eusage (greedy channel walk). */
+/* Rebuild packing = physical order on disk among habit experts (usage/traj).
+ * Neighbors in this order are nearby (fd,off) → merged WILLNEED is sequential. */
 static void pathpack_rebuild(Model *m){
     if(g_flow<=0 || !m) return;
     Cfg *c=&m->c;
@@ -2622,109 +2664,55 @@ static void pathpack_rebuild(Model *m){
     for(int l=0;l<c->n_layers && l<TRAJ_LMAX;l++){
         if(!m->L[l].sparse) continue;
         int E=c->n_experts; if(E>TRAJ_EMAX) E=TRAJ_EMAX;
-        /* affinity[e0][e1] compressed: only top via sparse bumps on score from heat */
-        float heat[TRAJ_EMAX];
+        int ids[TRAJ_EMAX]; int64_t key[TRAJ_EMAX]; int n=0;
         for(int e=0;e<E;e++){
             uint32_t h = (m->eusage && m->eusage[l]) ? m->eusage[l][e] : 0;
             if(m->eheat && m->eheat[l] && m->eheat[l][e]>h) h=m->eheat[l][e];
-            heat[e]=(float)h;
+            int has_traj=0;
+            for(int s=0;s<TRAJ_SUC && !has_traj;s++)
+                if(g_traj_tok[l][e][s].c || g_traj_lay[l][e][s].c) has_traj=1;
+            if(h==0 && !has_traj) continue;
+            ids[n]=e; key[n]=expert_disk_key(m,l,e); n++;
         }
-        /* Build sparse adjacency list: for each e, best partners from traj */
-        int16_t nbr[TRAJ_EMAX][8]; float nw[TRAJ_EMAX][8];
-        for(int e=0;e<E;e++){ for(int k=0;k<8;k++){ nbr[e][k]=-1; nw[e][k]=0; } }
-        for(int e0=0;e0<E;e0++){
-            for(int s=0;s<TRAJ_SUC;s++){
-                TrajEdge ed=g_traj_tok[l][e0][s];
-                if(!ed.c || ed.e<0 || ed.e>=E) continue;
-                float w=(float)ed.c;
-                /* insert into e0's list and e1's list */
-                for(int pass=0;pass<2;pass++){
-                    int a=pass?ed.e:e0, b=pass?e0:(int)ed.e;
-                    int slot=-1, weak=0;
-                    for(int k=0;k<8;k++){
-                        if(nbr[a][k]==b){ nw[a][k]+=w; slot=k; break; }
-                        if(nbr[a][k]<0){ slot=k; break; }
-                        if(nw[a][k]<nw[a][weak]) weak=k;
-                    }
-                    if(slot>=0 && nbr[a][slot]<0){ nbr[a][slot]=(int16_t)b; nw[a][slot]=w; }
-                    else if(slot<0 && w>nw[a][weak]){ nbr[a][weak]=(int16_t)b; nw[a][weak]=w; }
-                    else if(slot>=0 && nbr[a][slot]==b){ /* already added */ }
-                }
-            }
-            for(int s=0;s<TRAJ_SUC;s++){
-                TrajEdge ed=g_traj_lay[l][e0][s];
-                if(!ed.c || ed.e<0 || ed.e>=E) continue;
-                float w=0.5f*(float)ed.c;
-                int b=ed.e;
-                int slot=-1, weak=0;
-                for(int k=0;k<8;k++){
-                    if(nbr[e0][k]==b){ nw[e0][k]+=w; slot=k; break; }
-                    if(nbr[e0][k]<0){ slot=k; break; }
-                    if(nw[e0][k]<nw[e0][weak]) weak=k;
-                }
-                if(slot>=0 && nbr[e0][slot]<0){ nbr[e0][slot]=(int16_t)b; nw[e0][slot]=w; }
-                else if(slot<0 && w>nw[e0][weak]){ nbr[e0][weak]=(int16_t)b; nw[e0][weak]=w; }
-            }
+        /* insertion sort by disk key (n ≤ 256) */
+        for(int i=1;i<n;i++){
+            int ie=ids[i]; int64_t ik=key[i]; int j=i-1;
+            while(j>=0 && key[j]>ik){ ids[j+1]=ids[j]; key[j+1]=key[j]; j--; }
+            ids[j+1]=ie; key[j+1]=ik;
         }
-        char seen[TRAJ_EMAX]; memset(seen,0,sizeof(seen));
-        int n=0;
-        /* seed: hottest expert with any heat or any neighbor */
-        for(;;){
-            int seed=-1; float bh=-1.f;
-            for(int e=0;e<E;e++) if(!seen[e] && heat[e]>bh){ bh=heat[e]; seed=e; }
-            if(seed<0 || bh<=0){
-                /* any unseen with neighbors */
-                seed=-1;
-                for(int e=0;e<E && seed<0;e++) if(!seen[e] && nbr[e][0]>=0) seed=e;
-                if(seed<0) break;
-            }
-            int cur=seed;
-            while(cur>=0 && n<E){
-                if(seen[cur]) break;
-                seen[cur]=1;
-                g_pp_ord[l][n]=(int16_t)cur;
-                g_pp_pos[l][cur]=(int16_t)n;
-                n++;
-                int best=-1; float bw=-1.f;
-                for(int k=0;k<8;k++){
-                    int b=nbr[cur][k]; if(b<0||seen[b]) continue;
-                    if(nw[cur][k]>bw){ bw=nw[cur][k]; best=b; }
-                }
-                if(best<0){
-                    /* jump to hottest unseen connected component seed */
-                    break;
-                }
-                cur=best;
-            }
+        for(int i=0;i<n;i++){
+            g_pp_ord[l][i]=(int16_t)ids[i];
+            g_pp_pos[l][ids[i]]=(int16_t)i;
         }
         g_pp_n[l]=n; if(n>0) layers++;
     }
     if(layers>0)
-        fprintf(stderr,"[FLOW] pathpack rebuilt from traj/usage (%d layers, R=%d)\n",
+        fprintf(stderr,"[FLOW] pathpack rebuilt PHYSICAL (disk order of habit experts, %d layers, R=%d)\n",
                 layers,g_flow_r);
 }
-/* Thaw packing neighbors of eid on this layer (channel flow). */
+/* Thaw packing neighbors of eid — bulk physical fadvise (merged ranges). */
 static void pathpack_thaw(Model *m, int layer, int eid, int *left){
     if(g_flow<=0 || !m || !left || *left<=0) return;
     if(layer<0||layer>=TRAJ_LMAX||eid<0||eid>=TRAJ_EMAX) return;
     int pos=g_pp_pos[layer][eid]; if(pos<0) return;
     int n=g_pp_n[layer]; if(n<1) return;
     int R=g_flow_r<1?1:(g_flow_r>8?8:g_flow_r);
-    for(int d=1;d<=R && *left>0;d++){
+    int eids[32]; int ne=0;
+    for(int d=1;d<=R && ne<32;d++){
         if(pos-d>=0){
             int e=g_pp_ord[layer][pos-d];
-            if(e>=0 && !expert_resident(m,layer,e)){
-                expert_prefetch(m,layer,e); g_flow_thaw_n++; (*left)--;
+            if(e>=0 && !expert_resident(m,layer,e) && *left>0){
+                eids[ne++]=e; g_flow_thaw_n++; (*left)--;
             }
         }
-        if(*left<=0) break;
-        if(pos+d<n){
+        if(pos+d<n && ne<32 && *left>0){
             int e=g_pp_ord[layer][pos+d];
             if(e>=0 && !expert_resident(m,layer,e)){
-                expert_prefetch(m,layer,e); g_flow_thaw_n++; (*left)--;
+                eids[ne++]=e; g_flow_thaw_n++; (*left)--;
             }
         }
     }
+    if(ne) expert_prefetch_list(m, layer, eids, ne);
 }
 /* ENERGY: liberate pathpack-channel snow into pure GPU compute (vram light).
  * Walk packing order by *position* across layers (heads of every channel first),
@@ -3720,7 +3708,8 @@ int main(int argc, char **argv){
         g_traj_warm_every=atoi(getenv("TRAJ_WARM_EVERY"));
         if(g_traj_warm_every<1) g_traj_warm_every=1;
         if(g_traj_warm_every>8) g_traj_warm_every=8;
-    } else if(speed_mode || tao_mode || serve_mode) g_traj_warm_every=2;
+    } else if(tao_mode) g_traj_warm_every=3;     /* less AUX tax toward 1.0 */
+    else if(speed_mode || serve_mode) g_traj_warm_every=2;
     if(getenv("PATHPACK_EVERY")){
         g_pp_every=atoi(getenv("PATHPACK_EVERY"));
         if(g_pp_every<1) g_pp_every=1;
@@ -3830,7 +3819,10 @@ int main(int argc, char **argv){
       if(hist>0) fprintf(stderr,"[USAGE] storia expert: %lld selezioni (%s)\n",(long long)hist,g_usage_path);
       if(g_traj>0) traj_load();   /* warm Markov from previous sessions */
       if(g_flow>0){
-          if(pathpack_load()<1) pathpack_rebuild(&m);  /* file or live traj/usage */
+          /* Prefer live PHYSICAL rebuild (disk order of habit experts); file is cache. */
+          pathpack_rebuild(&m);
+          if(g_pp_n[0]==0 && g_pp_n[1]==0) pathpack_load(); /* empty rebuild → try file */
+          else pathpack_save();
       }
       int autopin = getenv("AUTOPIN")?atoi(getenv("AUTOPIN")):1;
       if(!getenv("PIN") && autopin && hist>=5000){

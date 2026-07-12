@@ -630,6 +630,18 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 38. Physical pathpack (disk-order channels) + merged fadvise (2026-07-12)
+
+**Intent:** pathpack neighbors = nearby on NVMe, not random expert ids.
+
+- `pathpack_rebuild`: sort habit experts by `(fd, off)` of `gate_proj` (**PHYSICAL**).
+- `st_prefetch_phys` / `expert_prefetch_list`: sort tensors, **merge ranges** within 2 MB, one `posix_fadvise` per span.
+- Miss path: bulk physical WILLNEED before `ov_submit` loaders.
+- `TRAJ_WARM_EVERY=3` under `TAO=1` (less AUX).
+
+**Smoke (TEMP=0 NGEN=24 TAO, pin+GPU-first):** **0.50 tok/s** (disk 13.8 s, attn 10.2 s, matmul 5.0 s, other 16 s, traj_warm 0.5 s).  
+Did **not** beat §37 best **0.60**; keep physical packing for sequential I/O correctness, do not claim a new record. Full container **rewrite** still future work.
+
 ### 37. PROFILE-AUX + throttle traj_warm/pathpack (2026-07-12)
 
 **Problem:** NGEN=24 TAO run at 0.40 tok/s had `other ≈ 28 s` (~half wall) unaccounted.

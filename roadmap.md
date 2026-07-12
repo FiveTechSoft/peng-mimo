@@ -13,11 +13,12 @@ GPU (`COLI_CUDA=1 CUDA_DENSE=1`); the speed dial is **expert hit-rate**,
 |---|---|---|---|---|---|---|---|
 | §25 PROMPT | GPU-first + moe_acc | ~60% | 8.9 s | — | ~16 s | — | **0.55** |
 | §32 SPEED | byte-strided GEMV + pin | ~60% | 10.6 s | 11 s | **4.9 s** | 20 s | **0.51** |
-| §37 TAO + throttle | TRAJ_WARM_EVERY=2, PATHPACK_EVERY=8 | 54% | 14.4 s | 9.1 s | 4.6 s | **5.9 s** | **0.60** |
+| §37 TAO + throttle | TRAJ_WARM_EVERY=2, PATHPACK_EVERY=8 | 54% | 14.4 s | 9.1 s | 4.6 s | **5.9 s** | **0.60** ← **best** |
+| §38 physical pathpack | disk-order pack + merged fadvise | 58% | 13.8 s | 10.2 s | 5.0 s | 16 s | 0.50 |
 
 **Gate 1.0 tok/s: still FAIL.** Soft ceiling on this box **~0.55–0.65** tok/s.
-Latest win was cutting hidden **other** (pathpack rebuild + traj_warm every
-token), not inventing FLOPs.
+**Project best remains 0.60 tok/s** (§37). Physical pathpack is landed for sequential
+WILLNEED; did not raise the record. Latest big win was cutting hidden **other**.
 
 ### Stack landed (keep)
 
@@ -61,7 +62,8 @@ Even at **0.60 tok/s**:
 ### A. Fit more experts (hit-rate) — main lever for 1.0
 
 - [ ] Host **32–64 GB RAM** (architecture-level win)
-- [ ] **Physical pathpack repack** of shards (sequential readahead; bit-exact values)
+- [x] **Physical pathpack (runtime):** disk-order of habit experts + merged fadvise (§38)
+- [ ] **Physical pathpack repack** of safetensor shards on disk (true sequential layout)
 - [ ] int2 experts (`ebits=2`) + quality gate
 - [ ] Native Linux vs WSL2 I/O
 - [x] SWA ring KV, REPIN→VRAM, autopin 85%, bitmaps, FLOW/ENERGY
