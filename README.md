@@ -20,6 +20,10 @@ A MoE activates few parameters per token. In MiMo-V2.5: of 311B total only ~15B 
 
 Cost per cold token: 47 × 8 × 12.6 MB ≈ **4.7 GB of reads** → on the NVMe of the dev machine (2.75 GB/s measured on random 19 MB reads) the physical ceiling is **~0.6 tok/s**, improving with warm cache. It's not fast: it's a 311B model responding on a desktop machine.
 
+> **Best speed so far (this project, 2026-07-12):** **0.60 tok/s** on the full 311B int4 container  
+> (`TAO=1` + GPU-first pin + PROFILE-AUX throttles, `NGEN=24`, pin+GPU warm, WSL2 / RTX 3060 12 GB / ~23 GB RAM).  
+> Details: [`findings.md`](findings.md) §37, [`roadmap.md`](roadmap.md). Gate **1.0 tok/s** is still open.
+
 **SSD wear:** those numbers are almost entirely **reads**. Consumer NVMe endurance is rated in **terabytes written (TBW)**; heavy read streams do not consume TBW the way writes do. Sustained generation can heat the drive and throttle; keep the model on a local ext4/NVMe path (not `/mnt/c` VHDX) and expect multi‑TB *read* in long benches without meaningful write wear. Logs / `.coli_usage` writes are negligible.
 
 ## Why MiMo-V2.5
@@ -174,6 +178,21 @@ line: **more RAM is the lever** — at `cap`→3 the disk is the ceiling and PIL
 only overlaps it; at 32–64 GB (`cap` 8–64) the README's 0.31–0.43 tok/s
 applies and PILOT's edge shrinks toward ~0% (experts cached, no stall).
 
+#### Best speed so far (2026-07-12) — project record
+
+On the **same box** (23 GB RAM, RTX 3060 12 GB, WSL2, SNAP on ext4 `/root/mimo25_i4`), with
+autopin + GPU-first + `TAO=1` / `SPEED=1` and throttled traj/pathpack (`findings` §37):
+
+| Metric | Value |
+|---|---|
+| **tok/s** | **0.60** (best we have measured) |
+| Protocol | `PROMPT` … `NGEN=24`, `PILOT=0`, `COLI_CUDA=1 CUDA_DENSE=1` |
+| hit-rate | ~54% |
+| PROFILE (approx.) | disk ~14 s · attn ~9 s · matmul ~4.6 s · other ~6 s |
+
+That is the **best throughput achieved in this repo** to date — still short of the 1.0 tok/s goal;
+more host RAM / native Linux / higher hit remain the main levers (`roadmap.md`).
+
 ### Validation results (2026-07-10)
 
 | Gate | Result |
@@ -277,7 +296,7 @@ PROMPT='The capital of France is' NGEN=8 TEMP=0 SNAP=~/mimo25_i4 ./mimo 64 4 8
 
 ### What to expect
 
-On the dev machine (8 cores, 32 GB RAM, 2.75 GB/s NVMe): 20 s load and **0.43 tok/s** cold with chat defaults (`TOPP=0.7 DIRECT=1`, measured 2.15× over baseline 0.20). It's a frontier 311B model on desktop hardware: telegram patience, frontier quality.
+On the dev machine (WSL2, ~23 GB RAM, RTX 3060 12 GB, 2.75 GB/s NVMe): load tens of seconds; **cold** chat is often ~0.2–0.4 tok/s. With warm pin/GPU-first and `TAO=1`, we have measured up to **0.60 tok/s** — **the best speed recorded for this project** so far (see above and `findings.md` §37). It's a frontier 311B model on desktop hardware: telegram patience, frontier quality.
 
 The native **MTP head** of MiMo is integrated (int8, lossless verified byte for byte, acceptance ~64%) but off by default: on disk-bound hosts the validation batch loads more cold experts than it saves in forwards. Enable it with `DRAFT=2` if you have RAM for a warm expert cache — that's where it shines. More RAM is lever #1 (cache scales itself); see the prediction table in the [colibri README](docs/README-colibri-upstream.md).
 
