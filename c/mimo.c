@@ -3616,9 +3616,14 @@ int main(int argc, char **argv){
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     /* SERVE/chat: speed-oriented defaults (override with env). Oracle/TF keep exact path. */
     int serve_mode = getenv("SERVE") && atoi(getenv("SERVE"));
+    /* TAO=1: wu wei — Corriente stack without force. Explicit env always wins.
+     * Residual is the Way; pin/FLOW/ENERGY yield to free VRAM; no DRAFT thrash. */
+    int tao_mode = getenv("TAO") && atoi(getenv("TAO"));
+    if(tao_mode)
+        fprintf(stderr,"[TAO] wu wei: flow with residual · thaw/ignite without force · DRAFT stays off\n");
     /* SPEED=1: unity profile — fewer experts/token, tighter I/O anticipatory stack.
      * Does not change matmul math (TOPK only shrinks routed set). Chat --fast sets it. */
-    int speed_mode = getenv("SPEED") && atoi(getenv("SPEED"));
+    int speed_mode = getenv("SPEED") ? atoi(getenv("SPEED")) : (tao_mode ? 1 : 0);
     if(speed_mode)
         fprintf(stderr,"[SPEED] profile on (TOPK/TRAJ/REPIN/TOPP defaults tightened; env overrides win)\n");
     g_nopack = getenv("NOPACK")?1:0;
@@ -3632,8 +3637,9 @@ int main(int argc, char **argv){
     else g_topp = speed_mode ? 0.55 : 0;         /* SPEED: nucleus trim (measured stack) */
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
     g_spec = getenv("SPEC")?atoi(getenv("SPEC")):1;
-    g_draft = getenv("DRAFT")?atoi(getenv("DRAFT")):-1;   /* draft per forward; -1 = auto dopo il
-                                                           * load (testa MTP presente -> 3, no -> 0) */
+    if(getenv("DRAFT")) g_draft=atoi(getenv("DRAFT"));
+    else if(tao_mode) g_draft=0;                 /* TAO: do not force MTP draft on cold disk */
+    else g_draft=-1;                             /* -1 = auto after load (MTP head -> often 0) */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):(serve_mode?1:0);
     g_overlap = getenv("OVERLAP")?atoi(getenv("OVERLAP")):1;   /* 0 = load/compute a fasi (A/B) */
     { const char *e=getenv("OVERLAP_T"); if(e){ g_overlap_t=atoi(e);
@@ -3643,12 +3649,12 @@ int main(int argc, char **argv){
       if(e) g_i4s=atoi(e);
       else if(serve_mode) g_i4s=1;   /* chat default; CUDA path may force I4S=1 below */
     }
-    /* REPIN: SERVE/SPEED every 32 tok (mid-gen load is expensive on WSL if too eager) */
-    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):(serve_mode||speed_mode?32:0);
+    /* REPIN: SERVE/SPEED every 32 tok; TAO slightly softer (less thrash = wu wei) */
+    g_repin = getenv("REPIN")?atoi(getenv("REPIN")):(tao_mode?48:(serve_mode||speed_mode?32:0));
     g_memwatch = getenv("MEMWATCH")?atoi(getenv("MEMWATCH")):1;  /* #71: adapt ecap each SERVE turn */
     /* Trajectory bulk WILLNEED: default ON for SERVE (multi-turn hit); off for oracle/TF */
     if(getenv("TRAJ")) g_traj=atoi(getenv("TRAJ"));
-    else g_traj = (serve_mode || speed_mode) ? 1 : 0;
+    else g_traj = (serve_mode || speed_mode || tao_mode) ? 1 : 0;
     if(getenv("TRAJ_K")){ g_traj_k=atoi(getenv("TRAJ_K")); if(g_traj_k<1)g_traj_k=1; if(g_traj_k>8)g_traj_k=8; }
     else g_traj_k = (speed_mode || serve_mode) ? 6 : 8;  /* lean: more K was fadvise storm */
     if(getenv("TRAJ_DEPTH")){ g_traj_depth=atoi(getenv("TRAJ_DEPTH")); if(g_traj_depth<1)g_traj_depth=1; if(g_traj_depth>4)g_traj_depth=4; }
@@ -3657,7 +3663,7 @@ int main(int argc, char **argv){
                 g_traj_k, g_traj_depth);
     /* FLOW: path-pack channel thaw (Corriente Peng). Default ON with TRAJ/SERVE/SPEED. */
     if(getenv("FLOW")) g_flow=atoi(getenv("FLOW"));
-    else g_flow = (g_traj>0 || serve_mode || speed_mode) ? 1 : 0;
+    else g_flow = (g_traj>0 || serve_mode || speed_mode || tao_mode) ? 1 : 0;
     if(getenv("FLOW_R")){ g_flow_r=atoi(getenv("FLOW_R")); if(g_flow_r<1)g_flow_r=1; if(g_flow_r>8)g_flow_r=8; }
     if(g_flow>0)
         fprintf(stderr,"[FLOW] pathpack channel thaw on (R=%d; FLOW=0 off)\n", g_flow_r);

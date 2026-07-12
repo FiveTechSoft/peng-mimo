@@ -207,6 +207,8 @@ scripts/start_peng.sh prompt "la capital de Francia es" 24
 
 The script refuses to be silent about `SNAP` under `/mnt/c` (slow 9p), picks `~/mimo25_i4` or `/root/mimo25_i4`, and tiers knobs by free RAM (PILOT+SPEED on ≤24 GB; DRAFT stays off unless you set it).
 
+**Tao (wu wei):** `TAO=1 scripts/start_peng.sh chat` — FLOW + ENERGY auto + SPEED, no forced DRAFT. See [`docs/tao.md`](docs/tao.md).
+
 ### Requirements
 
 - Linux or WSL2, gcc with OpenMP, CPU with AVX2

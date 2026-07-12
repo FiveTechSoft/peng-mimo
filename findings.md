@@ -630,6 +630,15 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 36. TAO=1 — wu wei stack (2026-07-12)
+
+Meta-profile: flow with the residual, do not force.
+
+- `TAO=1` → SPEED/TRAJ/FLOW on (if unset), `ENERGY` auto, **`DRAFT=0`**, softer `REPIN=48`.
+- Explicit env always wins. Log: `[TAO] wu wei: flow with residual · …`
+- Docs: `docs/tao.md` (yin/yang of snow/light, non-forcing I/O).
+- `scripts/start_peng.sh` honors `TAO=1` before tier defaults.
+
 ### 35. ENERGY — channel snow → pure VRAM (2026-07-12)
 
 **Metaphor made real:** free weight potential into GPU compute.

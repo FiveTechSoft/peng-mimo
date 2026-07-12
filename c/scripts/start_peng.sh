@@ -8,7 +8,23 @@
 #   scripts/start_peng.sh env                 # print export lines
 #
 # Override any knob: SNAP=... PIN_GB=4 PILOT=0 SPEED=1 scripts/start_peng.sh chat
+# Tao (wu wei): TAO=1 scripts/start_peng.sh chat
 set -euo pipefail
+
+# TAO=1 → Corriente without force (explicit env still wins)
+if [[ "${TAO:-0}" == "1" ]]; then
+  export SPEED="${SPEED:-1}"
+  export TRAJ="${TRAJ:-1}"
+  export FLOW="${FLOW:-1}"
+  export FLOW_R="${FLOW_R:-2}"
+  export ENERGY="${ENERGY:--1}"
+  export DRAFT="${DRAFT:-0}"
+  export REPIN="${REPIN:-48}"
+  export PILOT="${PILOT:-1}"
+  export PILOT_DEPTH="${PILOT_DEPTH:-1}"
+  export PREFETCH="${PREFETCH:-1}"
+  export DIRECT="${DIRECT:-1}"
+fi
 
 CODE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="$(cd "$CODE/.." && pwd)"
@@ -133,6 +149,9 @@ fi
 
 print_banner() {
   echo "========== peng-mimo start =========="
+  if [[ "${TAO:-0}" == "1" ]]; then
+    echo " TAO=1  wu wei · flow with residual · do not force"
+  fi
   echo " SNAP=$SNAP"
   echo " tier: $TIER"
   echo " COLI_CUDA=$COLI_CUDA CUDA_DENSE=$CUDA_DENSE"

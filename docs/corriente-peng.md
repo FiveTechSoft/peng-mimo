@@ -1,7 +1,9 @@
 # Corriente Peng — MiMo beyond the net
 
-**Status:** design manifesto + first executable seed (`path_pack_analyze.py`)  
+**Status:** design manifesto + FLOW/ENERGY in engine + path-pack tools  
 **Does not change tokens.** Bit-exact math of MiMo-V2.5 stays the law until a new form is validated.
+
+**Tao:** flow without force — [`docs/tao.md`](tao.md) · `TAO=1`
 
 ---
 
