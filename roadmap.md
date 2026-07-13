@@ -106,7 +106,7 @@ Even at **0.60 tok/s**:
 
 - [x] `start_peng.sh`, `TAO=1`, Corriente / sacred geometry docs
 - [x] MiMo chat template, cancel/health API (earlier F-xx)
-- [ ] QUALITY vs FAST one-pager in README (brief)
+- [x] QUALITY vs FAST one-pager in README (§40 frontier table)
 
 ### E. Correctness gates (do not regress)
 
