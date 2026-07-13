@@ -80,6 +80,16 @@ Even at **0.60 tok/s**:
   Stack TOPK=6 (§40), native Linux (§18), DRAFT=2 on warm RAM → ~1.2–1.5 realistic.
   (Old ~0.66 estimate was §29-era kernels: matmul 15.5 s pre-GEMV.)
 
+### A1. Lossless zstd expert pack (§41) — in progress
+
+- [x] **Measured (§41): real int4 experts compress to ~74.7% with zstd-1** (order-0
+  entropy floor; zstd-3 buys nothing). Decompress 3.4+ GB/s on 8 threads > NVMe
+  2.75 GB/s line rate. Estimated **0.60 → ~0.72–0.79 tok/s lossless**, disk 165 → ~123 GB.
+- [ ] Repack tool: per-expert zstd-1 frames + offset index (sidecar pack)
+- [ ] Loader: decompress in async loader pool (slab path), bit-exact gate vs
+  uncompressed container
+- [ ] Measure real tok/s delta on the §37 protocol
+
 ### A. Fit more experts (hit-rate) — main lever for 1.0
 
 - [ ] Host **32–64 GB RAM** (architecture-level win)

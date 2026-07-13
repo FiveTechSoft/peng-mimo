@@ -630,6 +630,43 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 41. Lossless zstd on int4 experts: ~25% fewer disk bytes, bit-exact (2026-07-13)
+
+**Origin:** evaluated a DFloat11-style proposal (lossless BF16 exponent compression,
+[arXiv 2504.11651](https://arxiv.org/abs/2504.11651)) — 16 → ~11.2 bits/weight via
+sign+exponent entropy coding. **Not applicable as-is:** peng experts are already int4;
+11.2 bits/weight would be ~2.8× *larger* and ~3× slower on the disk-bound path. But the
+underlying question transfers: *do our int4 expert bytes compress losslessly at all?*
+
+**Measured on the real container** (`/root/mimo25_i4`, 128–512 MB samples at multiple
+offsets of `out-00004` / `out-00010`, WSL2, 16 cores):
+
+| measurement | value |
+|---|---|
+| zstd-1 ratio (4 chunks, 2 shards) | **74.2–74.8%** |
+| zstd-3 ratio | identical to zstd-1 (±0.02%) |
+| zstd-1 ratio, per-expert-size frame (13 MB) | **74.7%** |
+| byte entropy of expert data | 5.89 bits/byte → 73.7% order-0 floor |
+| zero bytes | 0.0% (no padding artifact) |
+| decompress, 1 thread (CLI) | 0.95 GB/s |
+| decompress, 8 parallel processes | **3.41 GB/s** aggregate (> 2.75 GB/s NVMe line rate; CLI spawn tax included — in-process libzstd should do better) |
+
+**Why it compresses:** int4 quantized weights cluster near zero → skewed 4-bit symbol
+distribution. zstd-1 already sits on the order-0 entropy floor (74.7% vs 73.7% ideal),
+so higher levels buy nothing — the redundancy is symbol skew, not repeats. (The tiny
+random-init models compressed to only ~89%; real trained weights are the signal.)
+
+**Cold-token math:** 4.7 GB reads → ~3.5 GB compressed. Read 1.71 s → 1.27 s at
+2.75 GB/s. Decompress 4.7 GB output at 3.4+ GB/s ≈ 1.38 s, overlappable with reads in
+the existing async loader pool (cores are idle while IO-blocked). Pipelined estimate:
+**0.6 → ~0.72–0.79 tok/s, lossless, bit-exact** — a §40-frontier shift with zero
+quality cost, stackable with TOPK/TOPP trims. Bonus: expert store 165 → ~123 GB.
+
+**Plan (accepted):** per-expert zstd-1 frames in a sidecar pack + offset index;
+decompress in the existing loader pthread pool (`mimo.c` slab path); whole-container
+repack; bit-exact validation vs current container. Design doc:
+`docs/superpowers/specs/2026-07-13-zstd-expert-pack-design.md`.
+
 ### 40. Expert-trim quality matrix: fixed TOPK beats adaptive TOPP (2026-07-13)
 
 **Setup:** SCORE mode (teacher-forcing, §39 harness), fixed corpus 767+767 tokens
