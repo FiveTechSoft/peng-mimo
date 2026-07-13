@@ -106,8 +106,9 @@ Even at **0.60 tok/s**:
   + SCORE gate: EK192 = prose +7.8% but **code +67%** — usage history is
   prose-biased, pruning removed the code specialists. **Naive frequency pruning
   rejected with data.**
-- [ ] Multi-profile prune criterion: union of top-n across `.coli_usage.<profile>`
-  heat maps (code/chat/multi) or diverse-corpus usage; re-run EKEEP matrix
+- [~] Multi-profile prune criterion (§42.4): domain corpora + per-profile usage
+  collection + union mask builder + engine `EKEEP_MASK` — landed; SCORE gate
+  vs EK192 baseline pending (collection running 2026-07-13)
 - [ ] If a criterion passes screening: broad-corpus validation (10-20k tokens),
   agreement@5/KL, router stats, then physical pruned container (+zstd §41:
   keep-192 ≈ 80 GB)

@@ -676,7 +676,7 @@ BASE reproduced §40 to the last decimal):
 | BASE | 256 | 165 GB | 12.40 | — | 2.07 | — |
 | EK192 | 192 | 111 GB | 13.36 | **+7.8%** | 3.46 | **+67%** |
 | EK128 | 128 | 74 GB | 20.58 | +66% | 10.60 | **+411%** |
-| EK96 | 96 | 55 GB | (pending) | | (pending) | |
+| EK96 | 96 | 55 GB | 28.76 | +132% | 23.10 | **+1016%** |
 
 **The headline finding:** degradation is wildly asymmetric. Prose survives EK192
 cheaper than TOPK=6 (+7.8% vs +11%) — but code explodes (+67%, worse than the
@@ -692,6 +692,21 @@ engine already supports profiles (`COLI_PROFILE`). Gate pipeline agreed for any
 finalist: broad 10-20k-token corpus → agreement@5/KL if borderline → router-stats
 sanity (entropy, per-expert token share) → minimal downstream (HumanEval subset)
 before publishing any pruned container.
+
+**42.4 Multi-profile union criterion (in progress)** — machinery landed:
+
+- `scripts/make_domain_corpora.py`: per-domain SCORE requests, deliberately
+  **disjoint from the evaluation corpus** (prose = tao/corriente docs not README;
+  C = glm.c not olmoe.c; Python = converter tools) — the mask must not be tuned
+  on the exam.
+- Usage collection: `COLI_PROFILE=collect_<d>` (fresh profile → no contamination)
+  + `STATS=<file>` dumps that domain's pure expert heat map after a SCORE pass.
+- `scripts/build_ekeep_mask.py`: keep the union of each profile's top-K per layer.
+- Engine `EKEEP_MASK=<file>`: explicit keep-list ("layer eid" lines); absent layer
+  = all eligible; validates ≥ topk survivors per layer; overrides EKEEP. No-op
+  regression: tiny oracle TF 31/32 unchanged.
+
+Result vs EK192's prose +7.8% / code +67%: **PENDING** (collection running).
 
 ### 41. Lossless zstd on int4 experts: ~25% fewer disk bytes, bit-exact (2026-07-13)
 

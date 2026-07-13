@@ -3931,9 +3931,30 @@ int main(int argc, char **argv){
           fprintf(stderr,"[PROFILE] COLI_PROFILE=%s -> %s\n", g_profile, g_usage_path);
       int64_t hist = usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] storia expert: %lld selezioni (%s)\n",(long long)hist,g_usage_path);
+      /* §42 EKEEP_MASK=<file>: keep-list esplicita "layer eid" (unione multi-profilo,
+       * scripts/build_ekeep_mask.py). Layer assente dal file -> tutti eleggibili. */
+      const char *mkf = getenv("EKEEP_MASK");
+      if(mkf && *mkf){
+          FILE *f=fopen(mkf,"r");
+          if(!f){ perror(mkf); exit(1); }
+          int E=m.c.n_experts, NL=m.c.n_layers, L,e; int64_t kept=0;
+          g_ekeep_mask=calloc((size_t)NL*E,1);
+          uint8_t *seenL=calloc(NL,1);
+          while(fscanf(f,"%d %d",&L,&e)==2)
+              if(L>=0&&L<NL&&e>=0&&e<E){ g_ekeep_mask[(size_t)L*E+e]=1; seenL[L]=1; kept++; }
+          fclose(f);
+          for(int Li=0;Li<NL;Li++) if(!seenL[Li]) for(int ei=0;ei<E;ei++) g_ekeep_mask[(size_t)Li*E+ei]=1;
+          /* ogni layer MoE mascherato deve conservare almeno topk expert */
+          for(int Li=0;Li<NL;Li++){ if(!seenL[Li]||!m.c.is_moe[Li]) continue; int n=0;
+              for(int ei=0;ei<E;ei++) n+=g_ekeep_mask[(size_t)Li*E+ei];
+              if(n<m.c.topk){ fprintf(stderr,"[EKEEP_MASK] layer %d: %d expert < topk=%d\n",Li,n,m.c.topk); exit(1); } }
+          free(seenL);
+          fprintf(stderr,"[EKEEP_MASK] %s: %lld expert eleggibili\n",mkf,(long long)kept);
+      }
       /* §42 EKEEP=n: poda runtime dei (256-n) expert meno usati per layer. Richiede
        * storia d'uso; tie a zero uso -> vince l'eid basso (deterministico). */
       g_ekeep = getenv("EKEEP")?atoi(getenv("EKEEP")):0;
+      if(g_ekeep_mask && g_ekeep>0){ fprintf(stderr,"[EKEEP] ignorato: EKEEP_MASK attivo\n"); g_ekeep=0; }
       if(g_ekeep>0){
           int E=m.c.n_experts, K=m.c.topk, NL=m.c.n_layers;
           if(g_ekeep<K){ fprintf(stderr,"[EKEEP] n=%d < topk=%d: alzato a %d\n",g_ekeep,K,K); g_ekeep=K; }
