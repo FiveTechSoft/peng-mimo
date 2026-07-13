@@ -662,10 +662,40 @@ the existing async loader pool (cores are idle while IO-blocked). Pipelined esti
 **0.6 → ~0.72–0.79 tok/s, lossless, bit-exact** — a §40-frontier shift with zero
 quality cost, stackable with TOPK/TOPP trims. Bonus: expert store 165 → ~123 GB.
 
-**Plan (accepted):** per-expert zstd-1 frames in a sidecar pack + offset index;
-decompress in the existing loader pthread pool (`mimo.c` slab path); whole-container
-repack; bit-exact validation vs current container. Design doc:
-`docs/superpowers/specs/2026-07-13-zstd-expert-pack-design.md`.
+**Landed (2026-07-13):** zstd-1 frames inside the safetensors container (per-tensor
+`"nb"` key + `__metadata__.peng_zstd="1"`), `st.h` decompress-on-read, `expert_load`
+coalesced frame pread → decompress into slab. Repack tool `c/tools/repack_zstd.py`
+(streaming, atomic, `--verify`). Spec: `docs/superpowers/specs/2026-07-13-zstd-expert-pack-design.md`.
+
+**Measured results (full 311B container):**
+
+- **Size: 151.8 → 109.0 GiB (71.8%), all 17 shards verified byte-exact.** That is
+  **2.87 effective bits/weight, lossless** — smaller than a hypothetical int3 (3.0
+  bits) with zero quality cost.
+- **Bit-exactness at full scale:** TEMP=0 PROMPT produces identical text on both
+  containers ("Rome, the Eternal City,"), same experts/token (658.0), same VRAM
+  tier behavior. Tiny oracle: TF 31/32, greedy 15/20 — identical to uncompressed,
+  across `OVERLAP=0/1` and `DIRECT=1`.
+- **Speed: LOSS of ~18% on the reference box.** Same-day warm §37 protocol:
+  i4 0.46/0.38/0.34 tok/s (disk 7.7–8.2 s) vs i4z 0.36/0.33/0.31/0.30 (disk
+  13.9–15.6 s). `LOADNICE=0/5` (new knob: loader-thread nice) and `OVERLAP_T=8`
+  do NOT recover it — `OVERLAP_T=8` is much worse (0.21, contention).
+
+**Why the §41 estimate was wrong:** the "cores are idle while IO-blocked" premise
+does not hold — the OVERLAP pipeline already fills cores with expert matmul during
+loads. Decompression is ~1.05 s/token of NEW CPU work (4 GB/token at ~0.95 GB/s ×
+4 loader threads) on a box whose host matmul already needs ~1.25 s/token of the
+same cores. Nothing to hide it behind; priority games don't create capacity. This
+also falsifies the "dequant compute hides in the disk-wait shadow" assumption
+(relevant upstream: colibri #81 rotation-preconditioned int2 has the same cost model).
+
+**Where the compressed container DOES win:** storage/download (26% less; HF
+distribution), boxes with spare cores relative to NVMe speed (native Linux without
+the WSL2 I/O CPU tax may qualify — untested), and RAM-pin-all configs (128 GB
+roadmap: decompress once at pin time, zero steady-state cost, 43 GB less disk).
+**Default stays uncompressed for streaming on this box.** Future rescue idea:
+upload compressed frames over PCIe (−28% traffic) + GPU decompress (nvcomp zstd)
++ GPU matmul — DFloat11's actual pattern; roadmap-level work.
 
 ### 40. Expert-trim quality matrix: fixed TOPK beats adaptive TOPP (2026-07-13)
 

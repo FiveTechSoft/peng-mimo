@@ -1498,8 +1498,12 @@ static void *ov_worker(void *a){ (void)a;
      * dell'overlap. I loader stanno quasi sempre bloccati in pread; il nice conta solo
      * nei tratti CPU (copia dalla page-cache), dove devono cedere il passo.
      * EN: deprioritize loaders so the OMP matmul team keeps the cores; loaders mostly
-     * block in pread anyway (per-thread nice is Linux-specific and exactly what we want). */
-    setpriority(PRIO_PROCESS,(id_t)syscall(SYS_gettid),10);
+     * block in pread anyway (per-thread nice is Linux-specific and exactly what we want).
+     * §41: coi container peng_zstd i loader fanno lavoro CPU VERO (decompress zstd), non
+     * solo attese I/O: a nice 10 la decompressione non si sovrappone mai (misurato
+     * 0.46 -> 0.36 tok/s). LOADNICE regola la priorita' (default 10; 0 = nessun nice). */
+    int ln = getenv("LOADNICE")?atoi(getenv("LOADNICE")):10;
+    if(ln) setpriority(PRIO_PROCESS,(id_t)syscall(SYS_gettid),ln);
 #endif
     for(;;) if(!ov_claim(UINT_MAX)) usleep(200);
     return NULL; }

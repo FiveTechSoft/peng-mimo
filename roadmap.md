@@ -80,15 +80,20 @@ Even at **0.60 tok/s**:
   Stack TOPK=6 (§40), native Linux (§18), DRAFT=2 on warm RAM → ~1.2–1.5 realistic.
   (Old ~0.66 estimate was §29-era kernels: matmul 15.5 s pre-GEMV.)
 
-### A1. Lossless zstd expert pack (§41) — in progress
+### A1. Lossless zstd expert pack (§41) — DONE, mixed verdict
 
-- [x] **Measured (§41): real int4 experts compress to ~74.7% with zstd-1** (order-0
-  entropy floor; zstd-3 buys nothing). Decompress 3.4+ GB/s on 8 threads > NVMe
-  2.75 GB/s line rate. Estimated **0.60 → ~0.72–0.79 tok/s lossless**, disk 165 → ~123 GB.
-- [ ] Repack tool: per-expert zstd-1 frames + offset index (sidecar pack)
-- [ ] Loader: decompress in async loader pool (slab path), bit-exact gate vs
-  uncompressed container
-- [ ] Measure real tok/s delta on the §37 protocol
+- [x] **Size win: 151.8 → 109.0 GiB (71.8%), byte-exact verified, bit-exact engine
+  output** (2.87 effective bits/weight, lossless — smaller than int3 would be).
+- [x] Repack tool `c/tools/repack_zstd.py` (streaming, atomic, `--verify`,
+  `--skip-existing`), format flag `peng_zstd`, reader in `st.h` + `expert_load`.
+- [x] **Speed: −18% on this box** (i4z ~0.31 vs i4 ~0.38 same-day median).
+  Decompress = ~1.05 s/token new CPU work; OVERLAP already keeps cores busy —
+  no shadow to hide it in. `LOADNICE` knob added; doesn't recover. **Default
+  container stays uncompressed for streaming here.**
+- [ ] Native Linux re-test (no WSL2 I/O CPU tax → spare cores → may flip sign)
+- [ ] 128 GB RAM config: compressed container + decompress-once at pin = free win
+- [ ] GPU decompress path (nvcomp zstd, −28% PCIe, frees host CPU) — big, pairs
+  with the CUDA expert tier
 
 ### A. Fit more experts (hit-rate) — main lever for 1.0
 
