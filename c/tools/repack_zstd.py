@@ -26,18 +26,22 @@ def tensor_items(hdr):
 
 
 def repack_shard(src, dst):
+    """Streaming: frames go to a temp data file as they are produced, so peak
+    memory is one tensor, not one shard (a 17 GB shard held ~12 GB of frames
+    in RAM and OOM-killed the 23 GB WSL VM on the first full-container run)."""
     cctx = zstandard.ZstdCompressor(level=LEVEL)
-    with open(src, "rb") as f:
+    tmpdata = dst + ".tmpdata"
+    with open(src, "rb") as f, open(tmpdata, "wb") as fo:
         hdr, data_start = read_header(f)
-        new_hdr, frames, off = {}, [], 0
+        new_hdr, off = {}, 0
         for name, t in tensor_items(hdr):
             a, b = t["data_offsets"]
             f.seek(data_start + a)
             frame = cctx.compress(f.read(b - a))
+            fo.write(frame)
             new_hdr[name] = {"dtype": t["dtype"], "shape": t["shape"],
                              "data_offsets": [off, off + len(frame)],
                              "nb": b - a}
-            frames.append(frame)
             off += len(frame)
     meta = dict(hdr.get("__metadata__", {}))
     meta["peng_zstd"] = "1"
@@ -47,10 +51,11 @@ def repack_shard(src, dst):
     with open(tmp, "wb") as f:
         f.write(struct.pack("<Q", len(hj)))
         f.write(hj)
-        for frame in frames:
-            f.write(frame)
+        with open(tmpdata, "rb") as fd:
+            shutil.copyfileobj(fd, f, 64 << 20)
         f.flush(); os.fsync(f.fileno())
     os.rename(tmp, dst)
+    os.remove(tmpdata)
     return off
 
 
@@ -82,6 +87,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--verify-only", action="store_true")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="skip shards whose dst already exists (crash resume); "
+                         "rely on --verify to validate the skipped ones")
     args = ap.parse_args()
     shards = sorted(x for x in os.listdir(args.indir)
                     if x.endswith(".safetensors"))
@@ -93,6 +101,10 @@ def main():
         for i, sh in enumerate(shards):
             src = os.path.join(args.indir, sh)
             dst = os.path.join(args.out, sh)
+            if args.skip_existing and os.path.exists(dst) and os.path.getsize(dst) > 0:
+                tin += os.path.getsize(src); tout += os.path.getsize(dst)
+                print(f"[{i+1}/{len(shards)}] {sh}: skip (exists)", flush=True)
+                continue
             out = repack_shard(src, dst)
             tin += os.path.getsize(src); tout += os.path.getsize(dst)
             print(f"[{i+1}/{len(shards)}] {sh}: "
