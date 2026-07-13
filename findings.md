@@ -670,10 +670,15 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
    point (+11% ppl, +13% speed), TOPP=0.7 the balanced point (+19% ppl, +38%
    speed), TOPP=0.55 the speed point (+70% ppl, +53% speed). `SPEED=1` keeping
    TOPP=0.55 is defensible for demos; for real use prefer TOPP=0.7 or TOPK=6.
-   Untested: TOPK=6 + TOPP=0.7 hybrid (cap then adaptive).
-3. Code degrades less than prose in relative ppl (denser routing consensus), but
+3. **Hybrid `TOPK=6 TOPP=0.7` tested and discarded (2026-07-13):** ppl prose
+   19.20 (+55%), code 2.60 (+26%), agree 67.1%/84.6%; speed 0.45 tok/s with
+   ~220 experts/tok. Same speed as plain TOPP=0.7 (0.44) but 3× the quality
+   hit — the 0.7 mass cut applies to the already-capped 6-expert mass, so it
+   trims deeper (≈TP055–TP060 territory). Composition doesn't dominate;
+   the three-point frontier above stands.
+4. Code degrades less than prose in relative ppl (denser routing consensus), but
    absolute code ppl is so low (2.07) that even +5% is visible in agreement.
-4. Reproduce: `scripts/make_score_corpus.py` + `scripts/bench_topp_ppl.sh` +
+5. Reproduce: `scripts/make_score_corpus.py` + `scripts/bench_topp_ppl.sh` +
    `scripts/ppl_report.py`.
 
 ### 39. SWA ring corrupted batch prefill — found by oracle, fixed (2026-07-12)

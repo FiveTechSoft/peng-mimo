@@ -71,7 +71,8 @@ Even at **0.60 tok/s**:
   TOPK=6 → 0.36 tok/s (+11% ppl); TOPP=0.7 → 0.44 (+19%); TOPP=0.55 → 0.49 (+70%);
   top-8 → 0.32. Speed ~linear in experts loaded. Keep TOPP=0.55 for SPEED demos;
   recommend TOPP=0.7 (balanced) or TOPK=6 (quality) elsewhere.
-- [ ] Test hybrid `TOPK=6 TOPP=0.7` (cap then adaptive) — may dominate TOPP=0.7
+- [x] Hybrid `TOPK=6 TOPP=0.7` tested: 0.45 tok/s but +55% ppl (0.7 mass cut on
+  already-capped 6 trims deeper) — dominated by plain TOPP=0.7, discarded (§40.3)
 - [ ] Layered trim: keep top-8 on first/last ~4 layers, TOPK=5–6 in the middle
 - [ ] 128 GB RAM quote: 4×32 GB DDR4-2666 ECC RDIMM (~$250 used, ~$970 new kit)
   + install; kills the disk pole entirely. §37 physics with disk→0:

@@ -3,7 +3,7 @@
 import math
 
 DIR = "/root/ppl_topp"
-CFGS = ["BASE", "TP070", "TP060", "TP055", "TP050", "TK6", "TK5"]
+CFGS = ["BASE", "TP070", "TP060", "TP055", "TP050", "TK6", "TK5", "HYB"]
 
 base_am = [l.split() for l in open(f"{DIR}/BASE.argmax")]
 hdr = ("cfg", "ppl_prosa", "ppl_code", "agree_prosa", "agree_code")
