@@ -655,9 +655,22 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
    router: TOPP trims hardest exactly on flat-distribution tokens — the uncertain,
    decision-heavy positions where the tail experts matter most. TOPK removes the
    same 2 lowest-weight experts everywhere, which is far more benign.
-2. **`SPEED=1` default `TOPP=0.55` is expensive: +70% prose ppl.** Switch the
-   default trim to `TOPK=6` (similar disk savings, ~6× smaller quality hit).
-   Speed re-validation pending (§29 warned trims can *lower* hit-rate).
+2. **`SPEED=1` default `TOPP=0.55` is expensive: +70% prose ppl.** Speed measured
+   (2026-07-13, Rome NGEN=24, TAO/SPEED/CUDA stack, warm run of 2):
+
+   | trim | experts loaded/tok (per-layer) | tok/s | Δppl prose |
+   |---|---|---|---|
+   | none (top-8) | 470 (10.0) | 0.29–0.32 | — |
+   | TOPK=6 | 352 (7.5) | **0.36** | +11% |
+   | TOPP=0.7 | 280 (6.0) | **0.44** | +19% |
+   | TOPP=0.55 | 208 (4.4) | **0.49** | +70% |
+
+   Speed tracks experts-loaded almost linearly (matmul 31s→28s→20s→15s). So the
+   trims form a quality/speed frontier, not a free win: TOPK=6 is the quality
+   point (+11% ppl, +13% speed), TOPP=0.7 the balanced point (+19% ppl, +38%
+   speed), TOPP=0.55 the speed point (+70% ppl, +53% speed). `SPEED=1` keeping
+   TOPP=0.55 is defensible for demos; for real use prefer TOPP=0.7 or TOPK=6.
+   Untested: TOPK=6 + TOPP=0.7 hybrid (cap then adaptive).
 3. Code degrades less than prose in relative ppl (denser routing consensus), but
    absolute code ppl is so low (2.07) that even +5% is visible in agreement.
 4. Reproduce: `scripts/make_score_corpus.py` + `scripts/bench_topp_ppl.sh` +

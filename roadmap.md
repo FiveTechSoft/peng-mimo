@@ -67,8 +67,11 @@ Even at **0.60 tok/s**:
 
 ### A0. Quality-aware trim (from §40 matrix)
 
-- [ ] **Switch SPEED default `TOPP=0.55` → `TOPK=6`**: +11% ppl vs +70%, similar
-  expert savings. Re-measure tok/s + hit-rate (trims can lower VRAM hits, §29).
+- [x] **Measured (§40): trims are a quality/speed frontier, not a free win.**
+  TOPK=6 → 0.36 tok/s (+11% ppl); TOPP=0.7 → 0.44 (+19%); TOPP=0.55 → 0.49 (+70%);
+  top-8 → 0.32. Speed ~linear in experts loaded. Keep TOPP=0.55 for SPEED demos;
+  recommend TOPP=0.7 (balanced) or TOPK=6 (quality) elsewhere.
+- [ ] Test hybrid `TOPK=6 TOPP=0.7` (cap then adaptive) — may dominate TOPP=0.7
 - [ ] Layered trim: keep top-8 on first/last ~4 layers, TOPK=5–6 in the middle
 - [ ] 128 GB RAM quote: 4×32 GB DDR4-2666 ECC RDIMM (~$250 used, ~$970 new kit)
   + install; kills the disk pole entirely. §37 physics with disk→0:
