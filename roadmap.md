@@ -95,6 +95,25 @@ Even at **0.60 tok/s**:
 - [ ] GPU decompress path (nvcomp zstd, −28% PCIe, frees host CPU) — big, pairs
   with the CUDA expert tier
 
+### A2. MiMo-lite: fewer experts without retraining (§42) — explored, naive version rejected
+
+- [x] **Expert redundancy measured (§42.1): no near-duplicate experts** (mid/late
+  layers orthogonal, cos < 0.07) — intra-layer merging is out. Early layers share
+  a common component (delta-coding candidate, marginal).
+- [x] **Usage long-tail measured (§42.2):** only 2.5% of experts unused (3.7 GB);
+  Gini 0.615. Keep-192 covers 98.4% of historical calls.
+- [x] **EKEEP=n runtime prune landed** (mask by usage rank, zero disk, reversible)
+  + SCORE gate: EK192 = prose +7.8% but **code +67%** — usage history is
+  prose-biased, pruning removed the code specialists. **Naive frequency pruning
+  rejected with data.**
+- [ ] Multi-profile prune criterion: union of top-n across `.coli_usage.<profile>`
+  heat maps (code/chat/multi) or diverse-corpus usage; re-run EKEEP matrix
+- [ ] If a criterion passes screening: broad-corpus validation (10-20k tokens),
+  agreement@5/KL, router stats, then physical pruned container (+zstd §41:
+  keep-192 ≈ 80 GB)
+- [ ] Engine dump extensions for the gate: top-5 ids+probs in SCORE_DUMP,
+  per-layer router entropy
+
 ### A. Fit more experts (hit-rate) — main lever for 1.0
 
 - [ ] Host **32–64 GB RAM** (architecture-level win)

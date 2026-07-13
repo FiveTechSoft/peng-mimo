@@ -781,6 +781,12 @@ static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (0.95 = generation_co
                           * MiMo-V2.5, verificato: temperature=1.0, top_p=0.95) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
+/* §42 EKEEP=n: maschera di PODA per-layer — solo gli n expert piu' usati (storia
+ * .coli_usage) restano eleggibili al routing; il resto non viene MAI scelto ne' letto.
+ * Simula un container potato senza riscrivere nulla (reversibile, EKEEP assente = off).
+ * mask[layer*E+e]=1 -> eleggibile. */
+static uint8_t *g_ekeep_mask=NULL;
+static int g_ekeep=0;
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
 static int g_overlap=1;  /* OVERLAP=0 -> disattiva la pipeline load/compute dentro il layer
                           * (torna alle due fasi serializzate: prima tutti i load, poi i matmul) */
@@ -1736,8 +1742,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
+        const uint8_t *km = g_ekeep_mask ? g_ekeep_mask+(size_t)layer*E : NULL;
         for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
-            for(int e=0;e<E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
+            for(int e=0;e<E;e++){ if(km && !km[e]) continue;   /* §42 EKEEP: potato */
+                int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
                 if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
             idx[kk]=best; w[kk]=logit[best];
         }
@@ -1988,7 +1996,9 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
         m->t_router += now_s()-tr0;
         for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
         int top[64], kt=0;
-        for(int e=0;e<E && kt<K;e++){ int b=-1; for(int f=0;f<E;f++) if((b<0||ch[f]>ch[b])&&!in_top(top,kt,f)) b=f; if(b>=0) top[kt++]=b; }
+        const uint8_t *km = g_ekeep_mask ? g_ekeep_mask+(size_t)lnext*E : NULL;   /* §42 EKEEP */
+        for(int e=0;e<E && kt<K;e++){ int b=-1; for(int f=0;f<E;f++){ if(km && !km[f]) continue;
+            if((b<0||ch[f]>ch[b])&&!in_top(top,kt,f)) b=f; } if(b>=0) top[kt++]=b; }
         for(int k=0;k<K;k++){ int e=top[k];
             if(seen){ seen[e]=1; continue; }           /* prefill: solo raccolta, prefetch dopo (dedup) */
             if(g_looka) pilot_pred[lnext][k]=e;
@@ -3921,6 +3931,35 @@ int main(int argc, char **argv){
           fprintf(stderr,"[PROFILE] COLI_PROFILE=%s -> %s\n", g_profile, g_usage_path);
       int64_t hist = usage_load(&m,g_usage_path);
       if(hist>0) fprintf(stderr,"[USAGE] storia expert: %lld selezioni (%s)\n",(long long)hist,g_usage_path);
+      /* §42 EKEEP=n: poda runtime dei (256-n) expert meno usati per layer. Richiede
+       * storia d'uso; tie a zero uso -> vince l'eid basso (deterministico). */
+      g_ekeep = getenv("EKEEP")?atoi(getenv("EKEEP")):0;
+      if(g_ekeep>0){
+          int E=m.c.n_experts, K=m.c.topk, NL=m.c.n_layers;
+          if(g_ekeep<K){ fprintf(stderr,"[EKEEP] n=%d < topk=%d: alzato a %d\n",g_ekeep,K,K); g_ekeep=K; }
+          if(hist<=0) fprintf(stderr,"[EKEEP] ATTENZIONE: nessuna storia d'uso (%s) — poda per eid basso, quasi certamente dannosa\n",g_usage_path);
+          if(g_ekeep>=E){ g_ekeep=0; }
+          else {
+              g_ekeep_mask=calloc((size_t)NL*E,1);
+              int *ord=malloc(E*sizeof(int)); int64_t masked=0;
+              for(int L=0;L<NL;L++){
+                  if(!m.c.is_moe[L]||!m.eusage[L]){ for(int e=0;e<E;e++) g_ekeep_mask[(size_t)L*E+e]=1; continue; }
+                  for(int e=0;e<E;e++) ord[e]=e;
+                  /* selection sort dei top g_ekeep per uso (E=256: costo nullo, una tantum) */
+                  for(int a=0;a<g_ekeep;a++){ int besti=a;
+                      for(int b=a+1;b<E;b++)
+                          if(m.eusage[L][ord[b]]>m.eusage[L][ord[besti]] ||
+                             (m.eusage[L][ord[b]]==m.eusage[L][ord[besti]] && ord[b]<ord[besti])) besti=b;
+                      int t=ord[a]; ord[a]=ord[besti]; ord[besti]=t;
+                      g_ekeep_mask[(size_t)L*E+ord[a]]=1;
+                  }
+                  masked += E-g_ekeep;
+              }
+              free(ord);
+              fprintf(stderr,"[EKEEP] n=%d/%d per layer: %lld expert mascherati (~%.1f GB mai letti)\n",
+                      g_ekeep,E,(long long)masked,(double)masked*12.6/1024.0);
+          }
+      }
       if(g_traj>0) traj_load();   /* warm Markov from previous sessions */
       if(g_flow>0){
           /* Prefer live PHYSICAL rebuild (disk order of habit experts); file is cache. */

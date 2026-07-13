@@ -630,6 +630,69 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 42. Can we make a small MiMo? Expert redundancy, usage, and the EKEEP prune matrix (2026-07-13)
+
+Three linked experiments toward a "MiMo-lite" (fewer experts, no retraining). Net
+verdict: **experts are not redundant, and naive usage-based pruning destroys exactly
+the domains your usage history under-represents.** The infrastructure for doing it
+right (per-domain usage profiles) already exists in the engine.
+
+**42.1 Inter-expert redundancy (`scripts/expert_redundancy.py`)** — dequantized
+`gate_proj` of all 256 experts, pairwise cosine on a fixed 131k-coord subsample,
+layers 1/24/46 + cross-layer control:
+
+| layer | mean \|cos\| | max pair | pairs > 0.9 |
+|---|---|---|---|
+| 1 (early) | **0.401** | 0.65 | 0 |
+| 24 (mid) | 0.0085 | 0.031 | 0 |
+| 46 (late) | 0.0145 | 0.064 | 0 |
+| cross-layer control | 0.0027 | 0.012 | — |
+
+No near-duplicates anywhere → **intra-layer expert merging is not viable.** Early
+layers share a strong common component (top pair: 34% identical int4 bytes vs 0.4%
+random baseline) — delta-coding early layers against a per-layer centroid could
+squeeze a few extra points on top of §41's zstd, but only in those few layers.
+This shared structure is also part of what zstd is already collecting blindly.
+
+**42.2 Usage distribution (`scripts/usage_analysis.py` on `.coli_usage`, 1.96 M
+selections)** — the long tail is fatter than the literature suggests: only 2.5% of
+experts (297/12,032, ~3.7 GB) have zero recorded use; per-layer Gini 0.615; top-16
+serves ~30-38% (not 80%). Keeping 192/128/96 per layer covers 98.4% / 90.8% /
+82.9% of historical calls. Caveat flagged at the time: history ≈ 5,200 tokens of
+mostly-prose benchmarks.
+
+**42.3 EKEEP runtime prune + SCORE gate** — new env `EKEEP=n` (mimo.c): at boot,
+rank each layer's experts by usage history, mask all but the top n; the router
+never selects (and the engine never reads) the rest. Simulates a pruned container
+with zero disk writes, fully reversible. Guards: `EKEEP<topk` raised, no-history
+warning. No-op regression: without EKEEP, tiny oracle stays bit-exact (TF 31/32,
+greedy 15/20). Masked selection applied in `moe()` top-k and PILOT lookahead.
+
+SCORE matrix (§39/§40 harness, same fixed 767+767-token corpus, deterministic —
+BASE reproduced §40 to the last decimal):
+
+| config | experts/layer | disk equiv. | ppl prose | Δ | ppl code | Δ |
+|---|---|---|---|---|---|---|
+| BASE | 256 | 165 GB | 12.40 | — | 2.07 | — |
+| EK192 | 192 | 111 GB | 13.36 | **+7.8%** | 3.46 | **+67%** |
+| EK128 | 128 | 74 GB | 20.58 | +66% | 10.60 | **+411%** |
+| EK96 | 96 | 55 GB | (pending) | | (pending) | |
+
+**The headline finding:** degradation is wildly asymmetric. Prose survives EK192
+cheaper than TOPK=6 (+7.8% vs +11%) — but code explodes (+67%, worse than the
+worst §40 trim) because the usage history is prose-dominated and the pruner
+removed the code specialists. The "rarely used expert" is not dead weight; it is
+the specialist for whatever your history lacks. Frequency-based pruning measured
+as **workload bias made permanent**.
+
+**Design implication:** a viable MiMo-lite needs per-domain coverage, not raw
+frequency — e.g. union of top-n across several `.coli_usage.<profile>` heat maps
+(code/chat/multilingual), or usage gathered on a deliberately diverse corpus. The
+engine already supports profiles (`COLI_PROFILE`). Gate pipeline agreed for any
+finalist: broad 10-20k-token corpus → agreement@5/KL if borderline → router-stats
+sanity (entropy, per-expert token share) → minimal downstream (HumanEval subset)
+before publishing any pruned container.
+
 ### 41. Lossless zstd on int4 experts: ~25% fewer disk bytes, bit-exact (2026-07-13)
 
 **Origin:** evaluated a DFloat11-style proposal (lossless BF16 exponent compression,
