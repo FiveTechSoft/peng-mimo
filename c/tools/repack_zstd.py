@@ -10,7 +10,8 @@ import argparse, json, os, shutil, struct, sys
 import zstandard
 
 LEVEL = 1  # measured at the order-0 entropy floor; higher levels buy nothing (§41)
-AUX = ("config.json", "generation_config.json")
+AUX = ("config.json", "generation_config.json",
+       "tokenizer.json", "tokenizer_config.json")
 
 
 def read_header(f):
