@@ -106,9 +106,16 @@ Even at **0.60 tok/s**:
   + SCORE gate: EK192 = prose +7.8% but **code +67%** — usage history is
   prose-biased, pruning removed the code specialists. **Naive frequency pruning
   rejected with data.**
-- [~] Multi-profile prune criterion (§42.4): domain corpora + per-profile usage
-  collection + union mask builder + engine `EKEEP_MASK` — landed; SCORE gate
-  vs EK192 baseline pending (collection running 2026-07-13)
+- [x] **Multi-profile prune criterion (§42.4): WORKS.** Union of per-domain top-K
+  (prose/C/Python/general profiles) — UNION179 = 104 GB expert store (−37%) at
+  prose +7.8%, code −1.8% (≤ noise). Naive EK192's +67% code collapse eliminated.
+  Tools: `make_domain_corpora.py`, `build_ekeep_mask.py`, engine `EKEEP_MASK`.
+- [ ] **MiMo-lite 128 GB play:** 104 GB pruned store fits entirely in RAM →
+  disk pole gone → §37 physics ≈ 1.2 tok/s (gate PASS) on the ~$250 upgrade.
+  Blocked on finalist validation below.
+- [ ] Finalist gates before physical container: broad 10–20k-token corpus,
+  agreement@5/KL, router entropy stats, HumanEval subset; then pruned+zstd
+  container (~75 GB) + speed bench (est. +10–25% from cache coverage)
 - [ ] If a criterion passes screening: broad-corpus validation (10-20k tokens),
   agreement@5/KL, router stats, then physical pruned container (+zstd §41:
   keep-192 ≈ 80 GB)

@@ -706,7 +706,31 @@ before publishing any pruned container.
   = all eligible; validates ≥ topk survivors per layer; overrides EKEEP. No-op
   regression: tiny oracle TF 31/32 unchanged.
 
-Result vs EK192's prose +7.8% / code +67%: **PENDING** (collection running).
+**Result — the union criterion eliminates the code collapse entirely:**
+
+| config | experts/layer (avg) | disk equiv. | ppl prose | Δ | ppl code | Δ |
+|---|---|---|---|---|---|---|
+| BASE | 256 | 165 GB | 12.40 | — | 2.073 | — |
+| EK192 (naive frequency) | 192 | 111 GB | 13.36 | +7.8% | 3.46 | **+67%** |
+| **UNION208** (top-128 × 4 profiles) | 208 | 134 GB | 13.19 | **+6.4%** | 2.068 | **−0.2%** |
+| **UNION179** (top-96 × 4 profiles) | 179 | 104 GB | 13.37 | **+7.8%** | 2.036 | **−1.8%** |
+
+Code goes from +67% damage (naive, same prose cost) to *indistinguishable from
+BASE* (−0.2% / −1.8% ≤ noise) once each domain contributes its own top-K to the
+union. UNION179 gives a **−37% expert store (165 → 104 GB; ~75 GB with §41 zstd)
+at prose +7.8% and code intact** — strictly dominating naive EK192 (same prose
+cost, 7 GB smaller, code undamaged).
+
+Why the big picture matters: pruning does not reduce experts loaded per token
+(router still picks 8), so direct tok/s gain is limited to better cache coverage
+of a smaller pool (est. +10–25%, unmeasured). The real prize is the 128 GB RAM
+roadmap row: a 104 GB expert store **fits entirely in RAM** — disk pole gone,
+§37 physics ≈ 1.2 tok/s, gate 1.0 passed on a ~$250 upgrade.
+
+Caveats before believing more than screening: same 1.5k-token evaluation corpus
+as §40 (the collection corpora are disjoint, but the exam is narrow); pending
+gates per the agreed pipeline — broad 10–20k-token corpus, agreement@5/KL,
+router stats, minimal downstream — before any physical pruned container ships.
 
 ### 41. Lossless zstd on int4 experts: ~25% fewer disk bytes, bit-exact (2026-07-13)
 
