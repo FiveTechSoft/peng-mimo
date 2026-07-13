@@ -24,6 +24,23 @@ Cost per cold token: 47 × 8 × 12.6 MB ≈ **4.7 GB of reads** → on the NVMe 
 > (`TAO=1` + GPU-first pin + PROFILE-AUX throttles, `NGEN=24`, pin+GPU warm, WSL2 / RTX 3060 12 GB / ~23 GB RAM).  
 > Details: [`findings.md`](findings.md) §37, [`roadmap.md`](roadmap.md). Gate **1.0 tok/s** is still open.
 
+### QUALITY vs FAST — what the trim knobs really cost
+
+The 0.60 record runs with `TOPP=0.55`, which skips low-router-weight experts. On 2026-07-13 we
+**measured** what that costs (teacher-forcing perplexity on a fixed 767+767-token prose/code corpus,
+`findings.md` §40). Expert trims form a **quality/speed frontier** — pick a point, nothing is free:
+
+| knob | tok/s (same day, warm) | ppl prose | ppl code | use it for |
+|---|---|---|---|---|
+| none (top-8, exact model) | 0.32 | 12.40 | 2.07 | reference answers |
+| `TOPK=6` | 0.36 | +11% | +5% | **quality** default |
+| `TOPP=0.7` | 0.44 | +19% | +16% | **balanced** default |
+| `TOPP=0.55` (`SPEED=1` default) | 0.49–0.60 | **+70%** | +45% | demos / speed records |
+
+Speed tracks experts-loaded almost linearly. Combining knobs (`TOPK=6 TOPP=0.7`) was tested and
+**discarded**: same speed as `TOPP=0.7`, 3× the quality hit (§40.3). Day-to-day variance is real:
+the same `TOPP=0.55` stack measured 0.60 on 07-12 and 0.49 on 07-13 (cache/VM state).
+
 **SSD wear:** those numbers are almost entirely **reads**. Consumer NVMe endurance is rated in **terabytes written (TBW)**; heavy read streams do not consume TBW the way writes do. Sustained generation can heat the drive and throttle; keep the model on a local ext4/NVMe path (not `/mnt/c` VHDX) and expect multi‑TB *read* in long benches without meaningful write wear. Logs / `.coli_usage` writes are negligible.
 
 ## Why MiMo-V2.5
