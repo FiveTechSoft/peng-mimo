@@ -9,9 +9,13 @@
 
 The name comes from the mythological bird from the Chinese *Zhuangzi*: a colossal creature that stays in flight by riding a whirlwind — much like this engine keeps "airborne" a 311B parameter model on a continuous stream of NVMe reads, on a machine with 32 GB of RAM.
 
+<p align="center"><img src="assets/illustrations/peng2.png" width="90%" alt="The Peng metaphor: 4.7 GB of cold expert reads per token riding a 2.75 GB/s NVMe stream"></p>
+
 Derived project from colibri (Apache 2.0, © JustVugg). The original upstream engine README is at [`docs/README-colibri-upstream.md`](docs/README-colibri-upstream.md).
 
 ## The inherited idea from colibri
+
+<p align="center"><img src="assets/illustrations/peng3.png" width="90%" alt="Residency map: dense int4 resident in RAM, 12,032 routed experts on NVMe, per-layer LRU in between"></p>
 
 A MoE activates few parameters per token. In MiMo-V2.5: of 311B total only ~15B work per token, mostly 8 experts (of 256 possible) per each of the 47 MoE layers. Thus:
 
@@ -25,6 +29,8 @@ Cost per cold token: 47 × 8 × 12.6 MB ≈ **4.7 GB of reads** → on the NVMe 
 > Details: [`findings.md`](findings.md) §37, [`roadmap.md`](roadmap.md). Gate **1.0 tok/s** is still open.
 
 ### QUALITY vs FAST — what the trim knobs really cost
+
+<p align="center"><img src="assets/illustrations/peng11.png" width="90%" alt="Quality vs speed frontier (findings §40): TOPK=6, TOPP=0.7, TOPP=0.55 measured"></p>
 
 The 0.60 record runs with `TOPP=0.55`, which skips low-router-weight experts. On 2026-07-13 we
 **measured** what that costs (teacher-forcing perplexity on a fixed 767+767-token prose/code corpus,
@@ -57,6 +63,8 @@ core-limited hosts. Details: [`findings.md`](findings.md) §41.
 
 ## Why MiMo-V2.5
 
+<p align="center"><img src="assets/illustrations/peng4.png" width="90%" alt="Model selection matrix: MiMo-V2.5 vs GLM-5.2, Hunyuan Hy3, Qwen3.5"></p>
+
 Chosen after comparing candidates (GLM-5.2 744B, Hunyuan Hy3 295B, Qwen3.5-122B):
 
 | criterion | MiMo-V2.5 | GLM-5.2 | Hy3 | Qwen3.5-122B |
@@ -70,6 +78,8 @@ Chosen after comparing candidates (GLM-5.2 744B, Hunyuan Hy3 295B, Qwen3.5-122B)
 MiMo-V2.5 maximizes colibri reuse: router, FP8→int4 converter, streaming, AVX2 int4/int8 kernels — everything is inherited almost intact. Only attention changes (and it's *simpler* than GLM's MLA+DSA).
 
 ## MiMo-V2.5 Architecture (verified against official config.json and modeling)
+
+<p align="center"><img src="assets/illustrations/peng5.png" width="90%" alt="MiMo-V2.5 logical geometry: 48 layers, top-8 of 256 experts, 15B of 311B active"></p>
 
 - 48 layers: layer 0 dense (MLP 16384), layers 1–47 MoE (256 experts top-8, inter. 2048, no shared expert)
 - Hybrid attention: **9 full layers** (indices 0,5,11,17,23,29,35,41,47; 64Q/4KV heads, theta 10M) and **39 sliding-window 128 layers** (64Q/8KV heads, theta 10k, with *attention sink bias* per head)
@@ -91,6 +101,7 @@ Two static SVGs render on GitHub; open the HTML for an interactive Three.js orbi
 | **3D interactive** | Toggle MiMo stack ↔ peng memory map (drag / zoom) | [`docs/diagrams/mimo-vs-peng-3d.html`](docs/diagrams/mimo-vs-peng-3d.html) |
 | **Corriente Peng** | Residual as river · MoE as vortices · NVMe as snow · mouth = lm_head | [`docs/diagrams/corriente-peng.svg`](docs/diagrams/corriente-peng.svg) · [manifesto](docs/corriente-peng.md) |
 | **Sacred geometry** | Vesica (full/SWA) · flower (layers) · octagon (top-8) · φ budgets | [`docs/diagrams/sacred-geometry-mimo.svg`](docs/diagrams/sacred-geometry-mimo.svg) · [doc](docs/sacred-geometry.md) |
+| **Illustrated tour** | 14 conceptual infographics covering the whole project | [`docs/illustrations.md`](docs/illustrations.md) |
 
 #### 0) Corriente Peng — beyond the net (conception)
 
@@ -133,6 +144,8 @@ How to read it:
 > **Interactive 3D:** open [`docs/diagrams/mimo-vs-peng-3d.html`](docs/diagrams/mimo-vs-peng-3d.html) in a browser (needs network once for the Three.js CDN). Use the tabs *Logical MiMo* / *Physical peng*.
 
 ## Method (colibri's): token-exact validation first
+
+<p align="center"><img src="assets/illustrations/peng8.png" width="90%" alt="Bit-exact validation pipeline: tiny oracle, C engine matching, lossless packing, full container"></p>
 
 Nothing is taken for granted without reproducing **bit for bit** the tokens from the reference implementation (`transformers` + official `modeling_mimo_v2.py`):
 
