@@ -630,6 +630,39 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 40. Expert-trim quality matrix: fixed TOPK beats adaptive TOPP (2026-07-13)
+
+**Setup:** SCORE mode (teacher-forcing, §39 harness), fixed corpus 767+767 tokens
+(prose = README, code = olmoe.c), real MiMo int4. `ppl = exp(−logprob/tokens)`;
+`agree` = top-1 argmax agreement vs BASE per position. One run per config
+(deterministic: same input, same routing).
+
+| cfg | ~experts/layer | ppl prose | ppl code | Δ prose | Δ code | agree prose | agree code |
+|---|---|---|---|---|---|---|---|
+| BASE top-8 | 8.0 | **12.40** | **2.07** | — | — | 100% | 100% |
+| TOPK=6 | 6.0 | 13.81 | 2.17 | **+11%** | **+5%** | 78.4% | 91.7% |
+| TOPK=5 | 5.0 | 15.28 | 2.31 | +23% | +12% | 75.9% | 88.4% |
+| TOPP=0.7 | ~7.1 | 14.73 | 2.40 | +19% | +16% | 74.3% | 87.4% |
+| TOPP=0.6 | ~5.8 | 17.59 | 2.73 | +42% | +32% | 68.4% | 84.9% |
+| TOPP=0.55 | ~5.2 | 21.10 | 3.01 | **+70%** | **+45%** | 62.2% | 82.7% |
+| TOPP=0.5 | ~4.7 | 23.35 | 3.30 | +88% | +59% | 58.5% | 79.9% |
+
+**Findings:**
+
+1. **Fixed top-k dominates adaptive top-p at equal expert budget.** TOPK=6 costs
+   +11%/+5% ppl; TOPP=0.6 (fewer experts on average: ~5.8) costs 4-6× more. The
+   intuition "let easy tokens use fewer experts" is backwards on MiMo's sigmoid
+   router: TOPP trims hardest exactly on flat-distribution tokens — the uncertain,
+   decision-heavy positions where the tail experts matter most. TOPK removes the
+   same 2 lowest-weight experts everywhere, which is far more benign.
+2. **`SPEED=1` default `TOPP=0.55` is expensive: +70% prose ppl.** Switch the
+   default trim to `TOPK=6` (similar disk savings, ~6× smaller quality hit).
+   Speed re-validation pending (§29 warned trims can *lower* hit-rate).
+3. Code degrades less than prose in relative ppl (denser routing consensus), but
+   absolute code ppl is so low (2.07) that even +5% is visible in agreement.
+4. Reproduce: `scripts/make_score_corpus.py` + `scripts/bench_topp_ppl.sh` +
+   `scripts/ppl_report.py`.
+
 ### 39. SWA ring corrupted batch prefill — found by oracle, fixed (2026-07-12)
 
 **Symptom:** SCORE mode (teacher-forcing log-likelihood, built for the TOPP/TOPK quality matrix) returned ~uniform logprobs (~10 nats/token, ppl ≈ 25000) and argmax predictions that were pure noise (`。。。`, 0/767 top-1 on real MiMo).

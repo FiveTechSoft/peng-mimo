@@ -65,6 +65,14 @@ Even at **0.60 tok/s**:
 
 ## Next experiments (priority)
 
+### A0. Quality-aware trim (from §40 matrix)
+
+- [ ] **Switch SPEED default `TOPP=0.55` → `TOPK=6`**: +11% ppl vs +70%, similar
+  expert savings. Re-measure tok/s + hit-rate (trims can lower VRAM hits, §29).
+- [ ] Layered trim: keep top-8 on first/last ~4 layers, TOPK=5–6 in the middle
+- [ ] 128 GB RAM quote: 4×32 GB DDR4-2666 ECC RDIMM (~$250 used, ~$970 new kit)
+  + install; kills the disk pole entirely (§29 physics → ~0.66 ceiling, then attn/matmul)
+
 ### A. Fit more experts (hit-rate) — main lever for 1.0
 
 - [ ] Host **32–64 GB RAM** (architecture-level win)
