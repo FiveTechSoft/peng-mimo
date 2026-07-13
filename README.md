@@ -41,6 +41,18 @@ Speed tracks experts-loaded almost linearly. Combining knobs (`TOPK=6 TOPP=0.7`)
 **discarded**: same speed as `TOPP=0.7`, 3× the quality hit (§40.3). Day-to-day variance is real:
 the same `TOPP=0.55` stack measured 0.60 on 07-12 and 0.49 on 07-13 (cache/VM state).
 
+### Lossless zstd container (§41) — smaller, not faster (here)
+
+The int4 container compresses **151.8 → 109.0 GiB (71.8%, zstd-1)** with **bit-exact**
+output — effectively 2.87 bits/weight, lossless, smaller than a lossy int3 would be.
+The engine reads it natively (`c/tools/repack_zstd.py` + `peng_zstd` container flag).
+Measured catch: on the 16-core reference box, streaming compressed is **~18% slower**
+(0.31 vs 0.38 tok/s) — decompression is ~1 s/token of new CPU work and the OVERLAP
+pipeline already keeps every core busy during loads; there is no idle I/O shadow to
+hide it in. Use the compressed container for **distribution/storage** (26% smaller)
+and RAM-pin-all setups; keep the plain int4 for maximum streaming tok/s on
+core-limited hosts. Details: [`findings.md`](findings.md) §41.
+
 **SSD wear:** those numbers are almost entirely **reads**. Consumer NVMe endurance is rated in **terabytes written (TBW)**; heavy read streams do not consume TBW the way writes do. Sustained generation can heat the drive and throttle; keep the model on a local ext4/NVMe path (not `/mnt/c` VHDX) and expect multi‑TB *read* in long benches without meaningful write wear. Logs / `.coli_usage` writes are negligible.
 
 ## Why MiMo-V2.5
