@@ -1176,6 +1176,31 @@ static void embed_row(Model *m, int tok, float *x){
     for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
 }
 
+/* §41: scratch per-thread per i frame zstd degli expert (3 frame coalescenti,
+ * ~14 MB compressi). Allineato 4K per il pread O_DIRECT. Grow-only. */
+static __thread char   *ez_buf;
+static __thread int64_t ez_cap;
+static __thread ZSTD_DCtx *ez_dctx;
+static char *ez_scratch(int64_t need) {
+    if (!ez_buf || ez_cap < need) {
+        free(ez_buf);
+        ez_cap = need + 8192;
+        if (posix_memalign((void**)&ez_buf, 4096, (size_t)ez_cap)) {
+            fprintf(stderr, "OOM ez_scratch\n"); exit(1);
+        }
+    }
+    return ez_buf;
+}
+static void ez_decompress(const st_tensor *t, const char *src, char *dst) {
+    if (!ez_dctx) { ez_dctx = ZSTD_createDCtx(); if (!ez_dctx) { fprintf(stderr, "OOM ZSTD_DCtx\n"); exit(1); } }
+    size_t r = ZSTD_decompressDCtx(ez_dctx, dst, (size_t)t->nbytes, src, (size_t)t->znbytes);
+    if (ZSTD_isError(r) || (int64_t)r != t->nbytes) {
+        fprintf(stderr, "zstd expert frame corrotto: %s -> %s\n", t->name,
+                ZSTD_isError(r) ? ZSTD_getErrorName(r) : "size mismatch");
+        exit(1);
+    }
+}
+
 /* carica un expert nello slot. Container pre-quantizzato: le 3 matrici sono contigue nel
  * file -> UNA pread coalescente da ~19 MB dentro `slab` (+ le scale in fslab); i QT sono
  * viste dentro lo slab (zero copie). Fallback per modelli non quantizzati (oracolo tiny).
@@ -1214,10 +1239,57 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     if(!s->fslab || ftot > s->fslab_cap){ free(s->fslab); s->fslab=falloc(ftot); s->fslab_cap=ftot; }
     int ord[3]={0,1,2};                          /* ordina per offset nel file */
     for(int a=0;a<3;a++) for(int bb=a+1;bb<3;bb++) if(tw[ord[bb]]->off<tw[ord[a]]->off){ int t=ord[a]; ord[a]=ord[bb]; ord[bb]=t; }
+    int64_t pos[3]; int done=0;
+    if(tw[0]->znbytes>0){                        /* §41: container peng_zstd */
+        int64_t zw[3], zpos[3], zo=0;
+        for(int a=0;a<3;a++){ int k=ord[a]; zw[a]=tw[k]->znbytes; zpos[a]=zo; zo+=zw[a]; }
+        int zcontig = tw[ord[0]]->fd==tw[ord[1]]->fd && tw[ord[1]]->fd==tw[ord[2]]->fd
+                   && tw[ord[0]]->off+tw[ord[0]]->znbytes==tw[ord[1]]->off
+                   && tw[ord[1]]->off+tw[ord[1]]->znbytes==tw[ord[2]]->off;
+        char *zb=ez_scratch(zo+8192); int64_t zskew=0; int zdone=0;
+        if(zcontig){
+            int64_t off0=tw[ord[0]]->off;
+            int dfd = g_direct ? st_direct_fd(&m->S, tw[ord[0]]->fd) : -1;
+            if(dfd>=0){                          /* O_DIRECT: offset/len allineati a 4K */
+                int64_t base=off0 & ~4095LL, need=(off0-base)+zo;
+                int64_t len=(need+4095)&~4095LL;
+                ssize_t r=pread(dfd, zb, len, base);
+                if(r>=need){ zskew=off0-base; zdone=1; }
+            }
+            if(!zdone){
+                if(pread(tw[ord[0]]->fd, zb, zo, off0)!=zo){ perror("pread zexpert"); exit(1); }
+                zskew=0; zdone=1;
+            }
+        } else {
+            for(int a=0;a<3;a++){ int k=ord[a];
+                if(pread(tw[k]->fd, zb+zpos[a], zw[a], tw[k]->off)!=zw[a]){ perror("pread zexpert"); exit(1); } }
+            zskew=0;
+        }
+        int64_t o=0;
+        for(int a=0;a<3;a++){ int k=ord[a];
+            ez_decompress(tw[k], zb+zskew+zpos[a], (char*)s->slab+o);
+            pos[k]=o; o+=tw[k]->nbytes; }
+        done=1;
+        float *fpz[3]; int64_t foz=0;            /* scale: frame piccoli, decompress diretto */
+        for(int k=0;k<3;k++){
+            st_zread(tq[k], (char*)(s->fslab+foz), tq[k]->nbytes);
+            fpz[k]=s->fslab+foz; foz+=tq[k]->nbytes/4; }
+        if(g_drop){
+            posix_fadvise(tw[ord[0]]->fd, tw[ord[0]]->off, zo, POSIX_FADV_DONTNEED);
+            for(int k=0;k<3;k++) posix_fadvise(tq[k]->fd, tq[k]->off, tq[k]->znbytes, POSIX_FADV_DONTNEED);
+        }
+        QT *qtz[3]={&s->g,&s->u,&s->d}; int OOz[3]={I,I,D}, IIz[3]={D,D,I};
+        for(int k=0;k<3;k++){
+            int64_t nb=tw[k]->nbytes;
+            int fmt = (nb==(int64_t)OOz[k]*IIz[k])?1 : (nb==(int64_t)OOz[k]*((IIz[k]+1)/2))?2 : 3;
+            qtz[k]->fmt=fmt; qtz[k]->O=OOz[k]; qtz[k]->I=IIz[k]; qtz[k]->qf=NULL;
+            qtz[k]->q8=(int8_t*)(s->slab+pos[k]); qtz[k]->q4=s->slab+pos[k]; qtz[k]->s=fpz[k];
+        }
+        s->eid=eid; return;
+    }
     int contig = tw[ord[0]]->fd==tw[ord[1]]->fd && tw[ord[1]]->fd==tw[ord[2]]->fd
               && tw[ord[0]]->off+tw[ord[0]]->nbytes==tw[ord[1]]->off
               && tw[ord[1]]->off+tw[ord[1]]->nbytes==tw[ord[2]]->off;
-    int64_t pos[3]; int done=0;
     if(contig){
         int64_t off0=tw[ord[0]]->off;
         int dfd = g_direct ? st_direct_fd(&m->S, tw[ord[0]]->fd) : -1;

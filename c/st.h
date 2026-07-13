@@ -17,7 +17,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
-#include <zstd.h>            /* after the other includes, before json.h */
+#include <zstd.h>            /* §41 peng_zstd frames */
 #include "json.h"
 #include "compat.h"
 
@@ -146,6 +146,7 @@ static ssize_t pread_full(int fd, void *buf, int64_t count, int64_t off) {
  * ZSTD_decompress verso dst. dst_cap in byte. Errore frame = container corrotto: fatale. */
 static __thread char   *st_zbuf;
 static __thread int64_t st_zbuf_cap;
+static __thread ZSTD_DCtx *st_zdctx;
 static void st_zread(const st_tensor *t, void *dst, int64_t dst_cap) {
     if (dst_cap < t->nbytes) {
         fprintf(stderr, "st_zread dst too small: %s need %lld cap %lld\n",
@@ -161,7 +162,8 @@ static void st_zread(const st_tensor *t, void *dst, int64_t dst_cap) {
     if (pread_full(t->fd, st_zbuf, t->znbytes, t->off) != t->znbytes) {
         perror("pread zstd frame"); exit(1);
     }
-    size_t r = ZSTD_decompress(dst, (size_t)dst_cap, st_zbuf, (size_t)t->znbytes);
+    if (!st_zdctx) { st_zdctx = ZSTD_createDCtx(); if (!st_zdctx) { fprintf(stderr, "OOM ZSTD_DCtx\n"); exit(1); } }
+    size_t r = ZSTD_decompressDCtx(st_zdctx, dst, (size_t)dst_cap, st_zbuf, (size_t)t->znbytes);
     if (ZSTD_isError(r) || (int64_t)r != t->nbytes) {
         fprintf(stderr, "zstd frame corrotto: %s off=%lld z=%lld -> %s\n",
                 t->name, (long long)t->off, (long long)t->znbytes,
@@ -271,6 +273,10 @@ static void st_init(shards *S, const char *snap_dir) {
                 }
                 znbytes = nbytes;                 /* frame compresso su disco */
                 nbytes  = (int64_t)nb->num;       /* payload logico */
+                if (znbytes < 1 && nbytes > 0) {
+                    fprintf(stderr, "peng_zstd empty frame: %s in %s\n", name, files[fi]);
+                    exit(1);
+                }
             }
             int64_t abs_end = data_start + b0;
             if (abs_end < data_start || abs_end > fsz) {
