@@ -727,6 +727,13 @@ of a smaller pool (est. +10–25%, unmeasured). The real prize is the 128 GB RAM
 roadmap row: a 104 GB expert store **fits entirely in RAM** — disk pole gone,
 §37 physics ≈ 1.2 tok/s, gate 1.0 passed on a ~$250 upgrade.
 
+**Speed (same-day §37 pairs):** UNION179 mask 0.47/0.55 tok/s vs BASE 0.44/0.44
+— **median +16%**, inside the predicted +10–25% cache-coverage band. The mask
+wins both pairs; best run shows the mechanism (matmul 16.4→14.2 s, disk
+7.8→7.2 s: redirected calls land on resident experts more often). Free speed on
+top of the disk savings — and unlike TOPP/TOPK trims, quality-neutral (§42.4
+table).
+
 Caveats before believing more than screening: same 1.5k-token evaluation corpus
 as §40 (the collection corpora are disjoint, but the exam is narrow); pending
 gates per the agreed pipeline — broad 10–20k-token corpus, agreement@5/KL,

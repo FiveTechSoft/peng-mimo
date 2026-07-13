@@ -113,9 +113,12 @@ Even at **0.60 tok/s**:
 - [ ] **MiMo-lite 128 GB play:** 104 GB pruned store fits entirely in RAM →
   disk pole gone → §37 physics ≈ 1.2 tok/s (gate PASS) on the ~$250 upgrade.
   Blocked on finalist validation below.
+- [x] **Speed measured: UNION179 mask = median +16% tok/s** (0.51 vs 0.44
+  same-day §37 pairs; best 0.55) — cache coverage of the smaller pool, exactly
+  in the predicted band. Quality-neutral speedup, stacks with everything.
 - [ ] Finalist gates before physical container: broad 10–20k-token corpus,
   agreement@5/KL, router entropy stats, HumanEval subset; then pruned+zstd
-  container (~75 GB) + speed bench (est. +10–25% from cache coverage)
+  container (~75 GB)
 - [ ] If a criterion passes screening: broad-corpus validation (10-20k tokens),
   agreement@5/KL, router stats, then physical pruned container (+zstd §41:
   keep-192 ≈ 80 GB)
