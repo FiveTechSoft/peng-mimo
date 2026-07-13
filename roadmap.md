@@ -71,7 +71,10 @@ Even at **0.60 tok/s**:
   expert savings. Re-measure tok/s + hit-rate (trims can lower VRAM hits, §29).
 - [ ] Layered trim: keep top-8 on first/last ~4 layers, TOPK=5–6 in the middle
 - [ ] 128 GB RAM quote: 4×32 GB DDR4-2666 ECC RDIMM (~$250 used, ~$970 new kit)
-  + install; kills the disk pole entirely (§29 physics → ~0.66 ceiling, then attn/matmul)
+  + install; kills the disk pole entirely. §37 physics with disk→0:
+  attn 9.1 + matmul 4.6 + other 5.9 ≈ 19.6 s / 24 tok ≈ **1.2 tok/s** (gate PASS).
+  Stack TOPK=6 (§40), native Linux (§18), DRAFT=2 on warm RAM → ~1.2–1.5 realistic.
+  (Old ~0.66 estimate was §29-era kernels: matmul 15.5 s pre-GEMV.)
 
 ### A. Fit more experts (hit-rate) — main lever for 1.0
 
