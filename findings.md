@@ -689,8 +689,9 @@ same cores. Nothing to hide it behind; priority games don't create capacity. Thi
 also falsifies the "dequant compute hides in the disk-wait shadow" assumption
 (relevant upstream: colibri #81 rotation-preconditioned int2 has the same cost model).
 
-**Where the compressed container DOES win:** storage/download (26% less; HF
-distribution), boxes with spare cores relative to NVMe speed (native Linux without
+**Where the compressed container DOES win:** storage/download (26% less; published:
+[`fivetech/MiMo-V2.5-colibri-peng-int4-zstd`](https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4-zstd),
+109 GB, all shards verified; `repack_zstd.py --unpack` converts back to plain int4 locally), boxes with spare cores relative to NVMe speed (native Linux without
 the WSL2 I/O CPU tax may qualify — untested), and RAM-pin-all configs (128 GB
 roadmap: decompress once at pin time, zero steady-state cost, 43 GB less disk).
 **Default stays uncompressed for streaming on this box.** Future rescue idea:

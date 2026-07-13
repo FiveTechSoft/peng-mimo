@@ -60,6 +60,40 @@ def repack_shard(src, dst):
     return off
 
 
+def unpack_shard(src, dst):
+    """Inverse of repack_shard: peng_zstd shard -> plain safetensors (bit-exact)."""
+    dctx = zstandard.ZstdDecompressor()
+    with open(src, "rb") as f:
+        hdr, data_start = read_header(f)
+        if hdr.get("__metadata__", {}).get("peng_zstd") != "1":
+            sys.exit(f"{src}: not a peng_zstd shard")
+        new_hdr, off = {}, 0
+        items = tensor_items(hdr)
+        for name, t in items:
+            new_hdr[name] = {"dtype": t["dtype"], "shape": t["shape"],
+                             "data_offsets": [off, off + t["nb"]]}
+            off += t["nb"]
+        meta = {k: v for k, v in hdr.get("__metadata__", {}).items()
+                if k != "peng_zstd"}
+        if meta:
+            new_hdr["__metadata__"] = meta
+        hj = json.dumps(new_hdr).encode()
+        tmp = dst + ".tmp"
+        with open(tmp, "wb") as fo:
+            fo.write(struct.pack("<Q", len(hj)))
+            fo.write(hj)
+            for name, t in items:
+                a, b = t["data_offsets"]
+                f.seek(data_start + a)
+                raw = dctx.decompress(f.read(b - a), max_output_size=t["nb"])
+                if len(raw) != t["nb"]:
+                    sys.exit(f"unpack size mismatch: {name} in {src}")
+                fo.write(raw)
+            fo.flush(); os.fsync(fo.fileno())
+    os.rename(tmp, dst)
+    return off
+
+
 def verify_shard(src, dst):
     dctx = zstandard.ZstdDecompressor()
     with open(src, "rb") as fs, open(dst, "rb") as fd:
@@ -91,12 +125,29 @@ def main():
     ap.add_argument("--skip-existing", action="store_true",
                     help="skip shards whose dst already exists (crash resume); "
                          "rely on --verify to validate the skipped ones")
+    ap.add_argument("--unpack", action="store_true",
+                    help="inverse direction: peng_zstd container -> plain safetensors")
     args = ap.parse_args()
     shards = sorted(x for x in os.listdir(args.indir)
                     if x.endswith(".safetensors"))
     if not shards:
         sys.exit(f"no .safetensors in {args.indir}")
     os.makedirs(args.out, exist_ok=True)
+    if args.unpack:
+        for i, sh in enumerate(shards):
+            out = unpack_shard(os.path.join(args.indir, sh),
+                               os.path.join(args.out, sh))
+            print(f"[{i+1}/{len(shards)}] {sh}: {out/2**30:.2f} GiB unpacked",
+                  flush=True)
+        for aux in AUX:
+            p = os.path.join(args.indir, aux)
+            if os.path.exists(p):
+                shutil.copy2(p, args.out)
+        meta = os.path.join(args.indir, "_meta")
+        if os.path.isdir(meta):
+            shutil.copytree(meta, os.path.join(args.out, "_meta"),
+                            dirs_exist_ok=True)
+        return
     if not args.verify_only:
         tin = tout = 0
         for i, sh in enumerate(shards):

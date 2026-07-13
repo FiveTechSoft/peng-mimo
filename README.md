@@ -6,6 +6,9 @@
 
 > 📦 **Ready-to-run model** (no conversion needed, 152 GB, all 16 shards uploaded and validated):
 > **https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4**
+>
+> 📦 **Compressed variant** (same model bit-exact, 109 GB — 26% less download; see [§41 trade-off](#lossless-zstd-container-41--smaller-not-faster-here)):
+> **https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4-zstd**
 
 The name comes from the mythological bird from the Chinese *Zhuangzi*: a colossal creature that stays in flight by riding a whirlwind — much like this engine keeps "airborne" a 311B parameter model on a continuous stream of NVMe reads, on a machine with 32 GB of RAM.
 
@@ -58,6 +61,9 @@ pipeline already keeps every core busy during loads; there is no idle I/O shadow
 hide it in. Use the compressed container for **distribution/storage** (26% smaller)
 and RAM-pin-all setups; keep the plain int4 for maximum streaming tok/s on
 core-limited hosts. Details: [`findings.md`](findings.md) §41.
+
+Published: [`fivetech/MiMo-V2.5-colibri-peng-int4-zstd`](https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4-zstd)
+(109 GB, all 17 shards verified byte-exact against the original).
 
 **SSD wear:** those numbers are almost entirely **reads**. Consumer NVMe endurance is rated in **terabytes written (TBW)**; heavy read streams do not consume TBW the way writes do. Sustained generation can heat the drive and throttle; keep the model on a local ext4/NVMe path (not `/mnt/c` VHDX) and expect multi‑TB *read* in long benches without meaningful write wear. Logs / `.coli_usage` writes are negligible.
 
@@ -285,13 +291,22 @@ git clone https://github.com/FiveTechSoft/peng-mimo && cd peng-mimo/c
 make mimo          # binary ./mimo, pure C + OpenMP, zero dependencies
 ```
 
-### 2. Get the model (one of two)
+### 2. Get the model (one of three)
 
 **A — download the already-converted container** (~152 GB) from [`fivetech/MiMo-V2.5-colibri-peng-int4`](https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4):
 
 ```bash
 pip install -U huggingface_hub
 hf download fivetech/MiMo-V2.5-colibri-peng-int4 --local-dir ~/mimo25_i4
+```
+
+**A2 — download the compressed container** (~109 GB, 26% less, same model bit-exact) from
+[`fivetech/MiMo-V2.5-colibri-peng-int4-zstd`](https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4-zstd).
+The engine reads it directly; on core-limited hosts streaming it is ~18% slower than plain int4 (§41) —
+convert to plain locally with `c/tools/repack_zstd.py` if you want maximum tok/s:
+
+```bash
+hf download fivetech/MiMo-V2.5-colibri-peng-int4-zstd --local-dir ~/mimo25_i4z
 ```
 
 **B — convert it yourself from the official FP8 checkpoint** (316 GB download, resumable; disk peak ≈ output + 35 GB):

@@ -59,6 +59,20 @@ class TestRepackZstd(unittest.TestCase):
         self.assertEqual(hdr["w.weight"]["data_offsets"][1],
                          hdr["w.weight.qs"]["data_offsets"][0])
 
+    def test_unpack_roundtrip(self):
+        r = self.run_tool()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        back = tempfile.mkdtemp(prefix="peng_back_")
+        r = subprocess.run(
+            [sys.executable, os.path.join(TOOLS, "repack_zstd.py"),
+             "--indir", self.dst, "--out", back, "--unpack"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        orig = os.path.join(self.src, "out-00000.safetensors")
+        got = os.path.join(back, "out-00000.safetensors")
+        with open(orig, "rb") as a, open(got, "rb") as b:
+            self.assertEqual(a.read(), b.read())
+
     def test_verify_catches_corruption(self):
         r = self.run_tool()
         self.assertEqual(r.returncode, 0, r.stderr)
