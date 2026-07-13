@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <zstd.h>
 
 #include "../st.h"
 
@@ -83,6 +84,73 @@ int main(void) {
         memcpy(blob, &hlen, 8);
         blob[8] = '{'; blob[9] = '}'; blob[10] = 0; blob[11] = 0;
         CHECK(write_file(path, blob, 12) == 0);
+        CHECK(expect_st_init_fail(dir) == 1);
+        unlink(path);
+        rmdir(dir);
+    }
+
+    /* §41: peng_zstd container — st_init parses znbytes/nb, reads decompress */
+    {
+        char dir[] = "/tmp/peng_st_zstdXXXXXX";
+        CHECK(mkdtemp(dir) != NULL);
+        char path[512];
+        snprintf(path, sizeof(path), "%s/z.safetensors", dir);
+        float vals[8] = {1, -2, 3.5f, 0, 4, -0.5f, 6, 7};
+        uint8_t packed[16];
+        for (int i = 0; i < 16; i++) packed[i] = (uint8_t)(i % 16);
+        char zf[64], zw[64];
+        size_t zfn = ZSTD_compress(zf, sizeof(zf), vals, sizeof(vals), 1);
+        size_t zwn = ZSTD_compress(zw, sizeof(zw), packed, sizeof(packed), 1);
+        CHECK(!ZSTD_isError(zfn) && !ZSTD_isError(zwn));
+        char hdr[512];
+        int hn = snprintf(hdr, sizeof(hdr),
+            "{\"__metadata__\":{\"peng_zstd\":\"1\"},"
+            "\"a.weight\":{\"dtype\":\"F32\",\"shape\":[8],"
+            "\"data_offsets\":[0,%zu],\"nb\":32},"
+            "\"b.weight\":{\"dtype\":\"U8\",\"shape\":[4,8],"
+            "\"data_offsets\":[%zu,%zu],\"nb\":16}}",
+            zfn, zfn, zfn + zwn);
+        uint8_t blob[1024];
+        uint64_t hlen = (uint64_t)hn;
+        memcpy(blob, &hlen, 8);
+        memcpy(blob + 8, hdr, hn);
+        memcpy(blob + 8 + hn, zf, zfn);
+        memcpy(blob + 8 + hn + zfn, zw, zwn);
+        CHECK(write_file(path, blob, 8 + hn + zfn + zwn) == 0);
+        shards S;
+        st_init(&S, dir);
+        st_tensor *ta = st_find(&S, "a.weight");
+        st_tensor *tb = st_find(&S, "b.weight");
+        CHECK(ta && ta->nbytes == 32 && ta->znbytes == (int64_t)zfn);
+        CHECK(tb && tb->nbytes == 16 && tb->znbytes == (int64_t)zwn);
+        float out[8];
+        CHECK(st_read_f32(&S, "a.weight", out, 8, 0) == 8);
+        CHECK(out[0] == 1.0f && out[2] == 3.5f && out[7] == 7.0f);
+        uint8_t rawb[16];
+        st_read_raw(&S, "b.weight", rawb, 16, 0);
+        for (int i = 0; i < 16; i++) CHECK(rawb[i] == (uint8_t)(i % 16));
+        float slice[4];
+        st_read_slice_f32(&S, "a.weight", 2, 4, slice, 4, 0);
+        CHECK(slice[0] == 3.5f && slice[3] == -0.5f);
+        unlink(path);
+        rmdir(dir);
+    }
+
+    /* §41: flagged container with a tensor missing "nb" must be fatal */
+    {
+        char dir[] = "/tmp/peng_st_zbadXXXXXX";
+        CHECK(mkdtemp(dir) != NULL);
+        char path[512];
+        snprintf(path, sizeof(path), "%s/zbad.safetensors", dir);
+        const char *h =
+            "{\"__metadata__\":{\"peng_zstd\":\"1\"},"
+            "\"a.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+        uint8_t blob[512];
+        uint64_t hlen = strlen(h);
+        memcpy(blob, &hlen, 8);
+        memcpy(blob + 8, h, hlen);
+        memset(blob + 8 + hlen, 0, 8);
+        CHECK(write_file(path, blob, 8 + hlen + 8) == 0);
         CHECK(expect_st_init_fail(dir) == 1);
         unlink(path);
         rmdir(dir);

@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <zstd.h>            /* after the other includes, before json.h */
 #include "json.h"
 #include "compat.h"
 
@@ -24,7 +25,8 @@ typedef struct {
     char   *name;
     int     fd;
     int64_t off;       /* offset assoluto del dato dentro al file */
-    int64_t nbytes;
+    int64_t nbytes;    /* SEMPRE dimensione non compressa (payload logico) */
+    int64_t znbytes;   /* >0: frame zstd di znbytes byte a off (peng_zstd) */
     int     dtype;     /* 0=BF16 1=F16 2=F32 */
     int64_t numel;
 } st_tensor;
@@ -140,6 +142,40 @@ static ssize_t pread_full(int fd, void *buf, int64_t count, int64_t off) {
     return got;
 }
 
+/* §41 peng_zstd: pread del frame compresso in uno scratch per-thread (grow-only),
+ * ZSTD_decompress verso dst. dst_cap in byte. Errore frame = container corrotto: fatale. */
+static __thread char   *st_zbuf;
+static __thread int64_t st_zbuf_cap;
+static void st_zread(const st_tensor *t, void *dst, int64_t dst_cap) {
+    if (dst_cap < t->nbytes) {
+        fprintf(stderr, "st_zread dst too small: %s need %lld cap %lld\n",
+                t->name, (long long)t->nbytes, (long long)dst_cap);
+        exit(1);
+    }
+    if (!st_zbuf || st_zbuf_cap < t->znbytes) {
+        free(st_zbuf);
+        st_zbuf_cap = t->znbytes + 4096;
+        st_zbuf = malloc((size_t)st_zbuf_cap);
+        if (!st_zbuf) { fprintf(stderr, "OOM st_zbuf\n"); exit(1); }
+    }
+    if (pread_full(t->fd, st_zbuf, t->znbytes, t->off) != t->znbytes) {
+        perror("pread zstd frame"); exit(1);
+    }
+    size_t r = ZSTD_decompress(dst, (size_t)dst_cap, st_zbuf, (size_t)t->znbytes);
+    if (ZSTD_isError(r) || (int64_t)r != t->nbytes) {
+        fprintf(stderr, "zstd frame corrotto: %s off=%lld z=%lld -> %s\n",
+                t->name, (long long)t->off, (long long)t->znbytes,
+                ZSTD_isError(r) ? ZSTD_getErrorName(r) : "size mismatch");
+        exit(1);
+    }
+}
+
+/* Physical on-disk length of a tensor's data region: znbytes when compressed
+ * (peng_zstd frame), else the logical nbytes. Used by prefetch/DONTNEED sites. */
+static inline int64_t st_disk_len(const st_tensor *t) {
+    return t->znbytes > 0 ? t->znbytes : t->nbytes;
+}
+
 /* Max JSON header we will accept (safetensors header is rarely > few MB). */
 #ifndef ST_MAX_HEADER
 #define ST_MAX_HEADER (64ULL << 20)   /* 64 MiB */
@@ -191,6 +227,14 @@ static void st_init(shards *S, const char *snap_dir) {
             fprintf(stderr, "safetensors header JSON invalid: %s\n", files[fi]);
             free(arena); free(hdr); exit(1);
         }
+        int f_zstd = 0;
+        for (int i = 0; i < root->len; i++) {
+            if (root->keys[i] && !strcmp(root->keys[i], "__metadata__")) {
+                jval *md = root->kids[i];
+                jval *z = (md && md->t == J_OBJ) ? json_get(md, "peng_zstd") : NULL;
+                if (z && z->t == J_STR && z->str && !strcmp(z->str, "1")) f_zstd = 1;
+            }
+        }
         for (int i = 0; i < root->len; i++) {
             const char *name = root->keys[i];
             if (!name || !strcmp(name, "__metadata__")) continue;
@@ -216,6 +260,18 @@ static void st_init(shards *S, const char *snap_dir) {
                 exit(1);
             }
             int64_t nbytes = b0 - a0;
+            int64_t znbytes = 0;
+            if (f_zstd) {
+                jval *nb = json_get(m, "nb");
+                if (!nb || nb->t != J_NUM || nb->num < 0 ||
+                    nb->num != (double)(int64_t)nb->num) {
+                    fprintf(stderr, "peng_zstd tensor senza \"nb\": %s in %s\n",
+                            name, files[fi]);
+                    exit(1);
+                }
+                znbytes = nbytes;                 /* frame compresso su disco */
+                nbytes  = (int64_t)nb->num;       /* payload logico */
+            }
             int64_t abs_end = data_start + b0;
             if (abs_end < data_start || abs_end > fsz) {
                 fprintf(stderr, "safetensors range out of file: %s off=%lld..%lld file=%lld (%s)\n",
@@ -258,7 +314,7 @@ static void st_init(shards *S, const char *snap_dir) {
             if (S->n == S->cap) { S->cap *= 2; S->t = realloc(S->t, S->cap*sizeof(st_tensor)); }
             st_tensor *t = &S->t[S->n++];
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
-            t->nbytes = nbytes; t->dtype = dtype; t->numel = numel;
+            t->nbytes = nbytes; t->znbytes = znbytes; t->dtype = dtype; t->numel = numel;
         }
         free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
         free(hdr);
@@ -295,7 +351,7 @@ static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL
  * gia' calda. No-op se il tensore non esiste (es. il primo .qs prima della lettura). */
 static void st_prefetch(shards *S, const char *name) {
     st_tensor *t = st_find(S, name);
-    if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
+    if (t) posix_fadvise(t->fd, t->off, st_disk_len(t), POSIX_FADV_WILLNEED);
 }
 
 /* Physical readahead: sort tensors by (fd, off), merge adjacent/nearby ranges, one
@@ -303,7 +359,7 @@ static void st_prefetch(shards *S, const char *name) {
 static void st_prefetch_phys(shards *S, st_tensor **ts, int n) {
     if (!S || !ts || n < 1) return;
     if (n == 1) {
-        if (ts[0]) posix_fadvise(ts[0]->fd, ts[0]->off, ts[0]->nbytes, POSIX_FADV_WILLNEED);
+        if (ts[0]) posix_fadvise(ts[0]->fd, ts[0]->off, st_disk_len(ts[0]), POSIX_FADV_WILLNEED);
         return;
     }
     /* insertion sort by fd then off (n is small: pathpack radius * 6 tensors) */
@@ -323,10 +379,10 @@ static void st_prefetch_phys(shards *S, st_tensor **ts, int n) {
         while (i < n && !ts[i]) i++;
         if (i >= n) break;
         int fd = ts[i]->fd;
-        int64_t lo = ts[i]->off, hi = ts[i]->off + ts[i]->nbytes;
+        int64_t lo = ts[i]->off, hi = ts[i]->off + st_disk_len(ts[i]);
         int k = i + 1;
         while (k < n && ts[k] && ts[k]->fd == fd) {
-            int64_t a = ts[k]->off, b = ts[k]->off + ts[k]->nbytes;
+            int64_t a = ts[k]->off, b = ts[k]->off + st_disk_len(ts[k]);
             if (a > hi + gap) break;
             if (a < lo) lo = a;
             if (b > hi) hi = b;
@@ -355,7 +411,9 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int64_t out_
     }
     void *raw = malloc((size_t)t->nbytes);
     if (!raw) { fprintf(stderr, "OOM st_read_f32 %s (%lld bytes)\n", name, (long long)t->nbytes); exit(1); }
-    if (pread_full(t->fd, raw, t->nbytes, t->off) != t->nbytes) {
+    if (t->znbytes > 0) {
+        st_zread(t, raw, t->nbytes);
+    } else if (pread_full(t->fd, raw, t->nbytes, t->off) != t->nbytes) {
         struct stat sb; fstat(t->fd, &sb);
         fprintf(stderr, "pread data corto: %s off=%lld nbytes=%lld file=%lld byte\n",
                 t->name, (long long)t->off, (long long)t->nbytes, (long long)sb.st_size);
@@ -372,7 +430,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int64_t out_
         exit(1);
     }
     free(raw);
-    if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
+    if (drop) posix_fadvise(t->fd, t->off, st_disk_len(t), POSIX_FADV_DONTNEED);
     return t->numel;
 }
 
@@ -392,8 +450,9 @@ static void st_read_raw(shards *S, const char *name, void *out, int64_t out_cap_
                 name, (long long)t->nbytes, (long long)out_cap_bytes);
         exit(1);
     }
-    if (pread_full(t->fd, out, t->nbytes, t->off) != t->nbytes) { perror("pread raw"); exit(1); }
-    if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
+    if (t->znbytes > 0) st_zread(t, out, out_cap_bytes);
+    else if (pread_full(t->fd, out, t->nbytes, t->off) != t->nbytes) { perror("pread raw"); exit(1); }
+    if (drop) posix_fadvise(t->fd, t->off, st_disk_len(t), POSIX_FADV_DONTNEED);
 }
 
 /* legge una FETTA di un tensore: n_elems a partire dall'elemento elem_off.
@@ -420,12 +479,21 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc((size_t)nb);
     if (!raw) { fprintf(stderr, "OOM st_read_slice_f32\n"); exit(1); }
-    if (pread_full(t->fd, raw, nb, boff) != nb) { perror("pread slice"); exit(1); }
+    if (t->znbytes > 0) {
+        char *full = malloc((size_t)t->nbytes);
+        if (!full) { fprintf(stderr, "OOM slice zstd\n"); exit(1); }
+        st_zread(t, full, t->nbytes);
+        memcpy(raw, full + elem_off * esz, (size_t)nb);
+        free(full);
+    } else if (pread_full(t->fd, raw, nb, boff) != nb) { perror("pread slice"); exit(1); }
     if (t->dtype == 2) memcpy(out, raw, (size_t)nb);
     else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
     free(raw);
-    if (drop) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
+    if (drop) {
+        if (t->znbytes > 0) posix_fadvise(t->fd, t->off, t->znbytes, POSIX_FADV_DONTNEED);
+        else posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
+    }
 }
 
 #endif
