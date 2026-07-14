@@ -630,6 +630,35 @@ Also landed earlier same day: thread-local IDOT quant scratch (colibri #43) — 
 
 **Path still required for 1.0 on this box:** more host RAM and/or faster expert GEMV (tensor cores) and/or int2 experts and/or native Linux. Soft ceiling ~0.6 with current 23 GB + 3060 + WSL2.
 
+### 43. AVX-512 int4 kernel ported from colibri #95 — matmul −13%, ppl equal-or-better (2026-07-14)
+
+Upstream review (53 new colibri commits) yielded one direct port: the AVX-512
+int4→float accumulator (colibri `4b1d0e3`, #95) — 32 weights/iter on two FMA
+chains, tree reduction. Our Xeon has AVX-512F/BW (no VNNI, so the existing IDOT
+VNNI branches stay dead); the hot single-token host-expert GEMV is `matmul_i4`
+(float path, `g_i4s=2` gate) — exactly where this kernel lands.
+
+Measured (real 311B, deterministic SCORE + interleaved §37 speed pairs):
+
+| metric | AVX2 order (BASE) | I4_ACC512=1 |
+|---|---|---|
+| ppl prose / code | 12.40 / 2.073 | **12.19 (−1.7%) / 2.076 (+0.2%)** |
+| expert-matmul (clean runs) | 18.3–18.9 s | **16.2 s (−13%)** |
+| tok/s (clean pair) | 0.40–0.43 | 0.48 |
+| tiny oracle TF/greedy | 31/32, 15/20 | 31/32, 15/20 (same) |
+
+Tree reduction accumulates less rounding than sequential AVX2 — "more accurate
+AND faster", matching upstream's Xeon Silver numbers. Not bit-identical to the
+old order, so: **default OFF** (bit-exact gates stay the baseline), **auto-ON
+under `SPEED=1`/`TAO=1`** (explicit `I4_ACC512=0/1` always wins). Selftest:
+`I4_ACC512_TEST=1 SNAP=x ./mimo`.
+
+Also from the upstream review: colibri's serve heap-overflow (#117) does NOT
+affect peng (`mimo.c` sizes the attention score buffer by true `nt` with heap
+fallback); their native-Windows port (#131) and `quant_ablation.py` rotation/int3
+tooling (#132) are roadmap candidates (§18 path and int3+zstd+EKEEP stacking
+respectively).
+
 ### 42. Can we make a small MiMo? Expert redundancy, usage, and the EKEEP prune matrix (2026-07-13)
 
 Three linked experiments toward a "MiMo-lite" (fewer experts, no retraining). Net

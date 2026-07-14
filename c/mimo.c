@@ -354,11 +354,56 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
             for(;i<I;i++) a+=xs[i]*(float)w[i]; y[(int64_t)s*O+o]=a*sc; } }
 }
 /* y[S,O] = x[S,I] @ W^T con W int4 impacchettato (2 valori/byte) + scala[O]. */
+/* ---- Accumulatore int4->float a 512 bit (porting colibri #95 / 4b1d0e3) ----
+ * Stessa matematica lossless di matmul_i4 (nibble->f32, FMA), 32 pesi/iter su due
+ * catene FMA indipendenti. NON bit-identico all'ordine AVX2: la riduzione ad albero
+ * accumula meno errore della somma sequenziale (upstream: rel-err 2-6x più vicino
+ * all'oracolo double, ppl invariata, +7%% decode CPU-heavy su Xeon).
+ * Default OFF su peng: i gate bit-exact (oracolo tiny, §39) restano la baseline;
+ * I4_ACC512=1 per attivarlo dopo la validazione SCORE (§43). */
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+static int g_i4_acc512=0;
+static inline float dot_i4f_avx512(const uint8_t *w,const float *x,int I){
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m512i b8=_mm512_set1_epi32(8);
+    __m512 acc0=_mm512_setzero_ps(),acc1=_mm512_setzero_ps(); int i=0;
+    for(;i+32<=I;i+=32){ __m128i by=_mm_loadu_si128((const __m128i*)(w+(i>>1)));
+        __m128i lo=_mm_and_si128(by,m4),hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i n0=_mm_unpacklo_epi8(lo,hi),n1=_mm_unpackhi_epi8(lo,hi);
+        __m512 w0=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n0),b8));
+        __m512 w1=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_cvtepu8_epi32(n1),b8));
+        acc0=_mm512_fmadd_ps(_mm512_loadu_ps(x+i),w0,acc0);
+        acc1=_mm512_fmadd_ps(_mm512_loadu_ps(x+i+16),w1,acc1);
+    }
+    return _mm512_reduce_add_ps(_mm512_add_ps(acc0,acc1));
+}
+/* selftest contro il riferimento scalare (I4_ACC512_TEST=1): ordine dei nibble
+ * e ogni multiplo di 32. */
+static int i4_acc512_selftest(void){
+    enum { N=224 }; uint8_t w[(N+1)/2]; float x[N];
+    for(int i=0;i<N;i++){
+        int q=((i*13+5)&15)-8;
+        if(!(i&1)) w[i>>1]=(uint8_t)(q+8);
+        else w[i>>1]|=(uint8_t)((q+8)<<4);
+        x[i]=(float)(((i*29+7)%101)-50)/37.f;
+    }
+    for(int n=32;n<=N;n+=32){
+        float ref=0; for(int i=0;i<n;i++) ref+=x[i]*(float)(((w[i>>1]>>((i&1)*4))&15)-8);
+        float got=dot_i4f_avx512(w,x,n),tol=2e-5f*(1.f+fabsf(ref));
+        if(fabsf(got-ref)>tol){ fprintf(stderr,"AVX512 i4 selftest n=%d: %.9g != %.9g\n",n,got,ref); return 0; }
+    }
+    return 1;
+}
+#endif
+
 static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O){
     int rb=(I+1)/2;
     #pragma omp parallel for schedule(static)
     for (int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            if(g_i4_acc512){ a=dot_i4f_avx512(w,xs,I); i=I&~31; }
+            else {
+#endif
 #ifdef __AVX2__
             const __m128i m4=_mm_set1_epi8(0x0F); const __m256i b8=_mm256_set1_epi32(8);
             __m256 acc=_mm256_setzero_ps();
@@ -382,6 +427,9 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
                 ac0=vfmaq_f32(ac0, vld1q_f32(xs+i+8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1))));
                 ac1=vfmaq_f32(ac1, vld1q_f32(xs+i+12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)))); }
             a=vaddvq_f32(vaddq_f32(ac0,ac1));
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            }
 #endif
             for(;i+1<I;i+=2){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8, hi=(int)(byte>>4)-8;
                 a += xs[i]*(float)lo + xs[i+1]*(float)hi; }
@@ -3759,6 +3807,14 @@ int main(int argc, char **argv){
         }
         free(ln); free(tbuf); return 0;
     }
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if(getenv("I4_ACC512")) g_i4_acc512=atoi(getenv("I4_ACC512"))!=0;
+    if(getenv("I4_ACC512_TEST")){
+        if(!i4_acc512_selftest()) return 1;
+        puts("AVX512 i4 selftest: ok"); return 0;
+    }
+    if(g_i4_acc512) fprintf(stderr,"[I4_ACC512] kernel int4 AVX-512 attivo (non bit-identico all'ordine AVX2; §43)\n");
+#endif
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     /* SERVE/chat: speed-oriented defaults (override with env). Oracle/TF keep exact path. */
     int serve_mode = getenv("SERVE") && atoi(getenv("SERVE"));
@@ -3772,6 +3828,12 @@ int main(int argc, char **argv){
     int speed_mode = getenv("SPEED") ? atoi(getenv("SPEED")) : (tao_mode ? 1 : 0);
     if(speed_mode)
         fprintf(stderr,"[SPEED] profile on (TOPK/TRAJ/REPIN/TOPP defaults tightened; env overrides win)\n");
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    /* §43: kernel AVX-512 auto nel profilo SPEED/TAO (matmul host -13%%, ppl pari o
+     * migliore). Default OFF altrove: i gate bit-exact restano riproducibili. */
+    if(!getenv("I4_ACC512") && speed_mode){ g_i4_acc512=1;
+        fprintf(stderr,"[I4_ACC512] auto-on (SPEED): int4 AVX-512 tree-reduction (I4_ACC512=0 per l'ordine esatto)\n"); }
+#endif
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
     /* sticky next-token WILLNEED: auto ON for SERVE / when PILOT is on */
