@@ -161,6 +161,12 @@ Even at **0.60 tok/s**:
 - [ ] **Long-prefill gate (S > sliding_window)** — §39: the tiny oracle (S=32, W=8)
   caught the SWA ring bug only by luck; add a fixture with prefill well past W
 - SCORE ppl matrix before/after any routing or attention change (`scripts/bench_topp_ppl.sh`)
+- [ ] **Container qkv scale-grid integrity (`c/tools/verify_mimo_qkv.py`)** — 2026-07-16
+  incident: a deployed `mimo25_i4` container was built with the pre-fix per-rank
+  scale-grid converter, corrupting ranks 1..NR-1 of every `qkv_proj` (rank 0 intact)
+  while `o_proj`/experts stayed bit-identical. Run the guard (fp8 source vs int4
+  container, per rank-block) in CI / pre-ship so a stale container can never ship
+  again: `python3 c/tools/verify_mimo_qkv.py --int4 <container> --fp8 <fp8_src>`
 
 ## Explicit non-goals (measured dead ends)
 
