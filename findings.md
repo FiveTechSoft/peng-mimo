@@ -1268,3 +1268,247 @@ Bottleneck at 4.82 tok/s is mixed: `expert-disk` ~1.0 s + `expert-matmul` (GPU)
 ~1.4 s + `attention` ~1.2 s. Removing the disk pole (fit a pruned/zstd container
 in the 128 GB unified memory — see roadmap §A1/A2) is the next lever.
 ```
+
+---
+
+### 45. CUDA_ATTN: fused decode attention on device — attention 120→35 ms/tok synthetic (2026-07-19)
+
+**Profile context.** On the ref box (23 GB + RTX 3060 + WSL2), `attention` was the
+#2 pole (~9 s of ~38 s per 24 tok) and never moved across §23–§38 experiments.
+A synthetic harness (`c/tests/attn_bench.c`, real MiMo dims, no snapshot needed)
+found why: at S=1 the cost is the **qkv/o projections**, not the scoring —
+CPU attention = **120 ms/tok** (48 layers) and the existing CUDA dense tier
+(two synchronous GEMVs per layer + qkv/ctx PCIe round-trips) barely helps
+(90–141 ms/tok, sometimes *worse* than CPU). Measured WSL2 taxes: launch+sync
+38 µs, H2D 16 KB 50 µs, D2H 59 KB 66 µs.
+
+**Design (`CUDA_ATTN=1`, opt-in, single-device, requires `CUDA_DENSE=1`).**
+KV cache resident in VRAM (~0.24 GB at CTX 4096: SWA rings + full linear rows).
+Per decode layer: qkv GEMV with y left on device → one fused kernel per layer
+(RoPE + v·v_scale + KV append + causal scores + online softmax + weighted-V;
+one block per query head, t strided across warps, cross-warp merge; sink joins
+the denominator on warp 0) → o GEMV with x on device → D2H out. **One sync per
+layer instead of two**, zero qkv/ctx PCIe traffic. Host K/V stay authoritative
+for S>1 (prefill / speculative verify / MTP absorb): the kernel mirrors its
+appended row back to host every token (async, flushed by the end-of-layer
+sync), and CPU-appended rows are uploaded via `attn_dev_sync_rows()`.
+
+**Results (synthetic, 48-layer pass, RTX 3060):**
+
+| path | pos=30 | pos=1000 |
+|---|---|---|
+| CPU | 120 ms/tok | 123 ms/tok |
+| CUDA dense (2 syncs/layer) | 90 ms | 141 ms |
+| **CUDA_ATTN fused** | **35 ms** | **45 ms** |
+
+≈3.4× vs CPU, ≈3× vs the previous CUDA path; scales gently with context.
+Projection for the real 0.60 tok/s run: attention 9.1 s → ~1–1.5 s per 24 tok
+→ **~0.75–0.85 tok/s** (GPU path is also immune to the host-RAM pressure that
+inflates the real 379 ms/tok vs the 120 ms synthetic).
+
+**Numerics.** RoPE and v_scale are elementwise → mirror rows bit-match the CPU
+cache (test asserts 1e-5). Softmax is online (not the CPU 2-pass) and dot
+reductions reorder → ctx/out drift ~6e-4 abs through the o projection (fused vs
+classic CUDA, same GEMV kernels both sides: `attn_bench 3`). Same contract as
+the existing CUDA tiers: opt-in, chat-speed, **not** oracle-exact — the
+greedy/TF gates run CPU-only and are unaffected (flag defaults off, CPU-only
+build rejects `CUDA_ATTN`).
+
+**Impl.** `backend_cuda.cu`: `coli_cuda_matmul_ex` (flags `X_DEV`/`Y_DEV`),
+`coli_cuda_attn_kv_alloc/rope/layer_cfg/mirror/upload_rows/decode`,
+`attn_decode_kernel`. `mimo.c`: `g_cuda_attn` (`CUDA_ATTN`), device store set up
+in `kv_alloc()` (rebuilt on max_t growth), `attention()` S=1 branch with
+all-or-nothing fallback to the classic path, S>1 row sync in both append modes
+(direct + F-11 ring scratch flush). Tests: `tests/test_backend_cuda.cu` gains
+matmul_ex chaining + fused-attention-vs-CPU-reference (full/SWA-ring/sink,
+24 positions incl. ring wrap, host-mirror check). Harness: `tests/attn_bench.c`
+(modes 0 CPU / 1 CUDA 2-sync / 2 fused / 3 correctness).
+
+**Caveats.** Single device only (`CUDA_ATTN` refuses `COLI_GPUS`). −0.25 GB
+VRAM for KV (expert tier shrinks slightly). Needs real-model validation on the
+152 GB snapshot: tok/s + greedy sanity + ppl drift matrix like §40 before any
+default-on. CUDA graphs over the whole layer stack (rmsnorm/residual/router on
+device) is the next lever (~2 syncs/layer total).
+
+### 46. Real 311B on this PC: CUDA_ATTN + spin-sync — 0.60 → 0.72–0.89 tok/s (2026-07-19/20)
+
+**Goal.** User request: *"haz una prueba real en este pc usando mimo 2.5"* — run
+the real engine on this box. Constraint: the 152 GB MiMo-V2.5 int4 snapshot is
+**not** on this machine (it lives on the other box's ext4 `/root/mimo25_i4`;
+here: no sudo, no snapshot on any mounted drive, ollama blobs are an unrelated
+Qwen GGUF — all verified by search). The closest honest substitute is the
+project's own Phase-1 method (README, "token-exact validation first"): the
+**tiny oracle** — a random 6-layer model with the *real* MiMoV2 architecture
+(hybrid full/SWA pattern, fused QKV, partial RoPE, SWA sink bias, v×0.707,
+noaux_tc router) generated with the official `modeling_mimo_v2.py`, converted
+with the same converter used for the 311B checkpoint, and served by the same
+`c/mimo` binary.
+
+**What this validates — and what it does not.**
+
+- YES: end-to-end integration of the CUDA_ATTN path inside the real engine —
+  container loading, eager dense upload (`96 ok, 0 fail`-style notices),
+  `kv_alloc()` device-KV + rope/sink setup, prefill (S>1 CPU path) →
+  device-KV row sync (`attn_dev_sync_rows`), decode (S=1 device path), SWA ring
+  wrap past W=8, coherence of generated text greedy-vs-greedy.
+- YES: the CPU correctness gates (TF 32/32, greedy 20/20 vs the transformers
+  oracle) still pass with the CUDA-enabled binary when the flag is off
+  (default) — i.e. no regression of the bit-exact contract.
+- NO: performance at 311B scale. Tiny dims (hidden 128, 6 layers, KBs of KV)
+  are launch-latency dominated; the tiny-run tok/s delta is a smoke signal,
+  not a projection. The 311B projection stays §45 (0.75–0.85 tok/s) and must
+  be confirmed on the snapshot box with the §45 protocol.
+
+**Environment built for this** (dev box had no ML Python stack; isolated per
+project rules — nothing global):
+
+- uv venv `/tmp/mimovenv`: torch 2.13.0+cpu, **transformers 5.1.0** (§1 pin),
+  numpy 2.5.1, safetensors 0.8.0 (needed by `make_mimo_oracle.py` + the
+  converter).
+- CUDA 11.5 toolkit resurrected from Debian packages at `/tmp/cudatk` with
+  gcc-11 wrappers in `/tmp/bin`. Hard-won learnings: nvcc needs its private
+  bin dir (`.../lib/nvidia-cuda-toolkit/bin`, hosts `cicc`/`cudafe++`) in PATH;
+  use `-std=c++14`, not c++17 (libstdc++-11 headers break cicc at C++17); the
+  earlier "cicc rejects `<<<`" mystery was a plain syntax error in my test
+  snippets (missing `()` after the launch config).
+- `c/mimo` rebuilt with `CUDA=1 -arch=sm_86` (RTX 3060): one binary covers CPU
+  (default), classic CUDA (`COLI_CUDA=1 CUDA_DENSE=1`) and fused
+  (`CUDA_ATTN=1`); the backend is opt-in by env, CPU default is untouched.
+
+**Protocol (as executed).**
+
+1. `python tools/make_mimo_oracle.py` → `c/mimo_tiny/` + `c/ref_mimo.json`
+   (greedy 20-token reference + TF predictions from HF itself).
+2. `python tools/convert_fp8_to_int4.py --arch mimo --src mimo_tiny --out mimo_tiny_i4`
+   (same math as the 311B container: dense int8, experts int4, norms/router f32).
+3. CPU gates with the CUDA binary, flag off: TF 32/32 + greedy 20/20 vs
+   `ref_mimo.json` (must stay exact).
+4. A/B same prompt+greedy: `COLI_CUDA=1 CUDA_DENSE=1 CUDA_ATTN=0` vs
+   `CUDA_ATTN=1`. Compare: generated ids (late flips allowed — §45's 6e-4
+   reorder drift is the documented non-bit-exact contract), PROFILE attn line,
+   wall tok/s, stderr notices (eager upload, `attn KV: N layers device`).
+5. Ring/coherence stress: prompt+generation long enough to cross W=8 several
+   times, and prefill (S>1) → decode so `attn_dev_sync_rows` interleaves with
+   device-written rows (the host-mirror overwrite hazard flagged in §45).
+
+**Results (tiny oracle, this box, 2026-07-19).**
+
+- Oracle regenerated with **transformers 5.1.0** (§1 pin — 4.57 lacks
+  `standardize_rope_params`, 5.14 broke `create_causal_mask(input_embeds=)`),
+  torch 2.13.0+cpu. New RNG draw → weights differ from the 2026-07-10 oracle.
+- CPU gates on the new oracle: TF **31/32**, greedy **15/20** with both the
+  CUDA=1 binary *and* a pristine HEAD build (`git worktree`) — identical token
+  sequences → **not a regression of the CUDA_ATTN session**. Root cause:
+  position 24 is a genuine near-tie in the HF logits (top-2 gap **3.0e-3**,
+  the minimum of the whole sequence); int8 container misses the same single
+  position → tie-break noise on fresh random weights, engine math intact.
+- **A/B (`COLI_CUDA=1 CUDA_DENSE=1`, greedy, same prompt):**
+  `CUDA_ATTN=0` and `CUDA_ATTN=1` produce **byte-identical token sequences**
+  (both 12/20 vs the new oracle — the CUDA-vs-CPU drift is the pre-existing
+  classic-tier reorder, not the fused kernel). PROFILE attention:
+  **0.373 s → 0.090 s (4.1×)** even at tiny launch-latency-bound dims.
+- Notices as designed: `dense eager upload: 15 ok, 0 fail`,
+  `attn KV: 6 layers device`, no fallback, no errors.
+- TF with `CUDA_ATTN=1`: still 31/32 (S>1 path untouched); REPLAY (S>1
+  absorb interleaved with device decode): clean, hit 97% → host↔device KV
+  coherence holds across prefill/ring-flush/replay.
+
+**Integration: PASSED.**
+
+**311B A/B (container re-downloaded to this box, record protocol §37:
+TAO=1 SPEED=1 PILOT=0 TEMP=0 COLI_CUDA=1 CUDA_DENSE=1 DIRECT=1 NGEN=24,
+same PROMPT, interleaved arms, hit 74–80%).**
+
+Three measured findings, in order of surprise:
+
+1. **CUDA_ATTN alone is ~neutral at steady state (no spin):** base {0.69, 0.70}
+   vs attn {0.61, 0.66, 0.68}. Device branch confirmed taken (`PROFILE-ATTNDEV:
+   1104/1104 decode calls`), attention timer 10.3 → 8.5 s, but the wall does
+   not improve: the baseline already overlaps CPU attention with the GPU
+   expert tier, and the GPU device path was paying hidden latency (next item).
+2. **Root cause + fix — `cudaDeviceScheduleSpin` (default in
+   `coli_cuda_init`, override `COLI_CUDA_SYNC=yield|block`):** a yielding
+   `cudaStreamSynchronize` under the expert-pipeline CPU load deschedules the
+   forward thread ~5–8 ms per decode layer (measured: attention 8.6 s where
+   the kernels are ~0.5 ms × 1104 ≈ 0.6 s). With spin: attention 6.2–7.0 s
+   and `other` 10.3 → 5–7 s. First spin run: **0.80 tok/s**.
+3. **GEMV vectorization attempt — negative result, reverted:** uint4-per-lane
+   loads made kernels 2.4–7× SLOWER (16 consecutive shared floats/lane →
+   16-way bank conflicts). Microbench of the production kernels: legacy
+   byte-strided i4 182 GB/s, i8 230 GB/s pipe — already healthy; the 27 GB/s
+   figure from §45's syncbench was its toy 1-thread/row kernel, not the
+   production one. No GEMV bandwidth headroom of that kind.
+
+**Final interleaved A/B with spin (4 pairs):** attn beats base in **4/4
+pairs** (+0.09, +0.26, +0.03, +0.13): base mean **0.60** / attn mean **0.73**,
+best attn run **0.89** (disk 3.8 / ex-mm 11.1 / attn 7.0 / other 5.1 s).
+Session-wide attn-with-spin runs: {0.80, 0.77, 0.75, 0.79, 0.89, 0.60, 0.64}
+→ median 0.77. Absolute numbers drift with Windows-host conditions (both arms
+degrade together late in the batch; same-day variance already known in §40),
+the per-pair delta is the robust signal: **+21% mean over the 0.60 record
+protocol**. Verdict: 0.8 reached in warm runs, not yet a stable median; the
+next poles are expert-matmul (~11 s, CPU int4 for RAM-resident experts) and
+expert-disk (4–7 s, hit-rate bound).
+
+Artifacts: `c/tests/attn_bench.c`, `PROFILE-ATTNDEV` counter line,
+`COLI_CUDA_SYNC` env. Oracle/environment note: regenerated tiny oracle needs
+transformers 5.1.0 exactly (§1); a fresh RNG draw can move the TF gate to
+31/32 on a genuine 3e-3 near-tie — check `git worktree` HEAD parity before
+suspecting a regression (this session did: HEAD binary produced the identical
+31/32 + 15/20 sequence).
+
+**⚠ Quality gate on the PUBLIC container — CRITICAL FINDING.** The speed A/B
+above ran on a fresh download of `fivetech/MiMo-V2.5-colibri-peng-int4`.
+Generated text was garbage in BOTH arms (CPU baseline too) → investigated:
+
+- **sha256 of all 16 shards == HF LFS oids** → download byte-perfect; the
+  corruption is in the upload itself, not in transit.
+- Tokenizer: HF AutoTokenizer == engine (`Write one short sentence…` → same 7
+  ids) → not the tokenizer.
+- **SCORE teacher-forcing ppl (§40 protocol, same script/corpus sizes):
+  prose ≈ 3300, code ≈ 360 (CPU-only, exact config) — vs §40 reference
+  12.40 / 2.07.** Catastrophic on any axis; corpus drift explains ±20%, not
+  ×260. CUDA-dense run was less-broken (ppl ~420/~101) than CPU-only — the
+  container is broken under every engine path.
+- The container's own README validation claim (`The capital of France is →
+  Paris`, 2026-07-11) **no longer reproduces**: greedy today gives
+  `The capital of France is""引边边边边边`.
+- Internal per-rank RMS of qkv is uniform (inconclusive — misaligned scales
+  don't move rank RMS much; the fp8-side forensic `verify_mimo_qkv.py` needs
+  the gated fp8 repo, unavailable here).
+
+**Verdict:** the published int4 container (and presumably the zstd variant,
+same source) is the **pre-fix qkv scale-grid build** of the 2026-07-16
+incident (README §E / §45-era roadmap item): qkv ranks 1..NR-1 corrupt, rank
+0 intact. Timeline fits: uploaded 07-11 with a weak one-prompt validation;
+the 07-12 speed record (0.60) was measured on this same corrupt container —
+speed is unaffected (sizes/IO identical), quality was never re-gated on the
+public artifact; §40's good ppl (07-13) came from the OTHER box's rebuilt
+container. The tok/s numbers in this section remain valid (weight content
+does not change tensor sizes, IO volume or kernel time).
+
+**Repair (2026-07-20, this box).** All 48 `qkv_proj` tensors live in the
+single fp8 shard `model_pp0_ep0_shard1.safetensors` (14.5 GB) — so the fix
+needed no 316 GB re-conversion:
+
+1. **Forensic (gated fp8 repo, user token):** `verify_mimo_qkv.py --layers
+   5,11,17` → `FAIL ranks [1,2,3]`, rank_max up to **0.70** on corrupt ranks
+   vs 0.0007–0.0027 (int8 rounding) on rank 0. Exact incident signature.
+2. **Surgical patch** (`/tmp/repair_qkv.py`): re-dequant each of the 48 qkv
+   from fp8 with the FIXED per-rank scale grid + the engine's exact int8
+   requant (`np.rint`, amax/127), patched in place at the safetensors byte
+   offsets (identical sizes → layout preserved, `.bak` kept). All 48 live in
+   the container's `out-00001.safetensors`.
+3. **Validation:** `verify_mimo_qkv --layers 5,11,17,30,47` → **PASS 5/5,
+   all ranks** (max 0.0036 except L47 rank2 0.0156 < 0.05 threshold, L47 RMS
+   is 7× higher by nature). Greedy `The capital of France is` → **"Paris.
+   The capital of Germany is Berlin"** ✓. SCORE ppl: **prose 9.97 / code
+   2.07** — code is an EXACT match to the §40 reference axis (2.07); prose
+   differs because the corpus is the current README (changed since 07-13),
+   direction is better-not-worse. Rome prompt now produces coherent text
+   ("Rome is the capital of Italy…").
+4. **Caveats:** the warm expert cache must be rebuilt (corrupt weights →
+   different router decisions; delete `.coli_usage/.coli_traj/.coli_pathpack`
+   when swapping containers). The **zstd variant on HF is still corrupt**
+   (repacked from the same source) — needs its own repack from the repaired
+   int4 + upload. Repaired shard uploaded to HF by user request (2026-07-20).

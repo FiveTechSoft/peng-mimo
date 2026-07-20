@@ -136,6 +136,21 @@ Even at **0.60 tok/s**:
 
 ### B. Attention / residual compute
 
+- [x] **CUDA_ATTN fused decode attention** (§45/§46): KV resident on device,
+  1 sync/layer; opt-in `CUDA_ATTN=1`, non-bit-exact, default off. Real 311B:
+  +21% mean per-pair (4/4) with spin, best 0.89 tok/s
+- [x] **Spin-sync fix** (§46): `cudaDeviceScheduleSpin` default in `coli_cuda_init`
+  (`COLI_CUDA_SYNC=yield|block` override) — yielding syncs cost ~5–8 ms/layer
+  under expert-pipeline load; this was the hidden CUDA_ATTN eater
+- [x] **311B A/B done on this PC** (§46): container re-downloaded; base 0.60 →
+  attn+spin 0.72–0.89 (median ~0.76, host-drift bound). Gate 1.0 still open:
+  next poles expert-matmul (~11 s CPU int4) and expert-disk (hit-rate)
+- [x] **Re-upload FIXED int4 shard to HF** (§46): surgical qkv patch of
+  `out-00001.safetensors` (2026-07-20); guard PASS, ppl 9.97/2.07, Paris OK.
+  Pre-20-jul downloads need that shard only. **zstd HF still corrupt** — repack
+  from repaired int4 pending
+- [ ] **311B greedy sanity + §40 ppl drift matrix for CUDA_ATTN=1** on the
+  fixed container
 - [ ] Confirm all full/SWA attn on CUDA densas (no silent CPU)
 - [ ] Tensor-core / better tiled int4 GEMV if matmul rises again
 - [ ] Restore honest `cuda-copy` under async streams
@@ -155,12 +170,13 @@ Even at **0.60 tok/s**:
 
 ### E. Correctness gates (do not regress)
 
-- Tiny / fixture oracle TF + greedy
+- Tiny / fixture oracle TF + greedy (re-run in §46 with the CUDA=1 binary, flag off)
 - Identity DRAFT=0 vs n when MTP used
 - Convert atomic + revision
 - [ ] **Long-prefill gate (S > sliding_window)** — §39: the tiny oracle (S=32, W=8)
   caught the SWA ring bug only by luck; add a fixture with prefill well past W
 - SCORE ppl matrix before/after any routing or attention change (`scripts/bench_topp_ppl.sh`)
+- [ ] CUDA_ATTN=1 greedy sanity + ppl drift matrix on the 311B snapshot (§45/§46)
 - [ ] **Container qkv scale-grid integrity (`c/tools/verify_mimo_qkv.py`)** — 2026-07-16
   incident: a deployed `mimo25_i4` container was built with the pre-fix per-rank
   scale-grid converter, corrupting ranks 1..NR-1 of every `qkv_proj` (rank 0 intact)

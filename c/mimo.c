@@ -186,6 +186,7 @@ typedef struct {
     float *rope_full_cos, *rope_full_sin;        /* [max_t][rope_dim/2]   theta_full */
     float *rope_swa_cos,  *rope_swa_sin;         /* [max_t][rd_swa/2]     theta_swa  */
     int rope_cap, rope_rd_full, rope_rd_swa;
+    int attn_dev;                                /* device KV store ready (CUDA_ATTN) */
 } Model;
 
 static void traj_observe_layer(Model *m, int layer, const int *idx, int Ke);
@@ -211,6 +212,8 @@ static int g_draft=0;    /* Method E: DRAFT=n speculative tokens per forward (0=
 static int g_cuda_enabled;
 static double g_cuda_expert_gb;          /* 0=off, >0=GB cap, <0=auto (free-headroom) */
 static int g_cuda_dense;
+static int g_cuda_attn;                  /* CUDA_ATTN: fused decode attention on device */
+static long g_attn_dev_cand, g_attn_dev_took; /* debug: device branch adoption */
 static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
@@ -488,13 +491,14 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #define IDOT_KERNEL "scalar"
 #endif
 static int g_idot=1;
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-static int g_i4s=1;   /* SDOT presente: int4 IDOT conviene anche a S=1 (decode). Misurato
-                       * su Apple M-series: +14%%, expert-matmul -16%%. EN: with SDOT, int4
-                       * IDOT pays even at S=1 (decode); measured on Apple M-series. */
+#if (defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)) || (defined(__AVX512VNNI__) && defined(__AVX512BW__))
+static int g_i4s=1;   /* SDOT/VNNI presente: int4 IDOT conviene anche a S=1 (decode). Misurato
+                       * su Apple M-series: +14%%, expert-matmul -16%%; vpdpbusd (VNNI) e' il
+                       * gemello x86 di SDOT (colibri PR #9). EN: with SDOT/VNNI, int4 IDOT
+                       * pays even at S=1 (decode). */
 #else
-static int g_i4s=2;   /* senza SDOT / altrove: soglia originale (misura AVX2 dell'autore).
-                       * EN: without SDOT / elsewhere: original threshold (author's AVX2). */
+static int g_i4s=2;   /* senza SDOT/VNNI: soglia originale (misura AVX2 dell'autore).
+                       * EN: without SDOT/VNNI: original threshold (author's AVX2). */
 #endif
 static inline float qrow_i8(const float *x, int8_t *q, int I){
     float amax=0; for(int i=0;i<I;i++){ float a=fabsf(x[i]); if(a>amax)amax=a; }
@@ -771,6 +775,36 @@ static void matmul_qt(float *y, const float *x, QT *w, int S){
     else matmul_i4(y,x,w->q4,w->s,S,w->I,w->O);
 }
 
+/* gate+up condividono la STESSA attivazione: col percorso IDOT i due matmul
+ * riquantizzerebbero x riga per riga in modo identico. Qui si quantizza UNA volta
+ * e si lanciano entrambi i dot interi (~-50% del costo di quantizzazione attivazione
+ * nel MoE CPU). Fallback al dispatcher generale quando uno dei due tensori non
+ * prenderebbe il percorso CPU IDOT (CUDA-eligible, fmt diversi, int2, soglia):
+ * il risultato resta bit-identico in entrambi i rami. */
+static void gate_up_qt(float *gg, float *uu, const float *x, QT *g, QT *u, int S){
+#ifdef COLI_CUDA
+    if(g_cuda_enabled && ((g->cuda_eligible && !g->cuda_failed) ||
+                          (u->cuda_eligible && !u->cuda_failed))){
+        matmul_qt(gg,x,g,S); matmul_qt(uu,x,u,S); return;
+    }
+#endif
+    if(g_idot && g->fmt==u->fmt && g->I==u->I &&
+       (g->fmt==1 || (g->fmt==2 && (g_fw1?1:S)>=g_i4s))){
+        int I=g->I; int8_t *xq; float *sx;
+        if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){
+            fprintf(stderr,"gate_up_qt: shape overflow S=%d I=%d\n",S,I); exit(1);
+        }
+        quant_scratch((size_t)S*(size_t)I,(size_t)S,&xq,&sx);
+        for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
+        if(g->fmt==1){ matmul_q_idot(gg,xq,sx,g->q8,g->s,S,I,g->O);
+                       matmul_q_idot(uu,xq,sx,u->q8,u->s,S,I,u->O); }
+        else { matmul_i4_idot(gg,xq,sx,g->q4,g->s,S,I,g->O);
+               matmul_i4_idot(uu,xq,sx,u->q4,u->s,S,I,u->O); }
+        return;
+    }
+    matmul_qt(gg,x,g,S); matmul_qt(uu,x,u,S);
+}
+
 /* quantizza w[O,I] f32 -> int8 q[O,I] + scala[O] simmetrica per riga */
 static void quantize_rows(const float *w, int8_t *q, float *scale, int O, int I, int bits){
     int qmax=(1<<(bits-1))-1;
@@ -829,6 +863,21 @@ static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (0.95 = generation_co
                           * MiMo-V2.5, verificato: temperature=1.0, top_p=0.95) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
+/* CACHE_ROUTE=1 (port da colibri upstream; max-rank, paper 2412.00099): steering del
+ * router verso expert gia' residenti — top-J sacri sempre, gli slot restanti del top-K
+ * si riempiono preferendo expert in cache (pin∪gpu∪LRU) dentro la finestra top-M.
+ * Misurato upstream: miss 27%%->17%%, disco -31%%, route_agree 94.6%%. MAI default:
+ * cambia il routing (knob di qualita' come TOPP/TOPK — gate ppl §40 prima di adottarlo). */
+static int g_cache_route=0;
+static int g_route_j=2;    /* ROUTE_J: ranghi sacri (si caricano anche se non in cache) */
+static int g_route_m=12;   /* ROUTE_M: finestra max-rank per il fill cache-preferente */
+static uint64_t g_route_slots=0, g_route_swaps=0, g_route_agree_hit=0, g_route_agree_tot=0;
+static void cache_route_report(void){
+    if(!g_cache_route || !g_route_agree_tot) return;
+    fprintf(stderr,"[CACHE_ROUTE] agree=%.1f%% swaps=%.1f%% su %llu slot\n",
+        100.0*g_route_agree_hit/g_route_agree_tot,
+        100.0*g_route_swaps/g_route_slots, (unsigned long long)g_route_slots);
+}
 /* §42 EKEEP=n: maschera di PODA per-layer — solo gli n expert piu' usati (storia
  * .coli_usage) restano eleggibili al routing; il resto non viene MAI scelto ne' letto.
  * Simula un container potato senza riscrivere nulla (reversibile, EKEEP assente = off).
@@ -1081,6 +1130,7 @@ static inline int kv_phys(const Cfg *c, int li, int pos, int max_t){
     }
     return pos;
 }
+static void attn_dev_sync_rows(Model *m, int layer, int p0, int p1);
 
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
@@ -1647,6 +1697,38 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int rd=(int)((int64_t)hd*c->rope_dim/c->head_dim);
     float scale=1.f/sqrtf((float)hd);
     double ta0=now_s();
+#ifdef COLI_CUDA
+    /* Fused device decode (CUDA_ATTN=1, S=1): qkv GEMV (y on device) ->
+     * rope/append/score/softmax/weighted-V kernel (KV resident on device) ->
+     * o GEMV (x on device) -> D2H out. ONE sync per layer, no qkv/ctx PCIe
+     * round-trips. FP order differs from the CPU reference (online softmax):
+     * opt-in like the other CUDA tiers. Host KV row is mirrored back by the
+     * backend so S>1 CPU paths stay coherent. */
+    if(S==1 && g_cuda_attn && m->attn_dev) g_attn_dev_cand++;
+    if(S==1 && g_cuda_attn && m->attn_dev && l->qkv.cuda && l->o.cuda
+       && !l->qkv.cuda_failed && !l->o.cuda_failed){
+        g_attn_dev_took++;
+        int dev=g_cuda_devices[0];
+        const void *wq = l->qkv.fmt==0 ? (const void*)l->qkv.qf
+                     : l->qkv.fmt==1 ? (const void*)l->qkv.q8 : (const void*)l->qkv.q4;
+        const void *wo = l->o.fmt==0 ? (const void*)l->o.qf
+                     : l->o.fmt==1 ? (const void*)l->o.q8 : (const void*)l->o.q4;
+        float *qkvd=NULL, *ctxd=NULL;
+        if(coli_cuda_matmul_ex(&l->qkv.cuda, NULL, &qkvd, x, wq, l->qkv.s, l->qkv.fmt,
+                               1, l->qkv.I, l->qkv.O, dev, COLI_CUDA_MM_Y_DEV)
+           && (ctxd=coli_cuda_attn_decode(dev, layer, qkvd, pos_base,
+                                          m->kv_start[layer], c->v_scale))
+           && coli_cuda_matmul_ex(&l->o.cuda, out, NULL, ctxd, wo, l->o.s, l->o.fmt,
+                                  1, l->o.I, l->o.O, dev, COLI_CUDA_MM_X_DEV)){
+            m->t_attn += now_s()-ta0;
+            return;
+        }
+        /* Hard failure (OOM/launch): abandon the device store for good and fall
+         * back to the classic path — matmul_qt handles gpu_only weights. */
+        fprintf(stderr,"[CUDA] attn decode failed (layer %d); CUDA_ATTN disabled\n",layer);
+        m->attn_dev=0;
+    }
+#endif
     /* 1) proiezione fusa qkv [q|k|v] per tutti i token nuovi */
     float *qkv=falloc((int64_t)S*rowsz);
     matmul_qt(qkv, x, &l->qkv, S);
@@ -1678,6 +1760,9 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         for(int h=0;h<H;h++)   rope_apply(r+(int64_t)h*hd, rd, ct, st);
         for(int g=0;g<kvh;g++) rope_apply(Kd+(int64_t)g*hd, rd, ct, st);
     }
+    /* S>1 con append diretto (layer full, o SWA non ancora in ring): le righe
+     * scritte sopra vanno riflesse nel KV device per i decode S=1 futuri. */
+    if(S>1 && !ring_scratch) attn_dev_sync_rows(m, layer, pos_base, pos_base+S);
     /* 3) attenzione causale per (s,h): GQA, testa kv g=h/group */
     float *ctx=falloc((int64_t)S*H*vd);
     const float *Kc=m->K[layer], *Vc=m->V[layer];
@@ -1752,6 +1837,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             memcpy(m->K[layer]+(int64_t)pphy*ks, Ksc+(int64_t)s*ks, ks*sizeof(float));
             memcpy(m->V[layer]+(int64_t)pphy*vs, Vsc+(int64_t)s*vs, vs*sizeof(float));
         }
+        attn_dev_sync_rows(m, layer, pos_base+S-nkeep, pos_base+S);
         free(Ksc); free(Vsc);
     }
     /* 4) concat teste [S, H*vd] -> o_proj */
@@ -1791,6 +1877,37 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
         const uint8_t *km = g_ekeep_mask ? g_ekeep_mask+(size_t)layer*E : NULL;
+        if(g_cache_route){
+            /* Ranking completo dei top-Mwin per choice (EKEEP rispettato). */
+            int Mwin = g_route_m>Ksel ? g_route_m : Ksel; if(Mwin>E) Mwin=E;
+            int rbuf[256]; float rwin[256]; if(Mwin>256) Mwin=256;   /* E<=256 su MiMo */
+            int nr=0;
+            for(int kk=0;kk<Mwin;kk++){ int best=-1; float bv=-1e30f;
+                for(int e=0;e<E;e++){ if(km && !km[e]) continue;
+                    int tk=0; for(int j=0;j<nr;j++) if(rbuf[j]==e){tk=1;break;}
+                    if(!tk && choice[e]>bv){bv=choice[e];best=e;} }
+                if(best<0) break;
+                rbuf[nr]=best; rwin[nr]=logit[best]; nr++; }
+            if(Ksel>nr) Ksel=nr;                       /* EKEEP affamato: degrada pulito */
+            int J=g_route_j; if(J<0) J=0; if(J>Ksel) J=Ksel;
+            int chosen=0;
+            /* top-J veri sempre (anche se non in cache). */
+            for(int kk=0;kk<J;kk++){ idx[chosen]=rbuf[kk]; w[chosen]=rwin[kk]; chosen++; }
+            /* slot restanti: preferisci i RESIDENTI dentro la finestra (O(1) bitmap). */
+            for(int r=J;r<nr && chosen<Ksel;r++)
+                if(expert_resident(m,layer,rbuf[r])){ idx[chosen]=rbuf[r]; w[chosen]=rwin[r]; chosen++; }
+            /* riempi il resto in ordine di ranking vero. */
+            for(int r=J;r<nr && chosen<Ksel;r++){ int e=rbuf[r];
+                int dup=0; for(int j=J;j<chosen;j++) if(idx[j]==e){dup=1;break;}
+                if(!dup){ idx[chosen]=e; w[chosen]=rwin[r]; chosen++; } }
+            /* telemetria: swap vs il vero top-Ksel + overlap (route_agree). */
+            g_route_slots+=(uint64_t)Ksel;
+            int ov=0, tlim=Ksel<nr?Ksel:nr;
+            for(int kk=0;kk<Ksel;kk++){ int in_true=0;
+                for(int t=0;t<tlim;t++) if(rbuf[t]==idx[kk]){in_true=1;break;}
+                if(!in_true) g_route_swaps++; else ov++; }
+            g_route_agree_hit+=(uint64_t)ov; g_route_agree_tot+=(uint64_t)Ksel;
+        } else
         for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
             for(int e=0;e<E;e++){ if(km && !km[e]) continue;   /* §42 EKEEP: potato */
                 int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
@@ -1944,8 +2061,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #ifdef COLI_CUDA
               cuda_x_live=0;
 #endif
-              matmul_qt(gg, xg, &e->g, nr);
-              matmul_qt(uu, xg, &e->u, nr);
+              gate_up_qt(gg, uu, xg, &e->g, &e->u, nr);
               for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
               matmul_qt(hh, gg, &e->d, nr); }
 #ifdef COLI_CUDA
@@ -1997,8 +2113,7 @@ static void dense_mlp(Layer *l, float *x, int S, int D, int I, float *out){
     if(swiglu_qt(out, x, &l->gate_proj, &l->up_proj, &l->down_proj, S, 0)) return;
 #endif
     float *g=falloc((int64_t)S*I), *u=falloc((int64_t)S*I);
-    matmul_qt(g, x, &l->gate_proj, S);
-    matmul_qt(u, x, &l->up_proj,   S);
+    gate_up_qt(g, u, x, &l->gate_proj, &l->up_proj, S);
     for(int64_t i=0;i<(int64_t)S*I;i++) g[i]=siluf(g[i])*u[i];
     matmul_qt(out, g, &l->down_proj, S);
     free(g); free(u);
@@ -2138,6 +2253,53 @@ static void kv_alloc(Model *m, int max_t){
     if(bytes_lin>bytes_ring+1e6)
         fprintf(stderr,"[KV] SWA ring: %.2f GB -> %.2f GB (saved %.2f GB for expert cache budget)\n",
             bytes_lin/1e9, bytes_ring/1e9, (bytes_lin-bytes_ring)/1e9);
+#ifdef COLI_CUDA
+    /* Device KV mirror for fused decode attention (CUDA_ATTN=1). Rebuilt together
+     * with the host KV (max_t growth). All-or-nothing: on failure the engine keeps
+     * the classic path (qkv/o GEMV on GPU, rope+scoring on CPU). */
+    m->attn_dev=0;
+    if(g_cuda_enabled && g_cuda_attn && g_cuda_ndev==1){
+        int dev=g_cuda_devices[0];
+        int rw[128],kv[128],hd[128],vd[128],sw[128];
+        for(int i=0;i<rows;i++){ rw[i]=lyr_kv_rows(c,i,max_t); kv[i]=lyr_kvh(c,i);
+            hd[i]=lyr_hd(c,i); vd[i]=lyr_vd(c,i); sw[i]=c->is_swa[i]; }
+        if(coli_cuda_attn_kv_alloc(dev,rows,rw,kv,hd,vd,sw,c->sliding_window,max_t,c->n_heads)
+           && coli_cuda_attn_rope(dev,0,m->rope_full_cos,m->rope_full_sin,max_t,m->rope_rd_full/2)
+           && coli_cuda_attn_rope(dev,1,m->rope_swa_cos,m->rope_swa_sin,max_t,m->rope_rd_swa/2)){
+            int ok=1;
+            for(int i=0;i<rows && ok;i++){
+                Layer *l = i<c->n_layers ? &m->L[i] : &m->mtpL;
+                int rd = c->is_swa[i] ? m->rope_rd_swa : m->rope_rd_full;
+                ok &= coli_cuda_attn_layer_cfg(dev,i,rd,l->sink,c->n_heads);
+                ok &= coli_cuda_attn_mirror(dev,i,m->K[i],m->V[i]);
+            }
+            m->attn_dev=ok;
+        }
+        if(!m->attn_dev) fprintf(stderr,"[CUDA] attn KV setup failed; CUDA_ATTN disabled\n");
+    }
+#endif
+}
+
+/* Upload host KV rows for logical positions [p0,p1) of one layer to the device
+ * store (coalescing physical ranges across ring wrap). Needed after S>1 CPU
+ * attention (prefill / speculative verify / MTP absorb) so later S=1 device
+ * decodes see a coherent cache. */
+static void attn_dev_sync_rows(Model *m, int layer, int p0, int p1){
+#ifdef COLI_CUDA
+    if(!g_cuda_attn || !m->attn_dev || p1<=p0) return;
+    Cfg *c=&m->c; int kvh=lyr_kvh(c,layer), hd=lyr_hd(c,layer), vd=lyr_vd(c,layer);
+    int ks=kvh*hd, vs=kvh*vd, dev=g_cuda_devices[0];
+    int p=p0;
+    while(p<p1){
+        int pp=kv_phys(c,layer,p,m->max_t), run=1;
+        while(p+run<p1 && kv_phys(c,layer,p+run,m->max_t)==pp+run) run++;
+        coli_cuda_attn_upload_rows(dev,layer,pp,pp+run,
+            m->K[layer]+(int64_t)pp*ks, m->V[layer]+(int64_t)pp*vs);
+        p+=run;
+    }
+#else
+    (void)m;(void)layer;(void)p0;(void)p1;
+#endif
 }
 
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
@@ -2258,9 +2420,6 @@ static uint64_t g_rng=0x9E3779B97F4A7C15ULL;
 static inline double rndu(void){ g_rng^=g_rng<<13; g_rng^=g_rng>>7; g_rng^=g_rng<<17;
     return (double)(g_rng>>11)*(1.0/9007199254740992.0); }
 static float *g_pbuf=NULL; static int *g_pidx=NULL;   /* buffer riusati (decode single-thread) */
-static int cmp_pdesc(const void *a,const void *b){
-    float pa=g_pbuf[*(const int*)a], pb=g_pbuf[*(const int*)b];
-    return pa<pb ? 1 : pa>pb ? -1 : 0; }
 /* costruisce in g_pbuf la distribuzione target: softmax(lo/temp) troncata a top-p g_nuc */
 static void dist_build(const float *lo, int V){
     if(!g_pbuf){ g_pbuf=falloc(V); g_pidx=malloc(V*sizeof(int)); }
@@ -2270,12 +2429,36 @@ static void dist_build(const float *lo, int V){
     for(int i=0;i<V;i++) g_pbuf[i]/=(float)s;
     if(g_nuc>0 && g_nuc<1.f){
         for(int i=0;i<V;i++) g_pidx[i]=i;
-        qsort(g_pidx,V,sizeof(int),cmp_pdesc);
-        double cum=0; int keep=V;
-        for(int i=0;i<V;i++){ cum+=g_pbuf[g_pidx[i]]; if(cum>=g_nuc){ keep=i+1; break; } }
-        double s2=0; for(int i=keep;i<V;i++) g_pbuf[g_pidx[i]]=0;
-        for(int i=0;i<keep;i++) s2+=g_pbuf[g_pidx[i]];
-        for(int i=0;i<keep;i++) g_pbuf[g_pidx[i]]/=(float)s2;
+        /* Partial select (colibri #354 port): the qsort of all V entries cost ~5-8 ms
+         * per sampled token; the real work is finding the small head whose cumulative
+         * mass reaches g_nuc. Floyd max-heapify is O(V) iterative (no indirect
+         * comparator), then pop winners to the array's high end until cum>=nuc
+         * (k·log V, k = head size). The heap prefix left behind IS the tail. */
+        for(int i=(V-2)/2;i>=0;i--){
+            int r=i;
+            for(;;){ int ch=2*r+1; if(ch>=V) break;
+                if(ch+1<V && g_pbuf[g_pidx[ch+1]]>g_pbuf[g_pidx[ch]]) ch++;
+                if(g_pbuf[g_pidx[r]]>=g_pbuf[g_pidx[ch]]) break;
+                int t=g_pidx[r]; g_pidx[r]=g_pidx[ch]; g_pidx[ch]=t; r=ch; }
+        }
+        double cum=0; int out=V;
+        while(out>0){
+            int top=g_pidx[0]; out--;
+            g_pidx[0]=g_pidx[out]; g_pidx[out]=top;   /* popped -> g_pidx[out..V) */
+            int r=0;
+            for(;;){ int ch=2*r+1; if(ch>=out) break;
+                if(ch+1<out && g_pbuf[g_pidx[ch+1]]>g_pbuf[g_pidx[ch]]) ch++;
+                if(g_pbuf[g_pidx[r]]>=g_pbuf[g_pidx[ch]]) break;
+                int t=g_pidx[r]; g_pidx[r]=g_pidx[ch]; g_pidx[ch]=t; r=ch; }
+            cum+=g_pbuf[top];
+            if(cum>=g_nuc) break;
+        }
+        /* kept = g_pidx[out..V) (descending from V-1); tail = g_pidx[0..out) -> zero.
+         * s2 accumulates descending like the old sorted code (same FP order). */
+        double s2=0;
+        for(int i=0;i<out;i++) g_pbuf[g_pidx[i]]=0;
+        for(int i=V-1;i>=out;i--) s2+=g_pbuf[g_pidx[i]];
+        for(int i=out;i<V;i++) g_pbuf[g_pidx[i]]/=(float)s2;
     }
 }
 /* campiona da g_pbuf; ban>=0 -> quel token e' escluso (rinormalizzando al volo) */
@@ -2463,6 +2646,9 @@ static void profile_print(Model *m, double elapsed){
     double other=elapsed-accounted; if(other<0) other=0;
     printf("PROFILE: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs | lm_head %.3fs | other %.3fs\n",
         m->t_edisk,m->t_emm,m->t_attn,m->t_head,other);
+#ifdef COLI_CUDA
+    if(g_attn_dev_cand) printf("PROFILE-ATTNDEV: device branch %ld/%ld decode calls\n", g_attn_dev_took, g_attn_dev_cand);
+#endif
     if(io_aux>1e-4)
         printf("PROFILE-AUX: traj_warm %.3fs | pathpack %.3fs | persist %.3fs (was in other)\n",
             m->t_traj_warm,m->t_pathpack,m->t_persist);
@@ -3848,6 +4034,18 @@ int main(int argc, char **argv){
     if(getenv("DRAFT")) g_draft=atoi(getenv("DRAFT"));
     else if(tao_mode) g_draft=0;                 /* TAO: do not force MTP draft on cold disk */
     else g_draft=-1;                             /* -1 = auto after load (MTP head -> often 0) */
+    /* CACHE_ROUTE (port colibri upstream): steering del router verso expert residenti.
+     * Opt-in, MAI default: cambia il routing — adottare solo dopo gate ppl tipo §40. */
+    g_cache_route = getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):0;
+    if(getenv("ROUTE_J")) g_route_j=atoi(getenv("ROUTE_J"));
+    if(getenv("ROUTE_M")) g_route_m=atoi(getenv("ROUTE_M"));
+    if(g_cache_route){
+        fprintf(stderr,"[CACHE_ROUTE] on J=%d M=%d (prefer pin/GPU/LRU; gate ppl §40 prima dell'adozione)\n",
+                g_route_j, g_route_m);
+        if(g_draft!=0){ g_draft=0;
+            fprintf(stderr,"[CACHE_ROUTE] DRAFT forzato 0: lo steering rompe il contratto draft/verify (lossless-spec)\n"); }
+        atexit(cache_route_report);
+    }
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):(serve_mode?1:0);
     g_overlap = getenv("OVERLAP")?atoi(getenv("OVERLAP")):1;   /* 0 = load/compute a fasi (A/B) */
     { const char *e=getenv("OVERLAP_T"); if(e){ g_overlap_t=atoi(e);
@@ -3934,6 +4132,10 @@ int main(int argc, char **argv){
         if(!g_cuda_enabled){ fprintf(stderr,"[CUDA] backend richiesto ma non disponibile\n"); return 2; }
     }
     g_cuda_dense=getenv("CUDA_DENSE")?atoi(getenv("CUDA_DENSE")):0;
+    g_cuda_attn=getenv("CUDA_ATTN")?atoi(getenv("CUDA_ATTN")):0;
+    if(g_cuda_attn && !g_cuda_enabled){ fprintf(stderr,"CUDA_ATTN requires COLI_CUDA=1\n"); return 2; }
+    if(g_cuda_attn && !g_cuda_dense){ fprintf(stderr,"[CUDA] CUDA_ATTN needs CUDA_DENSE=1 (resident qkv/o); disabled\n"); g_cuda_attn=0; }
+    if(g_cuda_attn && g_cuda_ndev>1){ fprintf(stderr,"[CUDA] CUDA_ATTN: single-device only; disabled\n"); g_cuda_attn=0; }
     /* CUDA_EXPERT_GB: unset+CUDA → auto (-1); 0=off; >0=explicit GB cap. */
     if(getenv("CUDA_EXPERT_GB")) g_cuda_expert_gb=atof(getenv("CUDA_EXPERT_GB"));
     else g_cuda_expert_gb = g_cuda_enabled ? -1.0 : 0.0;
@@ -3944,12 +4146,14 @@ int main(int argc, char **argv){
         fprintf(stderr,"[CUDA] mode: routed experts%s | expert-GB %s\n",
             g_cuda_dense?" + resident dense tensors":" only (resident dense on CPU)",
             g_cuda_expert_gb<0?"auto":(g_cuda_expert_gb==0?"off":"cap"));
+        if(g_cuda_attn) fprintf(stderr,"[CUDA] CUDA_ATTN=1: fused decode attention on device (opt-in, non bit-exact)\n");
         /* Fast CPU expert path for S=1 int4 when env I4S unset (chat-speed, not oracle-exact). */
         if(!getenv("I4S")) g_i4s=1;
     }
 #else
     if((getenv("COLI_CUDA") && atoi(getenv("COLI_CUDA"))) ||
        getenv("COLI_GPU") || getenv("COLI_GPUS") ||
+       (getenv("CUDA_ATTN") && atoi(getenv("CUDA_ATTN"))) ||
        (getenv("CUDA_DENSE") && atoi(getenv("CUDA_DENSE"))) ||
        getenv("CUDA_EXPERT_GB")){
         fprintf(stderr,"CUDA requested but this binary is CPU-only; rebuild with: make CUDA=1\n");

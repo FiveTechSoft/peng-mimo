@@ -71,6 +71,52 @@ int coli_cuda_moe_end(float *y_host, int S, int D, int device);
 /* Drop sticky device-x (call when host x packing may change). */
 void coli_cuda_x_invalidate(int device);
 
+/* ---- fused decode attention (S=1), KV cache resident on device ----------
+ * Opt-in (CUDA_ATTN=1). Per decode layer:
+ *   qkv GEMV (y stays on device) -> attn kernel (RoPE + v_scale + KV append +
+ *   scores + online softmax + weighted-V) -> o GEMV (x on device) -> D2H out.
+ * One sync per layer instead of two, no qkv/ctx PCIe round-trips.
+ * Host K/V stay authoritative for S>1 (prefill/verify): those run on CPU and
+ * are mirrored to the device with coli_cuda_attn_upload_rows(); the S=1
+ * device path mirrors its appended row back to host (async, same stream). */
+
+/* flags for coli_cuda_matmul_ex */
+#define COLI_CUDA_MM_X_DEV  1   /* x is a device pointer (skip H2D)          */
+#define COLI_CUDA_MM_Y_DEV  2   /* leave y on device (*y_dev), skip D2H+sync */
+
+int coli_cuda_matmul_ex(ColiCudaTensor **tensor,
+                        float *y, float **y_dev, const float *x,
+                        const void *weights, const float *scales,
+                        int fmt, int S, int I, int O, int device, int flags);
+
+/* (Re)allocate the device KV store: per-layer physical rows (ring W or max_t),
+ * geometry and type. Frees previous allocations. swa[i]: 1=SWA layer.
+ * Returns 1 on success (all layers), 0 on any failure (store disabled). */
+int coli_cuda_attn_kv_alloc(int device, int n_layer,
+                            const int *rows, const int *kvh,
+                            const int *hd, const int *vd, const int *swa,
+                            int window, int max_t, int n_heads);
+
+/* Upload RoPE tables for one layer type: cos/sin [max_t][half]. type: 0=full 1=swa. */
+int coli_cuda_attn_rope(int device, int type, const float *cos_t, const float *sin_t,
+                        int rows, int half);
+
+/* Per-layer rope dim + optional sink bias [n_heads] (NULL = no sink). */
+int coli_cuda_attn_layer_cfg(int device, int layer, int rd, const float *sink, int n_heads);
+
+/* Register host K/V base pointers of one layer for the row mirror. */
+int coli_cuda_attn_mirror(int device, int layer, float *K_host, float *V_host);
+
+/* Mirror host rows [r0,r1) of one layer to the device (after S>1 CPU paths). */
+int coli_cuda_attn_upload_rows(int device, int layer, int r0, int r1,
+                               const float *K, const float *V);
+
+/* Fused decode attention for one token at pos (S=1).
+ * qkv_dev: device row [H*hd + kvh*hd + kvh*vd] (no RoPE/v_scale applied yet).
+ * Returns the device ctx pointer [H*vd] (valid until next decode), NULL on error. */
+float *coli_cuda_attn_decode(int device, int layer, const float *qkv_dev,
+                             int pos, int kv_start, float v_scale);
+
 void coli_cuda_tensor_free(ColiCudaTensor *tensor);
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor);
 int coli_cuda_tensor_device(const ColiCudaTensor *tensor);

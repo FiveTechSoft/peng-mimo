@@ -363,6 +363,18 @@ static int launch_gate_up_silu(float *mid, const float *dx,
 extern "C" int coli_cuda_init(const int *devices, int count) {
     int available = 0;
     if (!devices || count < 1 || count > COLI_CUDA_MAX_DEVICES) return 0;
+    /* Sync policy: SPIN by default. Measured 2026-07-19 on the 311B run: under
+     * the expert-pipeline CPU load a yielding cudaStreamSynchronize deschedules
+     * the forward thread for ~5-8 ms per decode layer, eating the whole
+     * CUDA_ATTN gain (8.6 s instead of ~1 s per 24 tok). Spinning keeps the
+     * sync at ~40 us. COLI_CUDA_SYNC=yield|block restores the old behavior. */
+    {
+        const char *sync = std::getenv("COLI_CUDA_SYNC");
+        unsigned flags = cudaDeviceScheduleSpin;
+        if (sync && !std::strcmp(sync, "yield")) flags = cudaDeviceScheduleYield;
+        else if (sync && !std::strcmp(sync, "block")) flags = cudaDeviceScheduleBlockingSync;
+        cudaSetDeviceFlags(flags);   /* best-effort: before context creation */
+    }
     if (!cuda_ok(cudaGetDeviceCount(&available), "device discovery")) return 0;
     g_nctx = 0;
     for (int i = 0; i < count; i++) {
@@ -468,27 +480,38 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     return 1;
 }
 
-extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
-                                 float *y, const float *x,
-                                 const void *weights, const float *scales,
-                                 int fmt, int S, int I, int O, int device) {
+extern "C" int coli_cuda_matmul_ex(ColiCudaTensor **tensor,
+                                    float *y, float **y_dev, const float *x,
+                                    const void *weights, const float *scales,
+                                    int fmt, int S, int I, int O, int device, int flags) {
     if (S < 1 || !coli_cuda_tensor_upload(tensor, weights, scales, fmt, I, O, device)) return 0;
     ColiCudaTensor *t = *tensor;
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
-    if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
-    double tc0 = now_s();
-    if (!cuda_ok(cudaMemcpyAsync(ctx->x, x, xb, cudaMemcpyHostToDevice, ctx->stream), "input upload")) return 0;
-    if (!launch_quant_matmul(ctx->y, ctx->x, t, S, I, O, ctx->stream)) return 0;
+    const float *dx = x;
+    if (!(flags & COLI_CUDA_MM_X_DEV)) {
+        if (!reserve(&ctx->x, &ctx->x_cap, xb)) return 0;
+        if (!cuda_ok(cudaMemcpyAsync(ctx->x, x, xb, cudaMemcpyHostToDevice, ctx->stream), "input upload")) return 0;
+        dx = ctx->x;
+        ctx->sticky_valid = 0;   /* x buffer repurposed */
+    }
+    if (!reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
+    if (!launch_quant_matmul(ctx->y, dx, t, S, I, O, ctx->stream)) return 0;
+    if (flags & COLI_CUDA_MM_Y_DEV) {
+        if (y_dev) *y_dev = ctx->y;
+        return 1;   /* no D2H, no sync: caller chains more device work */
+    }
     if (!cuda_ok(cudaMemcpyAsync(y, ctx->y, yb, cudaMemcpyDeviceToHost, ctx->stream), "output download")) return 0;
     if (!cuda_ok(cudaStreamSynchronize(ctx->stream), "matmul sync")) return 0;
-    double tc1 = now_s();
-    /* Full API call wall includes compute; copy timer stays best-effort (async). */
-    g_copy_sec += 0; /* H2D/D2H overlapped; not isolated under async */
-    (void)tc0; (void)tc1;
-    ctx->sticky_valid = 0;   /* x buffer repurposed */
     return 1;
+}
+
+extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
+                                 float *y, const float *x,
+                                 const void *weights, const float *scales,
+                                 int fmt, int S, int I, int O, int device) {
+    return coli_cuda_matmul_ex(tensor, y, nullptr, x, weights, scales, fmt, S, I, O, device, 0);
 }
 
 extern "C" void coli_cuda_x_invalidate(int device) {
@@ -655,4 +678,298 @@ extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
 
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {
     return tensor ? tensor->device : -1;
+}
+
+/* ================= fused decode attention (S=1), KV resident on device ====
+ * One block per query head. Inside a block:
+ *   1) load q/k, apply partial RoPE (pairs j, j+rd/2), scale v by v_scale
+ *   2) block with h%group==0 appends the new K/V row to the device cache
+ *   3) per-warp online softmax over the causal window [lo,pos] (t strided by
+ *      warp; t==pos uses the smem copy, no cross-block dependency)
+ *   4) cross-warp merge -> ctx[h*vd]
+ * FP order differs from the CPU 2-pass reference (online softmax + different
+ * dot reduction): the whole path is opt-in (CUDA_ATTN=1), same contract as
+ * the existing CUDA dense/expert tiers (chat-speed, not oracle-exact). */
+
+#define COLI_ATTN_MAX_LAYERS 130
+#define ATTN_THREADS 128                 /* 4 warps */
+#define ATTN_HD_MAX 192
+#define ATTN_VD_MAX 128
+
+typedef struct {
+    int allocated;
+    int n_layer, n_heads, window, max_t;
+    int rows[COLI_ATTN_MAX_LAYERS];      /* physical KV rows per layer */
+    int kvh[COLI_ATTN_MAX_LAYERS];
+    int hd[COLI_ATTN_MAX_LAYERS];
+    int vd[COLI_ATTN_MAX_LAYERS];
+    int rd[COLI_ATTN_MAX_LAYERS];        /* rope dims (even) */
+    int swa[COLI_ATTN_MAX_LAYERS];
+    int ring[COLI_ATTN_MAX_LAYERS];      /* swa && window>0 && rows<max_t */
+    int has_sink[COLI_ATTN_MAX_LAYERS];
+    float *K[COLI_ATTN_MAX_LAYERS];      /* device */
+    float *V[COLI_ATTN_MAX_LAYERS];      /* device */
+    float *sink;                         /* device [n_layer][n_heads] packed */
+    float *rope_cos[2], *rope_sin[2];    /* device, per type 0=full 1=swa */
+    int rope_half[2], rope_rows[2];
+    float *Kh[COLI_ATTN_MAX_LAYERS];     /* host mirror bases (nullable) */
+    float *Vh[COLI_ATTN_MAX_LAYERS];
+    float *ctx;                          /* device [n_heads*max_vd] */
+    size_t ctx_cap;
+} AttnState;
+
+static AttnState g_attn[COLI_CUDA_MAX_DEVICES];
+
+static AttnState *attn_for(int device) {
+    for (int i = 0; i < g_nctx; i++) if (g_ctx[i].device == device) return &g_attn[i];
+    return nullptr;
+}
+
+__global__ static void attn_decode_kernel(
+    const float *__restrict__ qkv,       /* [H*hd + kvh*hd + kvh*vd] */
+    float *__restrict__ K, float *__restrict__ V,
+    const float *__restrict__ cosr, const float *__restrict__ sinr,   /* [half] */
+    const float *__restrict__ sink,      /* [H] or nullptr */
+    float *__restrict__ ctx,             /* [H*vd] */
+    int pos, int lo, int nt,
+    int kvh, int group, int hd, int vd, int rd,
+    int rows, int ring,
+    float scale, float v_scale)
+{
+    const int h = blockIdx.x;
+    const int g = h / group;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nwarps = blockDim.x >> 5;
+    __shared__ float sq[ATTN_HD_MAX];
+    __shared__ float sk[ATTN_HD_MAX];
+    __shared__ float sv[ATTN_VD_MAX];
+    __shared__ float sacc[ATTN_THREADS / 32][ATTN_VD_MAX];
+    __shared__ float sm[ATTN_THREADS / 32], sl[ATTN_THREADS / 32];
+
+    const int qs = (int)gridDim.x * hd;  /* H*hd */
+    const int half = rd >> 1;
+    const float *qsrc = qkv + (size_t)h * hd;
+    const float *ksrc = qkv + (size_t)qs + (size_t)g * hd;
+    const float *vsrc = qkv + (size_t)qs + (size_t)kvh * hd + (size_t)g * vd;
+
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) { sq[d] = qsrc[d]; sk[d] = ksrc[d]; }
+    for (int d = threadIdx.x; d < vd; d += blockDim.x) sv[d] = vsrc[d] * v_scale;
+    __syncthreads();
+    if (threadIdx.x < (unsigned)half) {
+        const int j = threadIdx.x;
+        const float cs = cosr[j], sn = sinr[j];
+        float a = sq[j], b = sq[half + j];
+        sq[j] = a * cs - b * sn; sq[half + j] = b * cs + a * sn;
+        a = sk[j]; b = sk[half + j];
+        sk[j] = a * cs - b * sn; sk[half + j] = b * cs + a * sn;
+    }
+    __syncthreads();
+
+    /* append the new row (exactly one block per kv group) */
+    const int pphy = ring ? (pos % rows) : pos;
+    if (h % group == 0) {
+        float *kd = K + (size_t)pphy * ((size_t)kvh * hd) + (size_t)g * hd;
+        float *vdst = V + (size_t)pphy * ((size_t)kvh * vd) + (size_t)g * vd;
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) kd[d] = sk[d];
+        for (int d = threadIdx.x; d < vd; d += blockDim.x) vdst[d] = sv[d];
+    }
+
+    /* per-warp online softmax over [lo,pos], t strided by warp */
+    float m = -1e30f, l = 0.f;
+    if (warp == 0 && sink) { m = sink[h]; l = 1.0f; }
+    for (int d = lane; d < vd; d += 32) sacc[warp][d] = 0.f;
+    __syncwarp();
+    const float *Kb = K + (size_t)g * hd;
+    const float *Vb = V + (size_t)g * vd;
+    const size_t kstride = (size_t)kvh * hd, vstride = (size_t)kvh * vd;
+    for (int j = warp; j < nt; j += nwarps) {
+        const int t = lo + j;
+        const float *kr, *vr;
+        if (t == pos) { kr = sk; vr = sv; }
+        else {
+            const int tp = ring ? (t % rows) : t;
+            kr = Kb + (size_t)tp * kstride;
+            vr = Vb + (size_t)tp * vstride;
+        }
+        float sum = 0.f;
+        for (int d = lane; d < hd; d += 32) sum += sq[d] * kr[d];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+        const float s = sum * scale;
+        const float mn = fmaxf(m, s);
+        const float corr = expf(m - mn);
+        const float wgt = expf(s - mn);
+        l = l * corr + wgt;
+        m = mn;
+        for (int d = lane; d < vd; d += 32)
+            sacc[warp][d] = sacc[warp][d] * corr + wgt * vr[d];
+    }
+    if (lane == 0) { sm[warp] = m; sl[warp] = l; }
+    __syncthreads();
+
+    /* cross-warp merge */
+    float M = sm[0];
+    for (int w = 1; w < nwarps; w++) M = fmaxf(M, sm[w]);
+    float L = 0.f;
+    for (int w = 0; w < nwarps; w++) L += sl[w] * expf(sm[w] - M);
+    const float inv = 1.f / L;
+    for (int d = threadIdx.x; d < vd; d += blockDim.x) {
+        float a = 0.f;
+        for (int w = 0; w < nwarps; w++) a += sacc[w][d] * expf(sm[w] - M);
+        ctx[(size_t)h * vd + d] = a * inv;
+    }
+}
+
+static void attn_free(AttnState *A) {
+    if (!A) return;
+    for (int i = 0; i < A->n_layer; i++) {
+        if (A->K[i]) cudaFree(A->K[i]);
+        if (A->V[i]) cudaFree(A->V[i]);
+        A->K[i] = A->V[i] = nullptr;
+    }
+    for (int t = 0; t < 2; t++) {
+        if (A->rope_cos[t]) cudaFree(A->rope_cos[t]);
+        if (A->rope_sin[t]) cudaFree(A->rope_sin[t]);
+        A->rope_cos[t] = A->rope_sin[t] = nullptr;
+        A->rope_half[t] = A->rope_rows[t] = 0;
+    }
+    if (A->sink) { cudaFree(A->sink); A->sink = nullptr; }
+    if (A->ctx)  { cudaFree(A->ctx);  A->ctx = nullptr; }
+    A->ctx_cap = 0;
+    A->allocated = 0;
+}
+
+extern "C" int coli_cuda_attn_kv_alloc(int device, int n_layer,
+                                        const int *rows, const int *kvh,
+                                        const int *hd, const int *vd, const int *swa,
+                                        int window, int max_t, int n_heads) {
+    DeviceContext *ctx = find_ctx(device);
+    AttnState *A = attn_for(device);
+    if (!ctx || !A || !select_ctx(ctx)) return 0;
+    if (n_layer < 1 || n_layer > COLI_ATTN_MAX_LAYERS || n_heads < 1) return 0;
+    attn_free(A);
+    A->n_layer = n_layer; A->n_heads = n_heads;
+    A->window = window; A->max_t = max_t;
+    int max_vd = 0;
+    size_t total = 0;
+    for (int i = 0; i < n_layer; i++) {
+        A->rows[i] = rows[i]; A->kvh[i] = kvh[i];
+        A->hd[i] = hd[i]; A->vd[i] = vd[i]; A->swa[i] = swa[i];
+        A->ring[i] = (swa[i] && window > 0 && rows[i] < max_t) ? 1 : 0;
+        A->has_sink[i] = 0; A->Kh[i] = nullptr; A->Vh[i] = nullptr;
+        if (hd[i] > ATTN_HD_MAX || vd[i] > ATTN_VD_MAX) { attn_free(A); return 0; }
+        if (vd[i] > max_vd) max_vd = vd[i];
+        size_t kb = (size_t)rows[i] * kvh[i] * hd[i] * sizeof(float);
+        size_t vb = (size_t)rows[i] * kvh[i] * vd[i] * sizeof(float);
+        if (!cuda_ok(cudaMalloc(&A->K[i], kb), "attn K alloc") ||
+            !cuda_ok(cudaMalloc(&A->V[i], vb), "attn V alloc")) { attn_free(A); return 0; }
+        total += kb + vb;
+    }
+    if (!cuda_ok(cudaMalloc(&A->sink, (size_t)n_layer * n_heads * sizeof(float)), "attn sink alloc")) {
+        attn_free(A); return 0;
+    }
+    A->ctx_cap = (size_t)n_heads * max_vd * sizeof(float);
+    if (!cuda_ok(cudaMalloc(&A->ctx, A->ctx_cap), "attn ctx alloc")) { attn_free(A); return 0; }
+    A->allocated = 1;
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    std::fprintf(stderr, "[CUDA] attn KV: %d layers, %.2f GB device (free %.2f GB)\n",
+                 n_layer, total / 1e9, free_b / 1e9);
+    return 1;
+}
+
+extern "C" int coli_cuda_attn_rope(int device, int type, const float *cos_t, const float *sin_t,
+                                    int rows, int half) {
+    DeviceContext *ctx = find_ctx(device);
+    AttnState *A = attn_for(device);
+    if (!ctx || !A || !A->allocated || type < 0 || type > 1 || !select_ctx(ctx)) return 0;
+    if (!cos_t || !sin_t || rows < 1 || half < 1) return 0;
+    size_t b = (size_t)rows * half * sizeof(float);
+    if (A->rope_rows[type] < rows || A->rope_half[type] != half) {
+        if (A->rope_cos[type]) cudaFree(A->rope_cos[type]);
+        if (A->rope_sin[type]) cudaFree(A->rope_sin[type]);
+        A->rope_cos[type] = A->rope_sin[type] = nullptr;
+        A->rope_rows[type] = 0; A->rope_half[type] = half;
+        if (!cuda_ok(cudaMalloc(&A->rope_cos[type], b), "rope cos alloc") ||
+            !cuda_ok(cudaMalloc(&A->rope_sin[type], b), "rope sin alloc")) return 0;
+        A->rope_rows[type] = rows;
+    }
+    if (!cuda_ok(cudaMemcpy(A->rope_cos[type], cos_t, b, cudaMemcpyHostToDevice), "rope cos upload")) return 0;
+    if (!cuda_ok(cudaMemcpy(A->rope_sin[type], sin_t, b, cudaMemcpyHostToDevice), "rope sin upload")) return 0;
+    return 1;
+}
+
+extern "C" int coli_cuda_attn_layer_cfg(int device, int layer, int rd, const float *sink, int n_heads) {
+    DeviceContext *ctx = find_ctx(device);
+    AttnState *A = attn_for(device);
+    if (!ctx || !A || !A->allocated || !select_ctx(ctx)) return 0;
+    if (layer < 0 || layer >= A->n_layer || rd < 0 || rd > ATTN_HD_MAX || n_heads != A->n_heads) return 0;
+    A->rd[layer] = rd;
+    A->has_sink[layer] = sink ? 1 : 0;
+    if (sink && !cuda_ok(cudaMemcpy(A->sink + (size_t)layer * n_heads, sink,
+                                    (size_t)n_heads * sizeof(float), cudaMemcpyHostToDevice), "sink upload"))
+        return 0;
+    return 1;
+}
+
+extern "C" int coli_cuda_attn_mirror(int device, int layer, float *K_host, float *V_host) {
+    AttnState *A = attn_for(device);
+    if (!A || !A->allocated || layer < 0 || layer >= A->n_layer) return 0;
+    A->Kh[layer] = K_host; A->Vh[layer] = V_host;
+    return 1;
+}
+
+extern "C" int coli_cuda_attn_upload_rows(int device, int layer, int r0, int r1,
+                                           const float *K, const float *V) {
+    DeviceContext *ctx = find_ctx(device);
+    AttnState *A = attn_for(device);
+    if (!ctx || !A || !A->allocated || !select_ctx(ctx)) return 0;
+    if (layer < 0 || layer >= A->n_layer || r0 < 0 || r1 > A->rows[layer] || r1 <= r0) return 0;
+    size_t koff = (size_t)r0 * A->kvh[layer] * A->hd[layer];
+    size_t voff = (size_t)r0 * A->kvh[layer] * A->vd[layer];
+    size_t kb = (size_t)(r1 - r0) * A->kvh[layer] * A->hd[layer] * sizeof(float);
+    size_t vb = (size_t)(r1 - r0) * A->kvh[layer] * A->vd[layer] * sizeof(float);
+    if (!cuda_ok(cudaMemcpyAsync(A->K[layer] + koff, K, kb, cudaMemcpyHostToDevice, ctx->stream),
+                 "KV rows K upload")) return 0;
+    if (!cuda_ok(cudaMemcpyAsync(A->V[layer] + voff, V, vb, cudaMemcpyHostToDevice, ctx->stream),
+                 "KV rows V upload")) return 0;
+    if (!cuda_ok(cudaStreamSynchronize(ctx->stream), "KV rows sync")) return 0;
+    return 1;
+}
+
+extern "C" float *coli_cuda_attn_decode(int device, int layer, const float *qkv_dev,
+                                         int pos, int kv_start, float v_scale) {
+    DeviceContext *ctx = find_ctx(device);
+    AttnState *A = attn_for(device);
+    if (!ctx || !A || !A->allocated || !qkv_dev || !select_ctx(ctx)) return nullptr;
+    if (layer < 0 || layer >= A->n_layer) return nullptr;
+    const int swa = A->swa[layer], rows = A->rows[layer], ring = A->ring[layer];
+    int lo = (swa && A->window > 0) ? pos - A->window + 1 : 0;
+    if (lo < 0) lo = 0;
+    if (lo < kv_start) lo = kv_start;
+    if (pos < lo) return nullptr;
+    const int nt = pos + 1 - lo;
+    const int half = A->rd[layer] >> 1;
+    const float *cosr = A->rope_cos[swa] ? A->rope_cos[swa] + (size_t)pos * half : nullptr;
+    const float *sinr = A->rope_sin[swa] ? A->rope_sin[swa] + (size_t)pos * half : nullptr;
+    if (half > 0 && (!cosr || !sinr)) return nullptr;
+    const int hd = A->hd[layer], vd = A->vd[layer], kvh = A->kvh[layer];
+    const int H = A->n_heads, group = H / kvh;
+    const float scale = 1.f / sqrtf((float)hd);
+    const float *sink = A->has_sink[layer] ? A->sink + (size_t)layer * H : nullptr;
+    attn_decode_kernel<<<H, ATTN_THREADS, 0, ctx->stream>>>(
+        qkv_dev, A->K[layer], A->V[layer], cosr, sinr, sink, A->ctx,
+        pos, lo, nt, kvh, group, hd, vd, A->rd[layer], rows, ring, scale, v_scale);
+    if (!cuda_ok(cudaGetLastError(), "attn decode launch")) return nullptr;
+    /* mirror the appended row back to host K/V (async; flushed by the caller's
+     * end-of-layer sync) so S>1 CPU paths keep reading warm host KV. */
+    if (A->Kh[layer]) {
+        const int pphy = ring ? (pos % rows) : pos;
+        const size_t ko = (size_t)pphy * kvh * hd, vo = (size_t)pphy * kvh * vd;
+        cudaMemcpyAsync(A->Kh[layer] + ko, A->K[layer] + ko, kvh * hd * sizeof(float),
+                        cudaMemcpyDeviceToHost, ctx->stream);
+        cudaMemcpyAsync(A->Vh[layer] + vo, A->V[layer] + vo, kvh * vd * sizeof(float),
+                        cudaMemcpyDeviceToHost, ctx->stream);
+    }
+    return A->ctx;
 }

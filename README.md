@@ -4,10 +4,15 @@
 
 **peng** adapts the technology from [colibri](https://github.com/JustVugg/colibri) (pure C MoE inference engine with expert streaming from disk) to run **Xiaomi's MiMo-V2.5 (311B parameters, 15B active)** on consumer hardware.
 
-> 📦 **Ready-to-run model** (no conversion needed, 152 GB, all 16 shards uploaded and validated):
+> 📦 **Ready-to-run model** (no conversion needed, 152 GB):
 > **https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4**
+> Repaired 2026-07-20 (qkv per-rank scale-grid fix, `out-00001` re-uploaded; ppl 9.97/2.07,
+> guard PASS — see [findings.md](findings.md) §46). **If you downloaded before 2026-07-20,
+> re-download `out-00001.safetensors` only.**
 >
-> 📦 **Compressed variant** (same model bit-exact, 109 GB — 26% less download; see [§41 trade-off](#lossless-zstd-container-41--smaller-not-faster-here)):
+> ⚠️ **Compressed variant — TEMPORARILY WITHDRAWN** (109 GB zstd): it was packed from the
+> corrupt pre-fix build and still fails the quality gate. A repack from the repaired int4
+> is pending. Do not use it for quality work.
 > **https://huggingface.co/fivetech/MiMo-V2.5-colibri-peng-int4-zstd**
 
 The name comes from the mythological bird from the Chinese *Zhuangzi*: a colossal creature that stays in flight by riding a whirlwind — much like this engine keeps "airborne" a 311B parameter model on a continuous stream of NVMe reads, on a machine with 32 GB of RAM.
@@ -27,9 +32,10 @@ A MoE activates few parameters per token. In MiMo-V2.5: of 311B total only ~15B 
 
 Cost per cold token: 47 × 8 × 12.6 MB ≈ **4.7 GB of reads** → on the NVMe of the dev machine (2.75 GB/s measured on random 19 MB reads) the physical ceiling is **~0.6 tok/s**, improving with warm cache. It's not fast: it's a 311B model responding on a desktop machine.
 
-> **Best speed so far (this project, 2026-07-12):** **0.60 tok/s** on the full 311B int4 container  
-> (`TAO=1` + GPU-first pin + PROFILE-AUX throttles, `NGEN=24`, pin+GPU warm, WSL2 / RTX 3060 12 GB / ~23 GB RAM).  
-> Details: [`findings.md`](findings.md) §37, [`roadmap.md`](roadmap.md). Gate **1.0 tok/s** is still open.
+> **Best speed so far (this project, 2026-07-20):** **0.89 tok/s** on the full 311B int4 container  
+> (`TAO=1` + GPU-first pin + `CUDA_ATTN=1` + spin-sync default, `NGEN=24`, warm, WSL2 / RTX 3060 12 GB / ~23 GB RAM).  
+> Previous record 0.60 (2026-07-12); session median 0.72–0.77 under Windows-host drift, +21% mean over paired baseline (4/4 pairs).  
+> Details: [`findings.md`](findings.md) §46, [`roadmap.md`](roadmap.md). Gate **1.0 tok/s** is still open.
 
 ### QUALITY vs FAST — what the trim knobs really cost
 

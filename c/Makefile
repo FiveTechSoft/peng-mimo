@@ -37,7 +37,7 @@ CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
-TEST_BINS = tests/test_json tests/test_st tests/test_tier
+TEST_BINS = tests/test_json tests/test_st tests/test_tier tests/test_gateup tests/test_topp_heap
 ifeq ($(CUDA),1)
 ifeq ($(UNAME_S),Darwin)
 $(error CUDA=1 is supported only on Linux)
@@ -53,7 +53,7 @@ glm: glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm $(LDFLAGS)
 
 mimo: mimo.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
-	$(CC) $(CFLAGS) mimo.c $(CUDA_OBJ) -o mimo $(LDFLAGS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) mimo.c $(CUDA_OBJ) -o mimo $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -72,13 +72,19 @@ portable:
 	$(MAKE) mimo ARCH=x86-64-v3
 
 tests/test_json: tests/test_json.c json.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st: tests/test_st.c st.h json.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_tier: tests/test_tier.c tier.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_gateup: tests/test_gateup.c mimo.c st.h tok.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_topp_heap: tests/test_topp_heap.c mimo.c st.h tok.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@ $(LDFLAGS)
 
 test-c: $(TEST_BINS)
 	@for test in $(TEST_BINS); do ./$$test || exit 1; done
