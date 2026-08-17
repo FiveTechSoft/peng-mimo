@@ -34,7 +34,10 @@ CUDA      ?= 0
 CUDA_HOME ?= /usr/local/cuda
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?= native
-NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
+# -U_GNU_SOURCE: glibc >= 2.41 declara las funciones math C23 (cospi/rsqrt/...)
+# con noexcept(true) cuando _GNU_SOURCE; crt/math_functions.h de CUDA 12.8 las
+# declara sin noexcept -> conflicto duro. Sin _GNU_SOURCE glibc no las declara.
+NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra -U_GNU_SOURCE
 PYTHON    ?= python3
 CUDA_OBJ  =
 TEST_BINS = tests/test_json tests/test_st tests/test_tier tests/test_gateup tests/test_topp_heap
@@ -63,6 +66,11 @@ cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test
 	./backend_cuda_test
+
+# kernel-level A/B del path MoE decode (sin modelo): fused_down_acc, pinned staging
+fused-bench: backend_cuda.cu backend_cuda.h tests/fused_down_bench.cu
+	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/fused_down_bench.cu -o fused_down_bench
 
 olmoe: olmoe.c st.h json.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe $(LDFLAGS)

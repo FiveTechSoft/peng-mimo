@@ -126,6 +126,34 @@ int coli_cuda_tensor_device(const ColiCudaTensor *tensor);
  * timed region to isolate copy overhead from compute. */
 double coli_cuda_copy_seconds(void);
 
+/* ---- event-based profiler (opt-in via env COLI_CUDA_PROF=1) ---------------
+ * Cumulative per-device counters, reset with coli_cuda_prof_reset(). GPU times
+ * are measured with CUDA events on the device stream (drained at the existing
+ * sync points — no extra syncs are introduced); ms_sync_wait is host wall time
+ * inside the stream syncs. Synchronous pin-time weight uploads are accounted
+ * in ms_h2d/h2d_bytes with host timing. When COLI_CUDA_PROF is unset/0 all
+ * hooks are inert (one branch per call). */
+typedef struct ColiCudaProf {
+    uint64_t n_launch;              /* kernel launches (copies excluded) */
+    uint64_t n_h2d, n_d2h;          /* copy operations */
+    uint64_t h2d_bytes, d2h_bytes;
+    double ms_gate_up;              /* fused gate+up+silu kernels */
+    double ms_gemv;                 /* down / projection GEMV kernels */
+    double ms_axpy;                 /* weighted-accumulate kernels */
+    double ms_attn;                 /* fused decode attention kernels */
+    double ms_kernel_other;         /* zero/silu_mul and misc kernels */
+    double ms_h2d, ms_d2h;          /* event-measured copy time */
+    double ms_sync_wait;            /* host wall time inside syncs */
+} ColiCudaProf;
+
+int  coli_cuda_prof_enabled(void);
+void coli_cuda_prof_reset(int device);
+/* Drains only completed segments (never blocks); snapshot of counters. */
+int  coli_cuda_prof_snapshot(int device, ColiCudaProf *out);
+/* Syncs the stream and drains everything pending: call once before the final
+ * report so the tail of the last layer is not lost. */
+void coli_cuda_prof_flush(int device);
+
 #ifdef __cplusplus
 }
 #endif

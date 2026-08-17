@@ -310,6 +310,74 @@ int main(int argc, char **argv) {
         std::free(cos_t); std::free(sin_t);
     }
 
+    /* ---- fused_down_acc (moe_acc) vs swiglu GEMV + CPU accumulate ----
+     * The fused kernel must be BIT-IDENTICAL to down-GEMV + axpy: same byte-
+     * strided loop, same shuffle order, same fp ops (y=sum*scale, w*y, +=).
+     * Reference: coli_cuda_swiglu (same gate/up kernel, unfused down GEMV)
+     * per expert, accumulated on the host in fp32 in the same order. */
+    {
+        unsigned lc3 = 777;
+        auto fr3 = [&]() {
+            lc3 = lc3 * 1664525u + 1013904223u;
+            return ((lc3 >> 8) & 0xFFFFFF) / (float)0x1000000;
+        };
+        for (int fmt = 1; fmt <= 2; fmt++) {
+            for (int pass = 0; pass < 2; pass++) {      /* pass 0: small, 1: real dims */
+                const int D = pass ? 4096 : 512;
+                const int I = pass ? 2048 : 256;
+                if (pass && fmt == 1) continue;         /* real dims: i4 only (production) */
+                const int S = 1;
+                size_t rb_g = fmt == 2 ? (size_t)(D + 1) / 2 : (size_t)D;  /* gate/up row (cols=D) */
+                size_t rb_d = fmt == 2 ? (size_t)(I + 1) / 2 : (size_t)I;  /* down row (cols=I)    */
+                float *x = (float *)std::malloc((size_t)S * D * sizeof(float));
+                for (int i = 0; i < S * D; i++) x[i] = fr3() - 0.25f;
+                float *ref = (float *)std::calloc((size_t)S * D, sizeof(float));
+                float *yg = (float *)std::malloc((size_t)S * D * sizeof(float));
+                ColiCudaTensor *mg[2][3] = {};           /* [expert][gate,up,down] */
+                const float wexp[2] = {0.375f, -0.5f};
+                for (int e = 0; e < 2; e++) {
+                    uint8_t *gw = (uint8_t *)std::malloc(rb_g * (size_t)I);
+                    uint8_t *uw = (uint8_t *)std::malloc(rb_g * (size_t)I);
+                    uint8_t *dw = (uint8_t *)std::malloc(rb_d * (size_t)D);
+                    for (size_t i = 0; i < rb_g * (size_t)I; i++) gw[i] = (uint8_t)(fr3() * 255);
+                    for (size_t i = 0; i < rb_g * (size_t)I; i++) uw[i] = (uint8_t)(fr3() * 255);
+                    for (size_t i = 0; i < rb_d * (size_t)D; i++) dw[i] = (uint8_t)(fr3() * 255);
+                    float *gs = (float *)std::malloc((size_t)I * sizeof(float));
+                    float *us = (float *)std::malloc((size_t)I * sizeof(float));
+                    float *ds = (float *)std::malloc((size_t)D * sizeof(float));
+                    for (int i = 0; i < I; i++) { gs[i] = 0.01f + fr3() * 0.1f; us[i] = 0.01f + fr3() * 0.1f; }
+                    for (int i = 0; i < D; i++) ds[i] = 0.01f + fr3() * 0.1f;
+                    /* reference: same kernels, unfused down GEMV, host accumulate */
+                    if (!coli_cuda_swiglu(&mg[e][0], &mg[e][1], &mg[e][2], yg, x,
+                                         gw, gs, fmt, uw, us, fmt, dw, ds, fmt,
+                                         S, D, I, d0, 0)) return 1;
+                    for (int i = 0; i < S * D; i++) ref[i] += wexp[e] * yg[i];
+                    std::free(gs); std::free(us); std::free(ds);
+                    std::free(gw); std::free(uw); std::free(dw);
+                }
+                /* fused path: moe_begin -> 2x moe_acc -> moe_end */
+                float *gotm = (float *)std::malloc((size_t)S * D * sizeof(float));
+                if (!coli_cuda_moe_begin(d0, x, S, D)) return 1;
+                for (int e = 0; e < 2; e++)
+                    if (!coli_cuda_moe_acc(&mg[e][0], &mg[e][1], &mg[e][2],
+                                          nullptr, nullptr, fmt, nullptr, nullptr, fmt,
+                                          nullptr, nullptr, fmt, wexp[e], S, D, I, d0)) return 1;
+                if (!coli_cuda_moe_end(gotm, S, D, d0)) return 1;
+                int bad = 0;
+                for (int i = 0; i < S * D; i++)
+                    if (gotm[i] != ref[i]) {           /* exact: same fp op order */
+                        std::fprintf(stderr, "fused_down_acc mismatch fmt %d pass %d i %d: got %.9g want %.9g\n",
+                                     fmt, pass, i, gotm[i], ref[i]);
+                        bad = 1; break;
+                    }
+                if (bad) return 1;
+                for (int e = 0; e < 2; e++)
+                    for (int t = 0; t < 3; t++) coli_cuda_tensor_free(mg[e][t]);
+                std::free(x); std::free(ref); std::free(yg); std::free(gotm);
+            }
+        }
+    }
+
     coli_cuda_tensor_free(t8);
     coli_cuda_tensor_free(t4);
     coli_cuda_tensor_free(t2);

@@ -153,7 +153,56 @@ Even at **0.60 tok/s**:
   fixed container
 - [ ] Confirm all full/SWA attn on CUDA densas (no silent CPU)
 - [ ] Tensor-core / better tiled int4 GEMV if matmul rises again
-- [ ] Restore honest `cuda-copy` under async streams
+- [x] **Restore honest `cuda-copy` under async streams** (§47): `COLI_CUDA_PROF=1`
+  event-based H2D/D2H bytes+ms, no extra syncs
+
+## CUDA MoE v2 (issue: expert residency, async I/O, fused kernels)
+
+Goal: >1 tok/s without touching weights/quality, evolving toward a hybrid
+CPU/NVMe/GPU runtime (GPU owns hidden state; async expert I/O; fused kernels).
+Cycle-based; each cycle gated by the profiler data of the previous one.
+
+### Cycle 1 — DONE (§47, 2026-08-16): profiler + low-risk kernels
+
+- [x] **Build fix WSL2 (Ubuntu 26.04, glibc 2.43):** `NVCCFLAGS += -U_GNU_SOURCE`
+  (C23 math `noexcept` vs CUDA 12.8 headers). Blocks any CUDA work on this box
+- [x] **Event profiler `COLI_CUDA_PROF=1`:** per-site GPU ms (gate_up/gemv/axpy/
+  attn), H2D/D2H ops+bytes+ms, sync-wait; drained at existing syncs only
+- [x] **`PROF_TRACE=<csv>`** per (forward,layer): tier hits, real `nvme_bytes`,
+  kernels, wall; **`PROF_EXPERTS=<csv>`** per-expert freq/tier/disk/ms dump
+- [x] **`fused_down_acc_i4/i8`** (down GEMV + weighted acc in one kernel):
+  bit-identical (exact-equality test in `test_backend_cuda.cu`); 25→17
+  kernels/layer decode; kill-switch `COLI_CUDA_NO_FUSED_DOWN=1`
+- [x] **Pinned staging** for MoE activation copies (<1 MB; default ON,
+  `COLI_CUDA_PINNED=0` A/B): H2D 16 KB 82→25 µs
+- [x] **Kernel-level bench** (`make fused-bench`, `tests/fused_down_bench.cu`):
+  300 reps × 8 experts real shapes: 452→388 ms (**−14% MoE layer path**,
+  66.8→77.8 GB/s VRAM)
+- [x] **B4 scales warp-shuffle / B5 `xg` indexed input: measured, closed as
+  non-actionable** in decode S=1 (GEMV is weight-traffic-bound; `xg` is one
+  16 KB memcpy vs ~2–4 ms CPU GEMV)
+- [ ] **REPLAY e2e baseline + benchmark matrix: BLOCKED** — model snapshot
+  (~152 GB) not on this box since the OS reinstall; needs mount/download
+
+### Cycle 2 — next (needs the model mounted)
+
+- [ ] REPLAY baseline with profiler: per-layer CSV audit, find the real pole
+  split (disk vs CPU-expert-matmul vs GPU vs sync)
+- [ ] C: async expert H2D — upload stream + compute stream + CUDA events +
+  residency state machine (UNLOADED→UPLOADING→READY→IN_USE); re-test the
+  multi-stream non-goal with pinned buffers (§27 test predates them)
+- [ ] D: GPU hidden-state residency — rmsnorm/residual/router on device,
+  kill the per-layer D2H/H2D round-trips (~2 syncs + 4 PCIe hops × 48 layers)
+- [ ] E: grouped/batched expert GEMV benchmark (grouped GEMV vs grouped GEMM vs
+  Tensor Core INT4 at S=1); keep the fastest per workload
+
+### Later cycles
+
+- [ ] F: physical path-pack of shards from coactivation data + predictive
+  prefetch P(E_next|E_prev,layer); cold/warm cache bench
+- [ ] G: CUDA Graphs over the layer stack; UNION179 ~104 GB full-RAM mode
+  (disk-bound vs RAM-bound vs GPU-cache-heavy split); MTP on/off once I/O-bound
+  is gone
 
 ### C. AUX / habit I/O (done enough for now)
 

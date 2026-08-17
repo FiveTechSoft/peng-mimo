@@ -179,6 +179,13 @@ typedef struct {
     double t_edisk, t_emm, t_attn, t_head;       /* profiling: dove va il tempo (sempre attivo) */
     double t_router, t_cuda_copy;                 /* fine-grained profile: router + PCIe copy (CUDA) */
     double t_traj_warm, t_pathpack, t_persist;   /* was hidden in PROFILE "other" */
+    /* PROF_TRACE / PROF_EXPERTS (opt-in, coste ~0 cuando off) */
+    uint64_t hit_tier[4];                        /* 0=gpu_pin 1=ram_pin 2=lru 3=disk */
+    int64_t io_bytes;                            /* bytes de pesos de expert leídos de disco */
+    int tr_uniq;                                 /* experts únicos del último moe() */
+    double *xp_ms_cpu, *xp_ms_gpuq;              /* [n_layers*n_experts] */
+    uint64_t *xp_disk;                           /* [n_layers*n_experts] bytes disco */
+    uint32_t *xp_freq, *xp_tier;                 /* xp_tier: 4 planos de [n_layers*n_experts] */
     int64_t resident_bytes;
     /* tabella RoPE precalcolata: gli angoli dipendono SOLO da (pos, j, tipo-layer),
      * non dalla testa. La ricomputazione con powf() costava ~100k chiamate/token; qui
@@ -200,6 +207,11 @@ static int pathpack_load(void);
 static int pathpack_save(void);
 static void usage_save(Model *m);        /* cache che impara: definita accanto a stats_dump */
 static double now_s(void);               /* monotonic seconds; defined below CUDA helpers */
+/* PROF_TRACE=<csv>: una fila por (forward,layer). PROF_EXPERTS=<csv>: dump
+ * per-expert al final. Ambos opt-in; ver layers_forward/profile_print. */
+static FILE *g_prof_trace;
+static const char *g_prof_experts;
+static void xp_alloc(Model *m);          /* definida junto a profile_print */
 /* DRAFT must be visible before cuda_upload_dense_all (MTP densas only when >0). */
 static int g_draft=0;    /* Method E: DRAFT=n speculative tokens per forward (0=off). With the
                           * native MTP head in the container, draft comes from that head
@@ -1389,6 +1401,8 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
             qtz[k]->fmt=fmt; qtz[k]->O=OOz[k]; qtz[k]->I=IIz[k]; qtz[k]->qf=NULL;
             qtz[k]->q8=(int8_t*)(s->slab+pos[k]); qtz[k]->q4=s->slab+pos[k]; qtz[k]->s=fpz[k];
         }
+        __sync_fetch_and_add(&m->io_bytes, zo);          /* bytes comprimidos leídos */
+        if(m->xp_disk) __sync_fetch_and_add(&m->xp_disk[(size_t)layer*c->n_experts+eid], (uint64_t)zo);
         s->eid=eid; return;
     }
     int contig = tw[ord[0]]->fd==tw[ord[1]]->fd && tw[ord[1]]->fd==tw[ord[2]]->fd
@@ -1433,6 +1447,8 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
     }
+    __sync_fetch_and_add(&m->io_bytes, wtot);
+    if(m->xp_disk) __sync_fetch_and_add(&m->xp_disk[(size_t)layer*c->n_experts+eid], (uint64_t)wtot);
     s->eid=eid;
 }
 
@@ -1947,6 +1963,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     { unsigned char seen[E]; memset(seen,0,(size_t)E);
       for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++){ int e=idxs[(int64_t)s*K+kk];
           if(!seen[e]){ seen[e]=1; uniq[nu++]=e; } } }
+    m->tr_uniq=nu;
+    xp_alloc(m);
+    size_t xpbase=(size_t)layer*E; size_t xpn=(size_t)c->n_layers*E;
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
     int *rows=malloc(S*sizeof(int)); float *rw=malloc(S*sizeof(float));
@@ -1972,18 +1991,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64], jq[64]; int nmiss=0;
-        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; jq[j]=-1;
+        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; jq[j]=-1; int tier=3;
 #ifdef COLI_CUDA
             if(g_cuda_enabled){                         /* VRAM-only tier: highest priority */
                 ESlot *G=m->gpu_pin[layer];
-                for(int z=0;z<m->ngpin[layer];z++) if(G[z].eid==eid){ m->hits++; use[j]=&G[z]; break; }
+                for(int z=0;z<m->ngpin[layer];z++) if(G[z].eid==eid){ m->hits++; m->hit_tier[0]++; tier=0; use[j]=&G[z]; break; }
             }
 #endif
             { ESlot *P=m->pin[layer];
-            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; } }
+            for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; m->hit_tier[1]++; tier=1; use[j]=&P[z]; break; } }
             if(!use[j]){ ESlot *Sl=m->ecache[layer]; int nn=m->ecn[layer];
-                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=++m->eclock; use[j]=&Sl[z]; break; } }
-            if(!use[j]){ jq[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
+                for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; m->hit_tier[2]++; tier=2; Sl[z].used=++m->eclock; use[j]=&Sl[z]; break; } }
+            if(!use[j]){ jq[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; m->hit_tier[3]++; tier=3; }
+            if(m->xp_freq){ size_t xi=xpbase+(size_t)eid;
+                m->xp_freq[xi]++; m->xp_tier[(size_t)tier*xpn+xi]++; }
         }
         unsigned ovb=0;
         if(nmiss){
@@ -2028,7 +2049,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                     ov_wait(ovb+(unsigned)jq[j]); m->t_edisk += now_s()-t0; jq[j]=-1; }
                 if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
                 double t0=now_s();
-                if(moe_acc_qt(e, w1[j], 1)){ m->t_emm += now_s()-t0; done[j]=1; }
+                if(moe_acc_qt(e, w1[j], 1)){ double dtm=(now_s()-t0)*1e3; m->t_emm += dtm/1e3;
+                    if(m->xp_ms_gpuq) m->xp_ms_gpuq[xpbase+(size_t)uniq[base+j]] += dtm;
+                    done[j]=1; }
             }
         }
 #endif
@@ -2071,7 +2094,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 if(contrib) memcpy(contrib+((int64_t)rows[r]*K+rk[r])*D, hr, D*sizeof(float));
                 else { float *os=out+(int64_t)rows[r]*D, wgt=rw[r];
                        for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; } }
-            m->t_emm += now_s()-t0;
+            { double dtm=(now_s()-t0)*1e3; m->t_emm += dtm/1e3;
+              if(m->xp_ms_cpu) m->xp_ms_cpu[xpbase+(size_t)uniq[base+j]] += dtm; }
         }
         if(g_overlap && nmiss){ double t0=now_s();   /* ritardatari (expert rimasti senza righe):
                                                       * gli slot ws[] vanno quiescenti PRIMA dello
@@ -2215,7 +2239,41 @@ static void layers_forward(Model *m, float *x, int S, int pos_base){
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
         if(S>=8 && (i%4==0 || i==c->n_layers-1))
             fprintf(stderr,"[prefill] layer %d/%d · %d token\n", i+1, c->n_layers, S);
+        double lw0=0, emm0=0, att0=0, rtr0=0;
+        uint64_t ht0[4]={0,0,0,0}; int64_t io0=0;
+#ifdef COLI_CUDA
+        ColiCudaProf cp0, cp1; int hasp0=0, hasp1=0;
+        if(g_prof_trace && g_cuda_enabled && coli_cuda_prof_enabled())
+            hasp0=coli_cuda_prof_snapshot(g_cuda_devices[0],&cp0);
+#endif
+        if(g_prof_trace){ lw0=now_s(); for(int t=0;t<4;t++) ht0[t]=m->hit_tier[t];
+            io0=m->io_bytes; emm0=m->t_emm; att0=m->t_attn; rtr0=m->t_router; m->tr_uniq=0; }
         layer_forward(m,&m->L[i],i,x,S,pos_base,nrm,tmp);
+        if(g_prof_trace){
+            double lw=(now_s()-lw0)*1e3;
+            double gk=0,gh=0,gd=0,gsw=0; uint64_t nk=0,h2b=0,d2b=0;
+#ifdef COLI_CUDA
+            if(hasp0) hasp1=coli_cuda_prof_snapshot(g_cuda_devices[0],&cp1);
+            if(hasp1){
+                nk=cp1.n_launch-cp0.n_launch;
+                h2b=cp1.h2d_bytes-cp0.h2d_bytes; d2b=cp1.d2h_bytes-cp0.d2h_bytes;
+                gk=(cp1.ms_gate_up-cp0.ms_gate_up)+(cp1.ms_gemv-cp0.ms_gemv)
+                  +(cp1.ms_axpy-cp0.ms_axpy)+(cp1.ms_attn-cp0.ms_attn)
+                  +(cp1.ms_kernel_other-cp0.ms_kernel_other);
+                gh=cp1.ms_h2d-cp0.ms_h2d; gd=cp1.ms_d2h-cp0.ms_d2h;
+                gsw=cp1.ms_sync_wait-cp0.ms_sync_wait;
+            }
+#endif
+            fprintf(g_prof_trace,
+                "%llu,%d,%d,%d,%llu,%llu,%llu,%llu,%lld,%llu,%llu,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                (unsigned long long)m->n_fw, i, S, m->tr_uniq,
+                (unsigned long long)(m->hit_tier[0]-ht0[0]), (unsigned long long)(m->hit_tier[1]-ht0[1]),
+                (unsigned long long)(m->hit_tier[2]-ht0[2]), (unsigned long long)(m->hit_tier[3]-ht0[3]),
+                (long long)(m->io_bytes-io0),
+                (unsigned long long)h2b, (unsigned long long)d2b, (unsigned long long)nk,
+                (m->t_emm-emm0)*1e3, (m->t_attn-att0)*1e3, (m->t_router-rtr0)*1e3,
+                gk, gh, gd, gsw, lw);
+        }
     }
     /* Snapshot routes for next-token Markov; warm predicted path for the next step. */
     if(g_traj>0){
@@ -2640,6 +2698,28 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out){
     spec_decode(m,out,np,n_new,-1,logit,emit_store,&es,NULL);
 }
 
+static void xp_alloc(Model *m){
+    if(!g_prof_experts || m->xp_freq) return;
+    size_t n=(size_t)m->c.n_layers*m->c.n_experts;
+    m->xp_ms_cpu=calloc(n,sizeof(double)); m->xp_ms_gpuq=calloc(n,sizeof(double));
+    m->xp_disk=calloc(n,sizeof(uint64_t));
+    m->xp_freq=calloc(n,sizeof(uint32_t)); m->xp_tier=calloc(4*n,sizeof(uint32_t));
+}
+
+static void prof_experts_dump(Model *m){
+    if(!g_prof_experts || !m->xp_freq) return;
+    FILE *f=fopen(g_prof_experts,"w"); if(!f){ perror("PROF_EXPERTS"); return; }
+    int E=m->c.n_experts, NL=m->c.n_layers; size_t n=(size_t)NL*E;
+    fprintf(f,"layer,expert,freq,hit_gpu,hit_pin,hit_lru,miss,disk_bytes,cpu_ms,gpu_queue_ms\n");
+    for(int l=0;l<NL;l++) for(int e=0;e<E;e++){ size_t ix=(size_t)l*E+e;
+        if(!m->xp_freq[ix] && !m->xp_disk[ix]) continue;
+        fprintf(f,"%d,%d,%u,%u,%u,%u,%u,%llu,%.3f,%.3f\n", l,e,m->xp_freq[ix],
+            m->xp_tier[ix],m->xp_tier[n+ix],m->xp_tier[2*n+ix],m->xp_tier[3*n+ix],
+            (unsigned long long)m->xp_disk[ix], m->xp_ms_cpu[ix], m->xp_ms_gpuq[ix]); }
+    fclose(f);
+    fprintf(stderr,"PROF_EXPERTS: %s escrito\n", g_prof_experts);
+}
+
 static void profile_print(Model *m, double elapsed){
     double io_aux=m->t_traj_warm+m->t_pathpack+m->t_persist;
     double accounted=m->t_edisk+m->t_emm+m->t_attn+m->t_head+io_aux;
@@ -2658,8 +2738,25 @@ static void profile_print(Model *m, double elapsed){
         double comp=m->t_emm-copy; if(comp<0) comp=0;
         printf("PROFILE-GPU: router %.3fs | cuda-copy(PCIe) %.3fs | cuda-compute %.3fs (matmul total %.3fs)\n",
             m->t_router, copy, comp, m->t_emm);
+        if(coli_cuda_prof_enabled()){
+            coli_cuda_prof_flush(g_cuda_devices[0]);
+            ColiCudaProf p;
+            if(coli_cuda_prof_snapshot(g_cuda_devices[0],&p)){
+                double gk=p.ms_gate_up+p.ms_gemv+p.ms_axpy+p.ms_attn+p.ms_kernel_other;
+                printf("PROFILE-CUDA: kernels %llu [gate_up %.0f | gemv %.0f | axpy %.0f | attn %.0f | other %.0f ms] | "
+                       "H2D %llu× %.3f GB %.0f ms (%.2f GB/s) | D2H %llu× %.3f GB %.0f ms | sync-wait %.0f ms | gpu-kernel %.0f ms\n",
+                    (unsigned long long)p.n_launch,
+                    p.ms_gate_up, p.ms_gemv, p.ms_axpy, p.ms_attn, p.ms_kernel_other,
+                    (unsigned long long)p.n_h2d, p.h2d_bytes/1e9, p.ms_h2d,
+                    p.ms_h2d>0 ? p.h2d_bytes/1e9/(p.ms_h2d/1e3) : 0.0,
+                    (unsigned long long)p.n_d2h, p.d2h_bytes/1e9, p.ms_d2h,
+                    p.ms_sync_wait, gk);
+            }
+        }
     }
 #endif
+    if(g_prof_experts) prof_experts_dump(m);
+    if(g_prof_trace){ fflush(g_prof_trace); }
 }
 
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then
@@ -3973,6 +4070,16 @@ int main(int argc, char **argv){
 #endif
     /* OMP threads should not busy-spin while main waits on disk */
     if(!getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY","passive",1);
+    /* PROF_TRACE=<csv>: traza por (forward,layer) — pares con COLI_CUDA_PROF=1 para
+     * columnas GPU reales (eventos). PROF_EXPERTS=<csv>: dump per-expert al salir. */
+    if(getenv("PROF_TRACE")){
+        g_prof_trace=fopen(getenv("PROF_TRACE"),"w");
+        if(g_prof_trace) fprintf(g_prof_trace,"fw,layer,S,n_uniq,hit_gpu,hit_pin,hit_lru,miss,"
+            "nvme_bytes,h2d_bytes,d2h_bytes,kernels,expert_ms,attn_ms,router_ms,"
+            "gpu_kernel_ms,h2d_ms,d2h_ms,sync_ms,wall_ms\n");
+        else perror("PROF_TRACE");
+    }
+    g_prof_experts=getenv("PROF_EXPERTS");
     /* TEMPLATE_DUMP=1: modalita' debug per tests/test_mimo_template.py. Legge da stdin
      * righe "U <msg>" (turno utente -> renderizzato col template chat) e "A <testo>"
      * (cio' che il modello AVREBBE generato -> resta in KV cosi' com'e', senza stop token),

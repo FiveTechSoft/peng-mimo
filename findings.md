@@ -1512,3 +1512,86 @@ needed no 316 GB re-conversion:
    when swapping containers). The **zstd variant on HF is still corrupt**
    (repacked from the same source) — needs its own repack from the repaired
    int4 + upload. Repaired shard uploaded to HF by user request (2026-07-20).
+### 47. CUDA MoE v2 ciclo 1 — profiler de eventos + fused_down_acc + pinned staging (2026-08-16)
+
+Primer ciclo del roadmap CUDA v2 (issue "Performance: CUDA MoE v2"). Alcance:
+Fase A (profiling) + Fase B (kernels de bajo riesgo). Sin cambios de pesos,
+router ni selección de experts — calidad intacta por construcción (mismo orden
+FP) y verificada bit a bit.
+
+**Build fix (bloqueante en esta caja):** la distro WSL2 actual (Ubuntu 26.04,
+glibc 2.43) declara las funciones math C23 (`cospi`, `rsqrt`, ...) con
+`noexcept(true)` cuando `_GNU_SOURCE` (g++ lo define implícitamente);
+`crt/math_functions.h` de CUDA 12.8 declara las mismas sin noexcept → 6 errores
+duros y `backend_cuda.cu` no compilaba. Fix en `c/Makefile`:
+`NVCCFLAGS += -U_GNU_SOURCE` (sin `_GNU_SOURCE`, glibc no declara los símbolos
+C23 → sin conflicto). Lección: nvcc procesa sus propios pre-includes ANTES que
+el `-include` del usuario, así que un shim por `-include` llega tarde.
+
+**A1 — profiler por eventos CUDA (`COLI_CUDA_PROF=1`).** `backend_cuda.cu`:
+ring de 8192 pares de `cudaEvent_t` por device; `prof_begin/prof_end` envuelven
+cada kernel y cada `cudaMemcpyAsync`; los segmentos se acumulan al drenar en los
+puntos de sync YA existentes (cero syncs nuevos). Off = un branch por llamada.
+Contadores: launches, H2D/D2H ops+bytes, ms por tipo (gate_up / gemv / axpy /
+attn / other / h2d / d2h), `ms_sync_wait` (host wall dentro de los syncs).
+Las subidas síncronas de pesos (pin-time) se contabilizan con tiempo host.
+API: `coli_cuda_prof_reset/snapshot/flush`, struct `ColiCudaProf`.
+**Cierra §24 (contabilidad PCIe honesta):** H2D/D2H ahora se miden con eventos
+y bytes reales, no con tiempo de API host.
+
+**A2/A3 — trazas (`PROF_TRACE=<csv>`, `PROF_EXPERTS=<csv>`).** Una fila por
+(forward, layer): experts únicos, hits por tier (gpu/pin/lru/disk), `nvme_bytes`
+reales (sumados en `expert_load`), H2D/D2H bytes, kernels, expert/attn/router ms,
+gpu_kernel/h2d/d2h/sync ms, wall ms. Dump per-expert al final: freq, hit por
+tier, disk_bytes, cpu_ms, gpu_queue_ms (cola async; el tiempo GPU por experto
+individual requeriría syncs — no se añaden). `profile_print` imprime
+`PROFILE-CUDA:` con el resumen. Verificado: build no-CUDA y `make test-c`
+intactos (5/5 bins OK).
+
+**B1 — `fused_down_acc_i4/i8`:** down-GEMV + weighted accumulate en un kernel:
+`yacc += w * (sum * scale)` con el MISMO bucle byte-strided y orden de shuffle
+que `quant_gemv_i4` + `axpy_kernel` → resultado **bit-idéntico** (test en
+`tests/test_backend_cuda.cu`: fused vs `coli_cuda_swiglu` + acumulación host,
+igualdad exacta en fmt 1/2, dims 512/256 y 4096/2048 reales). Kill-switch:
+`COLI_CUDA_NO_FUSED_DOWN=1`. Elimina por experto: write+read de `ctx->y` (16 KB)
+y 1 launch (25→17 kernels/capa en decode top-8).
+
+**B3 — pinned staging (`COLI_CUDA_PINNED=0` para A/B, default ON):** pool
+page-locked mínimo (<1 MB) para la x de `moe_begin` y el destino D2H de
+`moe_end`. Solo activaciones; los pesos siguen pageable (se suben una vez).
+
+**Benchmark kernel-level** (`tests/fused_down_bench.cu`, target `fused-bench`;
+300 reps × 8 experts, D4096/I2048 int4, pesos residentes, RTX 3060):
+
+| cfg | wall | ms/expert-call | GB/s VRAM |
+|---|---|---|---|
+| baseline (no fused, pageable) | 452 ms | 0.188 | 66.8 |
+| fused, pageable | 458 ms | 0.191 | 65.9 |
+| no fused, pinned | 427 ms | 0.178 | 70.8 |
+| **fused + pinned (default)** | **388 ms** | **0.162** | **77.8** |
+
+Desglose por eventos (baseline): gate_up 87 µs, down 35 µs, axpy 13 µs por
+expert-call; H2D 16 KB pageable ~82 µs vs pinned ~25 µs por capa. El path
+completo de capa MoE baja ~14% (fused+pinned). La ganancia por token en el
+régimen disk-bound actual será pequeña (GPU MoE ≈ 70 ms/token de ~1500 ms);
+importa para el régimen RAM/VRAM-resident (UNION179 / Fases C-D).
+
+**B4 — scales warp-shuffle: NO accionable, cerrado.** `quant_gemv_i4` ya lee la
+escala una vez por fila (lane 0 tras la reducción); el profiler confirma que el
+tiempo de gate_up/down es tráfico de pesos (~95 GB/s efectivos sobre 8.4/4.2 MB
+por experto), no cargas de escalas. `__shfl_sync` ahorraría 0-2 cargas/row.
+
+**B5 — copia `xg`: NO accionable en decode, cerrado.** En S=1 cada experto
+sirve 1 fila → 1 memcpy de 16 KB (~1-2 µs) vs ~2-4 ms de GEMV int4 CPU.
+Relevante solo para prefill/batch/speculative (Fase E).
+
+**Pendiente (bloqueado):** el snapshot del modelo (`~/mimo25_i4` /
+`/root/mimo25_i4`, ~152 GB) NO está en esta caja (buscado en C:, VHDX, ambas
+distros WSL) → el baseline REPLAY end-to-end y la benchmark matrix del issue
+quedan pendientes hasta tener el modelo montado. Todo lo anterior se validó con
+tests unitarios y microbench; tok/s end-to-end sin medir aún.
+
+Artifacts: `c/tests/fused_down_bench.cu` (+ target `fused-bench`), test
+bit-exact en `tests/test_backend_cuda.cu`, envs `COLI_CUDA_PROF`, `PROF_TRACE`,
+`PROF_EXPERTS`, `COLI_CUDA_NO_FUSED_DOWN`, `COLI_CUDA_PINNED`, fix
+`-U_GNU_SOURCE`.
