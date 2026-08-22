@@ -191,13 +191,22 @@ Cycle-based; each cycle gated by the profiler data of the previous one.
 - [x] **B4 scales warp-shuffle / B5 `xg` indexed input: measured, closed as
   non-actionable** in decode S=1 (GEMV is weight-traffic-bound; `xg` is one
   16 KB memcpy vs ~2–4 ms CPU GEMV)
-- [ ] **REPLAY e2e baseline + benchmark matrix: BLOCKED** — model snapshot
-  (~152 GB) not on this box since the OS reinstall; needs mount/download
+- [x] **REPLAY e2e baseline + benchmark matrix (§49, 2026-08-22):** model
+  mounted in WSL. Cold-regime pole split: CPU expert matmul 49%, disk 37%,
+  attn 5%, other 8%. CUDA+REPIN=32 does NOT pay e2e when cold (0.18 vs 0.20
+  CPU); SPEED=1 (TOPP=0.55) is the big lever (0.38, +90-110%). Trap found:
+  REPIN=0 outside SERVE/SPEED → empty GPU tier; kernel comparisons need
+  explicit REPIN/ENERGY.
 
 ### Cycle 2 — next (needs the model mounted)
 
-- [ ] REPLAY baseline with profiler: per-layer CSV audit, find the real pole
-  split (disk vs CPU-expert-matmul vs GPU vs sync)
+- [ ] **REORDERED per §49 pole split:** E first (grouped/batched expert GEMV
+  attacks the 49% CPU matmul), then real VRAM residency (fill the 12 GB, not
+  REPIN=32), then C/D (async H2D / hidden-state residency only touch the ~8%
+  sync overhead in cold regime).
+
+- [x] REPLAY baseline with profiler: per-layer CSV audit, find the real pole
+  split — done in §49 (CPU matmul 49% / disk 37% / attn 5% / other 8% cold)
 - [ ] C: async expert H2D — upload stream + compute stream + CUDA events +
   residency state machine (UNLOADED→UPLOADING→READY→IN_USE); re-test the
   multi-stream non-goal with pinned buffers (§27 test predates them)

@@ -1640,3 +1640,55 @@ Nota de tooling: `analyze_experts.py` con ≥32 expertos OOM en WSL 25 GB
 (matriz aplanada + SVD densa LAPACK tumban la VM); con ≤16 expertos la SVD es
 degenerada (rank ≥ n-1 ⇒ error 0 trivial). Para el análisis real usar
 `expert_svd.py`.
+
+### 49. CUDA MoE v2 ciclo 2 — REPLAY e2e baseline + benchmark matrix desbloqueado (2026-08-22)
+
+El snapshot está en WSL (`/root/mimo25_i4`, corrección del bloqueo de §47).
+Método: `REPLAY=1` (decode teacher-forced determinista) con `COLI_CUDA_PROF=1`
++ `PROF_TRACE=<csv>` por (forward, layer). Dos refs: `ref.json` (oráculo, 5+12
+tokens) y `ref_long.json` (prosa real tokenizada con `tools/tok_mimo_cli`,
+8+112 tokens). Mismo binario del 19-ago (post-§47). Caché fría en todos los
+runs (expert hit 32-41%), sin DRAFT/MTP.
+
+**Matrix corta (12 tokens):**
+
+| config | tok/s | disk | matmul | attn | other |
+|---|---|---|---|---|---|
+| COLI_CUDA=0 (CPU) | 0.28 | 12.5 | 21.3 | 2.7 | 5.0 |
+| REPIN=32 (fused+pinned) | 0.31 | 12.5 | 18.0 | 2.1 | 4.7 |
+| REPIN=32 NO_FUSED_DOWN | 0.18 | 20.1 | 28.8 | 3.6 | 12.9 |
+| REPIN=32 PINNED=0 | 0.30 | 10.7 | 20.5 | 2.7 | 4.8 |
+| SPEED=1 | 0.45 | 8.1 | 9.9 | 2.6 | 4.8 |
+
+**Trampa de la matrix 1 (sin REPIN):** fuera de SERVE/SPEED, `REPIN=0` → GPU
+expert tier VACÍO (gpu_kernel_ms=0 en los 624 rows del CSV); CUDA solo añade
+overhead (CPU 0.28 vs CUDA-sin-REPIN 0.20). Toda comparación de kernels CUDA
+exige REPIN/ENERGY explícito.
+
+**Confirmación larga (112 tokens):**
+
+| config | tok/s | disk | matmul | attn | other |
+|---|---|---|---|---|---|
+| REPIN=32 | 0.18 | 223.5 | 300.3 | 32.2 | 48.3 |
+| COLI_CUDA=0 | 0.20 | 200.1 | 285.6 | 32.4 | 36.5 |
+| SPEED=1 | **0.38** | 111.4 | 102.9 | 30.2 | 41.1 |
+
+**Veredictos:**
+
+1. **En régimen frío (34% hit), CUDA+REPIN=32 NO paga e2e** (0.18 vs 0.20
+   CPU): con solo 32 expertos residentes, la mayoría de expert-call cae al
+   camino CPU y el tier GPU añade syncs/H2D encima. La ganancia de
+   `fused_down_acc` visible en corto (0.31→0.18 al quitarlo) no sobrevive al
+   run largo frío. Pinned staging: ruido (ya esperado, §47).
+2. **El pole real del sistema frío:** matmul CPU de experts ≈ 49% del wall,
+   disco ≈ 37%, atención ≈ 5%, other ≈ 8%. Atacar syncs (ciclo C/D) toca el
+   8% como mucho; los polos son bytes+GEMV.
+3. **SPEED=1 (TOPP=0.55) es la palanca grande medida:** 0.38 vs 0.18-0.20
+   (+90-110%) por leer menos experts/token — confirma §40 (TOPK/TOPP) como
+   el knob dominante en régimen frío.
+
+Implicación para el ciclo 2 del roadmap: reordenar — E (grouped/batched GEMV,
+ataca el 49%) y residencia real de experts en VRAM (subir REPIN/ENERGY hasta
+llenar los 12 GB, no 32) antes que C/D (async H2D, hidden-state residency).
+Caveat: runs únicos por config; B2 sugiere varianza de scheduling de disco de
+±30% en las columnas disk/other.
