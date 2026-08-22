@@ -2113,7 +2113,21 @@ static void run_serve(Model *m, const char *snap){
         int cur=req_ngen; if(len+k+cur+g_draft+2>=maxctx) cur=maxctx-len-k-g_draft-2;
         uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
         float *logit;
-        if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
+        if(k>0){
+            /* FreeToken PoC (issue #7): conversazione da zero (len==0, dopo RESET o
+             * overflow) con prefisso gia' visto -> ripristina la KV dalla cache host
+             * invece di ri-prefillare. I turni con prefisso in comune (len>0) sono
+             * gia' coperti dalla KV persistente e non passano di qui. */
+            if(g_freetoken && !m->has_dsa && len==0 && try_restore_kv_from_cache(m,hist,k)){
+                logit=step(m,hist+k-1,1,k-1); len=k;
+                fprintf(stderr,"[FREETOKEN] HIT serve: prefill di %d token via cache\n",k);
+            } else {
+                int fresh=(len==0);
+                logit=step(m,hist+len,k,len); len+=k;
+                if(fresh && g_freetoken && !m->has_dsa && try_save_kv_to_cache(m,hist,k))
+                    fprintf(stderr,"[FREETOKEN] MISS serve: prefill pieno, salvati %d token\n",k);
+            }
+        }
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;

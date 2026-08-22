@@ -12,16 +12,23 @@ How to use (PoC)
    links `kv_cache.c`, and `glm.c` carries the PoC save/restore helpers
    (`try_save_kv_to_cache` / `try_restore_kv_from_cache`). `mimo` is unchanged.
 
-2. The prefill path in `run_text` is wired to the cache:
-   - `FREETOKEN=1` — on an exact token-prefix HIT, restore Lc/Rc and forward
-     only the last prompt token; on MISS, full prefill then save. Fallback is
-     always a full recompute. Exact token match only (no semantics): lossless
-     by construction. Disabled automatically when DSA is active (the indexer
-     cache `Ic` is not saved). The MTP row is excluded (its KV is born in
-     decode). `FREETOKEN_CACHE_GB` sets the RAM cap (default 8).
-   - `FREETOKEN_BENCH=1` — after a MISS, re-run the prefill from the cache on
-     fresh KV buffers and print hit/miss times, speedup, max |logit diff| and
-     argmax agreement.
+2. The prefill path is wired to the cache in both entry points:
+   - `run_text` (`FREETOKEN=1`) — on an exact token-prefix HIT, restore Lc/Rc
+     and forward only the last prompt token; on MISS, full prefill then save.
+     Fallback is always a full recompute. Exact token match only (no
+     semantics): lossless by construction. Disabled automatically when DSA is
+     active (the indexer cache `Ic` is not saved). The MTP row is excluded
+     (its KV is born in decode). `FREETOKEN_CACHE_GB` sets the RAM cap
+     (default 8).
+   - `run_serve` (`FREETOKEN=1`) — covers the fresh-conversation case
+     (`len==0`: first turn, after `\x02RESET`, or context-overflow reset).
+     Turns that share a prefix with the live history are already served by
+     the persistent KV and do not need the cache. Measured with the tiny
+     fixture (1618-token turn, RESET, identical turn): turn throughput
+     0.31 -> 30.69 tok/s (~100x on the repeated turn).
+   - `FREETOKEN_BENCH=1` — in `run_text`, after a MISS, re-run the prefill
+     from the cache on fresh KV buffers and print hit/miss times, speedup,
+     max |logit diff| and argmax agreement.
 
 3. To build an ANN index for prompts, precompute embeddings (numpy .npy)
    using your preferred encoder and run:
