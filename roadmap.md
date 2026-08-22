@@ -100,6 +100,16 @@ Even at **0.60 tok/s**:
 - [x] **Expert redundancy measured (§42.1): no near-duplicate experts** (mid/late
   layers orthogonal, cos < 0.07) — intra-layer merging is out. Early layers share
   a common component (delta-coding candidate, marginal).
+- [x] **Shared-basis/low-rank SVD measured (§48, issue #4): REJECTED with data.**
+  Expert deltas are near full-rank (k95 ≈ 225-241/256, layers 1/24/46),
+  functional SwiGLU error 96-100% at affordable ranks, 39-81% even at rank-128,
+  and rank ≥ 32 costs more bytes than int4. No compression knee. Clustering
+  equally flat. Only the early-layer centroid is real — zstd already gets it.
+  Tools: `scripts/expert_svd.py`, `c/tools/analyze_experts.py` (PR #5).
+- [x] **Markov predictability measured (§48.4, issue #6):** real `.coli_traj`
+  top-4 coverage ≈ 77-80%, ~5.5 effective successors — useful complement
+  (already exploited by TRAJ), not the simulated regime-change. Tool:
+  `scripts/traj_analysis.py`.
 - [x] **Usage long-tail measured (§42.2):** only 2.5% of experts unused (3.7 GB);
   Gini 0.615. Keep-192 covers 98.4% of historical calls.
 - [x] **EKEEP=n runtime prune landed** (mask by usage rank, zero disk, reversible)

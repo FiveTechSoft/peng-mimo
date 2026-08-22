@@ -1595,3 +1595,48 @@ Artifacts: `c/tests/fused_down_bench.cu` (+ target `fused-bench`), test
 bit-exact en `tests/test_backend_cuda.cu`, envs `COLI_CUDA_PROF`, `PROF_TRACE`,
 `PROF_EXPERTS`, `COLI_CUDA_NO_FUSED_DOWN`, `COLI_CUDA_PINNED`, fix
 `-U_GNU_SOURCE`.
+
+### 48. Issue #4 real: SVD/clustering de expertos DESCARTADO con datos; Markov TRAJ medido (2026-08-22)
+
+El modelo está ahora disponible en WSL (`/root/mimo25_i4`) — el bloqueo del §47
+("snapshot no está en esta caja") queda resuelto. Tools nuevos en PR #5:
+`c/tools/analyze_experts.py` (script propuesto en el issue) y
+`scripts/expert_svd.py` (SVD por proyección vía matriz de Gram 256×256, ~9 GB
+RAM, 256 expertos completos; clustering k-means numpy-only en espacio de
+coeficientes; error funcional SwiGLU con activaciones reales `resid_out/`;
+`--selftest`). `scripts/traj_analysis.py` mide la predictibilidad Markov real
+de `.coli_traj`.
+
+**48.1 Espectro efectivo de los deltas de expertos (capas 1/24/46, 256
+expertos, gate/up/down por separado):** k95 = 225-241 de 256 direcciones en las
+tres capas — el delta (tras quitar el centroide) es **casi de rango completo**.
+No existe el subespacio de dimensión 32-64 que hipotetizaba el issue #4.
+
+**48.2 Error funcional SwiGLU (activaciones reales, no solo ||ΔW||):**
+
+| rank | capa 1 | capa 24 | capa 46 |
+|---|---|---|---|
+| 8 | 0.96 | 1.00 | 1.00 |
+| 32 | 0.83 | 0.96 | 1.00 |
+| 64 | 0.82 | 0.95 | 0.98 |
+| 128 | 0.39 | 0.81 | 0.61 |
+
+**48.3 Contabilidad de bytes perdedora:** con coeficientes f32 + base
+amortizada, rank-32 ya cuesta 12.98 MB/experto (> 12.6 MB int4). La única
+config que ahorra (rank-8, 3.54 MB → 1.33 GB/token teórico) tiene 96-100% de
+error funcional. Clustering k=64 (8.4 MB/experto amort.): rel_frob 0.83-0.87
+sobre el delta — igual de plano. **La curva compresión/calidad no tiene
+rodilla: hipótesis "deltas de 2-3 MB" refutada.** Lo único real sigue siendo
+el centroide compartido de capas tempranas (§42.1), que zstd ya captura (§41).
+
+**48.4 Predictibilidad Markov real de `.coli_traj` (173k transiciones):**
+cobertura top-1 = 29%, top-2 ≈ 50%, top-4 ≈ 77-80% (cota superior por
+truncamiento TRAJ_SUC=8); sucesores efectivos ≈ 5.5; sticky self-transition
+solo 9.4%. Comparable al 71% de PILOT sin coste de cómputo — útil como
+complemento (ya lo usa TRAJ/traj_warm), no como ruptura. Refuta las
+simulaciones del issue #6 (transiciones intra-grupo 0.25 inventadas).
+
+Nota de tooling: `analyze_experts.py` con ≥32 expertos OOM en WSL 25 GB
+(matriz aplanada + SVD densa LAPACK tumban la VM); con ≤16 expertos la SVD es
+degenerada (rank ≥ n-1 ⇒ error 0 trivial). Para el análisis real usar
+`expert_svd.py`.
