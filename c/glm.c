@@ -2451,7 +2451,11 @@ int main(int argc, char **argv){
     g_ft_bench = getenv("FREETOKEN_BENCH")?atoi(getenv("FREETOKEN_BENCH")):0;
     if(g_ft_bench) g_freetoken=1;
     if(g_freetoken){ double gb=getenv("FREETOKEN_CACHE_GB")?atof(getenv("FREETOKEN_CACHE_GB")):8.0;
-        kv_cache_init((size_t)(gb*1073741824.0)); }
+        kv_cache_init((size_t)(gb*1073741824.0));
+        char kcd[2100]; snprintf(kcd,sizeof(kcd),"%s/.coli_kvcache",snap);
+        kv_cache_set_dir(kcd);                  /* tier caldo: sopravvive al processo */
+        double dgb=getenv("FREETOKEN_DISK_GB")?atof(getenv("FREETOKEN_DISK_GB")):32.0;
+        kv_cache_set_disk_max((size_t)(dgb*1073741824.0)); }
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* piu' stretto dell'ufficiale 0.95: la coda int4 e' rumore */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;

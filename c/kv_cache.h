@@ -30,8 +30,18 @@ int kv_cache_get(const char *model_hash, const char *prompt_id,
                  int *n_layer_out, int **rows_out, int **kvh_k_out, int **kvh_v_out,
                  float ***K_out, float ***V_out);
 
-/* Free all cache entries */
+/* Free all cache entries (RAM only; disk files survive) */
 void kv_cache_free_all(void);
+
+/* Optional disk backing (PoC: same-machine format, raw f32, no endianness
+ * handling). kv_cache_set_dir(dir): entries written by kv_cache_put are also
+ * stored as one file per (model_hash, prompt_id) under dir, and a kv_cache_get
+ * that misses in RAM tries to load the file back. Files survive the process:
+ * this is the warm tier across restarts. kv_cache_set_disk_max caps the total
+ * disk usage; when exceeded, the oldest files (by mtime) are deleted.
+ * RAM evictions never delete the disk copy. */
+void kv_cache_set_dir(const char *dir);
+void kv_cache_set_disk_max(size_t max_bytes);
 
 /* Introspect */
 size_t kv_cache_cur_bytes(void);

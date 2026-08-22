@@ -49,14 +49,26 @@ Measured (2026-08-22, WSL CPU, tiny random-weight GLM-MoE fixture:
   (max |logit diff| ~0.45 over 152576 entries comes from the S=2001 vs S=1
   kernel batch shapes, not from the cache: restore is a byte-exact memcpy of
   what the full prefill itself wrote).
+- Cross-process persistence: process 1 (cold) MISS prefill 12.36 s and writes
+  a 10 MB `.kvc` file; process 2 (fresh process, same prompt) HITs from disk
+  and prefills in 0.058 s (~213x, disk read included).
 - Note: the tiny fixture has no disk-streaming cost per expert; on the real
   379 GB model the absolute times differ but the mechanism (skip np-1 tokens
   of prefill) is the same. The paper's semantic ANN + CUDA streaming numbers
   are NOT reproduced here — this PoC measures exact-prefix reuse only.
 
+Disk persistence (warm tier)
+- With `FREETOKEN=1`, every saved entry is also written to
+  `<SNAP>/.coli_kvcache/<modelhash16>_<prompthash16>.kvc` (raw f32,
+  same-machine format: no endianness/portability handling, PoC).
+- A get that misses in RAM falls back to the disk file, so a fresh process
+  can HIT on a prompt cached by an earlier run. RAM evictions never delete
+  the disk copy; corrupt files are deleted on read.
+- `FREETOKEN_DISK_GB` caps the directory size (default 32); oldest files by
+  mtime are deleted when the cap is exceeded.
+
 Next steps (planned)
 - Semantic lookup (ANN over embeddings) on top of the exact-hash cache.
-- On-disk serialization for warm reboots (model-hash + prompt hash metadata).
 - Robust LRU and memory caps, plus tests and benchmarks.
 - DSA support (save/restore the indexer cache `Ic` too).
 
