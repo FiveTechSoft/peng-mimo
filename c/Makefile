@@ -52,8 +52,8 @@ endif
 
 all: mimo
 
-glm: glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
-	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm $(LDFLAGS)
+glm: glm.c kv_cache.c kv_cache.h st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
+	$(CC) $(CFLAGS) glm.c kv_cache.c $(CUDA_OBJ) -o glm $(LDFLAGS)
 
 mimo: mimo.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) $(CPPFLAGS) mimo.c $(CUDA_OBJ) -o mimo $(LDFLAGS)

@@ -11,9 +11,10 @@
 
 typedef struct KVLayer {
     int rows;
-    int kvh;
-    float *K; /* rows * kvh */
-    float *V; /* rows * kvh */
+    int kvh_k;
+    int kvh_v;
+    float *K; /* rows * kvh_k */
+    float *V; /* rows * kvh_v */
 } KVLayer;
 
 typedef struct KVEntry {
@@ -51,7 +52,7 @@ static void free_entry(KVEntry *e) {
 }
 
 int kv_cache_put(const char *model_hash, const char *prompt_id,
-                 int n_layer, const int *rows, const int *kvh,
+                 int n_layer, const int *rows, const int *kvh_k, const int *kvh_v,
                  const float **K_src, const float **V_src) {
     if (!model_hash || !prompt_id) return 0;
 
@@ -63,15 +64,18 @@ int kv_cache_put(const char *model_hash, const char *prompt_id,
     size_t bytes = 0;
     for (int i = 0; i < n_layer; ++i) {
         int r = rows[i];
-        int h = kvh[i];
+        int hk = kvh_k[i];
+        int hv = kvh_v[i];
         e->layers[i].rows = r;
-        e->layers[i].kvh = h;
-        size_t nelem = (size_t)r * (size_t)h;
-        e->layers[i].K = (float*)malloc(sizeof(float) * nelem);
-        e->layers[i].V = (float*)malloc(sizeof(float) * nelem);
-        if (K_src && K_src[i]) memcpy(e->layers[i].K, K_src[i], sizeof(float) * nelem);
-        if (V_src && V_src[i]) memcpy(e->layers[i].V, V_src[i], sizeof(float) * nelem);
-        bytes += sizeof(float) * nelem * 2;
+        e->layers[i].kvh_k = hk;
+        e->layers[i].kvh_v = hv;
+        size_t nk = (size_t)r * (size_t)hk;
+        size_t nv = (size_t)r * (size_t)hv;
+        e->layers[i].K = (float*)malloc(sizeof(float) * nk);
+        e->layers[i].V = (float*)malloc(sizeof(float) * nv);
+        if (K_src && K_src[i]) memcpy(e->layers[i].K, K_src[i], sizeof(float) * nk);
+        if (V_src && V_src[i]) memcpy(e->layers[i].V, V_src[i], sizeof(float) * nv);
+        bytes += sizeof(float) * (nk + nv);
     }
     e->bytes = bytes;
 
@@ -95,7 +99,7 @@ int kv_cache_put(const char *model_hash, const char *prompt_id,
 }
 
 int kv_cache_get(const char *model_hash, const char *prompt_id,
-                 int *n_layer_out, int **rows_out, int **kvh_out,
+                 int *n_layer_out, int **rows_out, int **kvh_k_out, int **kvh_v_out,
                  float ***K_out, float ***V_out) {
     KVEntry *prev = NULL;
     KVEntry *cur = g_head;
@@ -113,10 +117,15 @@ int kv_cache_get(const char *model_hash, const char *prompt_id,
                 for (int i = 0; i < cur->n_layer; ++i) rows[i] = cur->layers[i].rows;
                 *rows_out = rows;
             }
-            if (kvh_out) {
+            if (kvh_k_out) {
                 int *kvh = (int*)malloc(sizeof(int) * cur->n_layer);
-                for (int i = 0; i < cur->n_layer; ++i) kvh[i] = cur->layers[i].kvh;
-                *kvh_out = kvh;
+                for (int i = 0; i < cur->n_layer; ++i) kvh[i] = cur->layers[i].kvh_k;
+                *kvh_k_out = kvh;
+            }
+            if (kvh_v_out) {
+                int *kvh = (int*)malloc(sizeof(int) * cur->n_layer);
+                for (int i = 0; i < cur->n_layer; ++i) kvh[i] = cur->layers[i].kvh_v;
+                *kvh_v_out = kvh;
             }
             if (K_out) {
                 float **Ks = (float**)malloc(sizeof(float*) * cur->n_layer);

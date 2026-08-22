@@ -8,9 +8,9 @@ Files added in the PoC branch:
 - tools/kv_index_build.py     -- build/query HNSW index for prompt embeddings
 
 How to use (PoC)
-1. Build the project as usual. The kv_cache files are standalone and do not
-   change existing build targets. You can link them into the runtime or use
-   the demo code in c/ to integrate later.
+1. Build the `glm` engine as usual (`make -C c glm`): it now compiles and
+   links `kv_cache.c`, and `glm.c` carries the PoC save/restore helpers
+   (`try_save_kv_to_cache` / `try_restore_kv_from_cache`). `mimo` is unchanged.
 
 2. To build an ANN index for prompts, precompute embeddings (numpy .npy)
    using your preferred encoder and run:
