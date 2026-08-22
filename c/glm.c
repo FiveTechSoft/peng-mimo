@@ -565,6 +565,13 @@ static int64_t la_hit[3], la_tot[3];
 static int la_pred[2][130][16]; static signed char la_val[2][130];
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
+static int g_freetoken=0;/* FREETOKEN=1 (issue #7, PoC): cache KV in RAM per prefisso di prompt.
+                          * Al prefill: hash esatto dei token -> se HIT ripristina Lc/Rc e si
+                          * fa il forward solo dell'ultimo token; se MISS prefill pieno + save.
+                          * Solo prefissi IDENTICI token-per-token (niente semantica): lossless.
+                          * Disattivato con DSA (la cache dell'indexer Ic non e' salvata). */
+static int g_ft_bench=0; /* FREETOKEN_BENCH=1: dopo il MISS ripete il prefill via cache e
+                          * confronta i logit (correttezza) + stampa i due tempi (hit vs miss). */
 /* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
@@ -1392,7 +1399,9 @@ static void kv_alloc(Model *m, int max_t){
  * try_save_kv_to_cache: salva il prefisso ids[0..n-1] (Lc/Rc per layer) in cache.
  * try_restore_kv_from_cache: ripristina Lc/Rc se esiste una entry per lo stesso
  *   modello (env SNAP) + prompt. Conservativo: richiede kv_alloc gia' fatto con
- *   max_t >= n; il chiamante decide se saltare il prefill (fallback = recompute). */
+ *   max_t >= n, rifiuta con DSA attivo (Ic non salvata) o se la entry non copre
+ *   esattamente n righe; il chiamante decide se saltare il prefill (fallback =
+ *   recompute). La riga MTP (n_layers) resta fuori: la sua KV nasce in decode. */
 static void prompt_hash(const int *ids, int n, char *out, size_t outlen){
     uint64_t h=14695981039346656037ULL;
     for(int i=0;i<n;i++){ uint32_t v=(uint32_t)ids[i];
@@ -1401,41 +1410,40 @@ static void prompt_hash(const int *ids, int n, char *out, size_t outlen){
 }
 
 static int try_save_kv_to_cache(Model *m, const int *ids, int n){
-    if(!ids||n<=0||!m->Lc||!m->Rc) return 0;
+    if(!ids||n<=0||!m->Lc||!m->Rc||m->has_dsa) return 0;
     char prompt_id[32]; prompt_hash(ids,n,prompt_id,sizeof(prompt_id));
     const char *snap=getenv("SNAP"); const char *model_id=snap?snap:"unknown";
-    Cfg *c=&m->c; int NR=c->n_layers+1;
+    Cfg *c=&m->c; int NL=c->n_layers;
     int upto=n; if(upto>m->max_t) upto=m->max_t;
-    int *rows=malloc(NR*sizeof(int)), *wk=malloc(NR*sizeof(int)), *wv=malloc(NR*sizeof(int));
-    const float **Ks=malloc(NR*sizeof(float*)), **Vs=malloc(NR*sizeof(float*));
+    int *rows=malloc(NL*sizeof(int)), *wk=malloc(NL*sizeof(int)), *wv=malloc(NL*sizeof(int));
+    const float **Ks=malloc(NL*sizeof(float*)), **Vs=malloc(NL*sizeof(float*));
     if(!rows||!wk||!wv||!Ks||!Vs){ free(rows); free(wk); free(wv); free(Ks); free(Vs); return 0; }
-    for(int i=0;i<NR;i++){ rows[i]=upto; wk[i]=c->kv_lora; wv[i]=c->qk_rope;
+    for(int i=0;i<NL;i++){ rows[i]=upto; wk[i]=c->kv_lora; wv[i]=c->qk_rope;
         Ks[i]=m->Lc[i]; Vs[i]=m->Rc[i]; }
-    int ok=kv_cache_put(model_id,prompt_id,NR,rows,wk,wv,Ks,Vs);
+    int ok=kv_cache_put(model_id,prompt_id,NL,rows,wk,wv,Ks,Vs);
     free(rows); free(wk); free(wv); free(Ks); free(Vs);
     return ok;
 }
 
 static int try_restore_kv_from_cache(Model *m, const int *ids, int n){
-    if(!ids||n<=0||!m->Lc||!m->Rc) return 0;
+    if(!ids||n<=0||!m->Lc||!m->Rc||m->has_dsa) return 0;
     char prompt_id[32]; prompt_hash(ids,n,prompt_id,sizeof(prompt_id));
     const char *snap=getenv("SNAP"); const char *model_id=snap?snap:"unknown";
     int n_layer=0, *rows=NULL, *wk=NULL, *wv=NULL; float **Ks=NULL, **Vs=NULL;
     if(!kv_cache_get(model_id,prompt_id,&n_layer,&rows,&wk,&wv,&Ks,&Vs)){
         free(rows); free(wk); free(wv); free(Ks); free(Vs); return 0; }
-    Cfg *c=&m->c; int NR=c->n_layers+1;
+    Cfg *c=&m->c; int NL=c->n_layers;
     int upto=n; if(upto>m->max_t) upto=m->max_t;
-    for(int i=0;i<NR&&i<n_layer;i++){
-        int rowcnt=rows[i]; if(rowcnt>upto) rowcnt=upto;
-        /* copia solo se le larghezze coincidono col modello corrente */
-        if(rowcnt>0&&m->Lc[i]&&m->Rc[i]&&wk[i]==c->kv_lora&&wv[i]==c->qk_rope){
-            memcpy(m->Lc[i],Ks[i],(size_t)rowcnt*c->kv_lora*sizeof(float));
-            memcpy(m->Rc[i],Vs[i],(size_t)rowcnt*c->qk_rope*sizeof(float));
-        }
+    int ok = n_layer>=NL;
+    for(int i=0;ok&&i<NL;i++)
+        ok = rows[i]>=upto && wk[i]==c->kv_lora && wv[i]==c->qk_rope;  /* copertura esatta */
+    if(ok) for(int i=0;i<NL;i++){
+        memcpy(m->Lc[i],Ks[i],(size_t)upto*c->kv_lora*sizeof(float));
+        memcpy(m->Rc[i],Vs[i],(size_t)upto*c->qk_rope*sizeof(float));
+        m->kv_start[i]=0;                            /* KV valida da pos 0 */
     }
-    for(int i=0;i<NR;i++) m->kv_start[i]=0;      /* KV valida da pos 0 (PoC) */
     free(rows); free(wk); free(wv); free(Ks); free(Vs);
-    return 1;
+    return ok;
 }
 
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
@@ -1795,7 +1803,37 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     kv_alloc(m, np+ngen+g_draft+2);
     int *all=malloc((np+ngen+g_draft+2)*sizeof(int)); memcpy(all,pids,np*sizeof(int));
     double t=now_s();
-    float *logit=step(m,pids,np,0);
+    float *logit=NULL;
+    if(g_freetoken && !m->has_dsa){
+        /* FreeToken PoC (issue #7): prefill via cache KV su prefisso esatto.
+         * HIT -> ripristina Lc/Rc e forward solo dell'ultimo token (stessi logit).
+         * MISS -> prefill pieno + save. Fallback sempre al recompute. */
+        double tp=now_s();
+        if(try_restore_kv_from_cache(m,pids,np)){
+            logit=step(m,pids+np-1,1,np-1);
+            fprintf(stderr,"[FREETOKEN] HIT: prefill di %d token via cache in %.3fs\n",np,now_s()-tp);
+        } else {
+            logit=step(m,pids,np,0);
+            double tm=now_s()-tp;
+            int saved=try_save_kv_to_cache(m,pids,np);
+            fprintf(stderr,"[FREETOKEN] MISS: prefill pieno %.3fs (save=%d)\n",tm,saved);
+            if(g_ft_bench && saved){              /* self-check: ripeti via cache e confronta */
+                float *ref=malloc(c->vocab*sizeof(float)); memcpy(ref,logit,c->vocab*sizeof(float));
+                kv_alloc(m,np+ngen+g_draft+2);    /* buffer freschi: la prova che conta e' la cache */
+                double th=now_s();
+                int hit=try_restore_kv_from_cache(m,pids,np);
+                free(logit); logit=step(m,pids+np-1,1,np-1);
+                double dmax=0; int am_ref=0, am_hit=0;
+                for(int i=0;i<c->vocab;i++){ double d=fabs(logit[i]-ref[i]); if(d>dmax)dmax=d;
+                    if(ref[i]>ref[am_ref])am_ref=i; if(logit[i]>logit[am_hit])am_hit=i; }
+                fprintf(stderr,"[FREETOKEN] BENCH: miss %.3fs | hit %.3fs (restore=%d) | speedup %.2fx | "
+                               "max|logit diff| %.3g su %d | argmax %s (%d vs %d)\n",
+                               tm,now_s()-th,hit, tm/(now_s()-th),dmax,c->vocab,
+                               am_ref==am_hit?"OK":"DIVERSO",am_hit,am_ref);
+                free(ref);
+            }
+        }
+    } else logit=step(m,pids,np,0);
     EmitStream es={&T,m,t,0,0};
     int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);
     double dt=now_s()-t;
@@ -2395,6 +2433,11 @@ int main(int argc, char **argv){
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
+    g_freetoken = getenv("FREETOKEN")?atoi(getenv("FREETOKEN")):0;   /* issue #7 PoC */
+    g_ft_bench = getenv("FREETOKEN_BENCH")?atoi(getenv("FREETOKEN_BENCH")):0;
+    if(g_ft_bench) g_freetoken=1;
+    if(g_freetoken){ double gb=getenv("FREETOKEN_CACHE_GB")?atof(getenv("FREETOKEN_CACHE_GB")):8.0;
+        kv_cache_init((size_t)(gb*1073741824.0)); }
     g_temp = getenv("TEMP")?atof(getenv("TEMP")):-1;       /* -1 = auto (1.0 chat/testo, greedy altrove) */
     g_nuc  = getenv("NUCLEUS")?atof(getenv("NUCLEUS")):0.90f;  /* piu' stretto dell'ufficiale 0.95: la coda int4 e' rumore */
     if(getenv("SEED")) g_rng = (uint64_t)atoll(getenv("SEED"))*0x9E3779B97F4A7C15ULL+1;
