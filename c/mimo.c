@@ -1245,7 +1245,18 @@ static inline int lyr_hd (const Cfg *c, int li){ return c->is_swa[li] ? c->swa_h
 static inline int lyr_vd (const Cfg *c, int li){ return c->is_swa[li] ? c->swa_v_head_dim : c->v_head_dim; }
 /* F-11 / speed: SWA (and MTP-as-SWA) KV is a ring of sliding_window rows, not max_t.
  * Full-attention layers stay linear. RoPE still uses the logical position. */
+/* FREETOKEN=1 (issue #7, port del PoC de glm.c): cache KV en RAM host para
+ * prefill por prefijo exacto o prefijo común más largo (§52.2) de prompt.
+ * FREETOKEN_BENCH=1: self-check tras MISS. Lossless: restore = memcpy exacto;
+ * fallback siempre a recomputar. */
+static int g_freetoken=0;
+static int g_ft_bench=0;
+/* FREETOKEN_LINEAR=1 (implícito con FREETOKEN=1): capas SWA lineales en vez de
+ * anillo. +~1.6 GB de RAM con CTX 4096, pero permite restaurar CUALQUIER prefijo
+ * guardado (no sólo la longitud exacta) — requisito para prefix-tree agéntico. */
+static int g_ft_linear=0;
 static inline int lyr_kv_rows(const Cfg *c, int li, int max_t){
+    if(g_ft_linear) return max_t;                       /* prefijos parciales: todo lineal */
     if(c->is_swa[li] && c->sliding_window>0){
         int w=c->sliding_window;
         return (w<max_t)?w:max_t;
@@ -2603,11 +2614,12 @@ static int try_save_kv_to_cache(Model *m, const int *ids, int n){
     const char *snap=getenv("SNAP"); const char *model_id=snap?snap:"unknown";
     char prompt_id[32]; prompt_hash(ids,upto,prompt_id,sizeof(prompt_id));
     for(int i=0;i<NL;i++){
-        int W=c->is_swa[i]&&c->sliding_window>0 ? c->sliding_window : 0;
-        int from=W? (upto>W? upto-W:0) : 0;
+        int lin = g_ft_linear || !(c->is_swa[i] && c->sliding_window>0);
+        int W=c->sliding_window;
+        int from = lin ? 0 : (upto>W? upto-W:0);
         rows[i]=upto-from;
         wk[i]=lyr_kvh(c,i)*lyr_hd(c,i); wv[i]=lyr_kvh(c,i)*lyr_vd(c,i);
-        if(from==0){                            /* full: layout lineal ya contiguo */
+        if(from==0){                            /* full o lineal: layout ya contiguo */
             Ks[i]=m->K[i]; Vs[i]=m->V[i];
         } else {                                /* SWA: recopilar el rango lógico */
             swak[i]=falloc((int64_t)rows[i]*wk[i]); swav[i]=falloc((int64_t)rows[i]*wv[i]);
@@ -2620,27 +2632,27 @@ static int try_save_kv_to_cache(Model *m, const int *ids, int n){
         }
     }
     int ok=kv_cache_put(model_id,prompt_id,NL,rows,wk,wv,Ks,Vs);
+    if(ok) kv_cache_set_ids(model_id,prompt_id,ids,upto);   /* para LCP agénticos */
     for(int i=0;i<NL;i++){ free(swak[i]); free(swav[i]); }
     return ok;
 }
-static int try_restore_kv_from_cache(Model *m, const int *ids, int n){
-    if(!ids||n<=0||!m->K||!m->V) return 0;
+static int do_restore_kv(Model *m, const char *model_id, const char *prompt_id, int upto){
+    if(!m->K||!m->V) return 0;
     Cfg *c=&m->c; int NL=c->n_layers;
-    int upto=n; if(upto>m->max_t) upto=m->max_t;
-    char prompt_id[32]; prompt_hash(ids,upto,prompt_id,sizeof(prompt_id));
-    const char *snap=getenv("SNAP"); const char *model_id=snap?snap:"unknown";
     int n_layer=0,*rows=NULL,*wk=NULL,*wv=NULL; float **Ks=NULL,**Vs=NULL;
     if(!kv_cache_get(model_id,prompt_id,&n_layer,&rows,&wk,&wv,&Ks,&Vs)){
         free(rows);free(wk);free(wv);free(Ks);free(Vs); return 0; }
     int ok=n_layer>=NL;
     for(int i=0;ok&&i<NL;i++){
-        int W=c->is_swa[i]&&c->sliding_window>0 ? c->sliding_window : 0;
-        int need=W? (upto>W? W:upto) : upto;
+        int lin = g_ft_linear || !(c->is_swa[i] && c->sliding_window>0);
+        int W=c->sliding_window;
+        int need = lin ? upto : (upto>W? W:upto);
         ok = rows[i]>=need && wk[i]==lyr_kvh(c,i)*lyr_hd(c,i) && wv[i]==lyr_kvh(c,i)*lyr_vd(c,i);
     }
     if(ok) for(int i=0;i<NL;i++){
-        int W=c->is_swa[i]&&c->sliding_window>0 ? c->sliding_window : 0;
-        int from=W? (upto>W? upto-W:0) : 0;
+        int lin = g_ft_linear || !(c->is_swa[i] && c->sliding_window>0);
+        int W=c->sliding_window;
+        int from = lin ? 0 : (upto>W? upto-W:0);
         /* la cache guarda [upto-rows_i, upto); copiar desde donde empieza a servirnos */
         int off=rows[i]-(upto-from);
         for(int p=from;p<upto;p++){
@@ -2653,6 +2665,22 @@ static int try_restore_kv_from_cache(Model *m, const int *ids, int n){
     }
     free(rows);free(wk);free(wv);free(Ks);free(Vs);
     return ok;
+}
+static int try_restore_kv_from_cache(Model *m, const int *ids, int n){
+    if(!ids||n<=0) return 0;
+    int upto=n; if(upto>m->max_t) upto=m->max_t;
+    char prompt_id[32]; prompt_hash(ids,upto,prompt_id,sizeof(prompt_id));
+    const char *snap=getenv("SNAP");
+    return do_restore_kv(m,snap?snap:"unknown",prompt_id,upto);
+}
+/* Prefijo agéntico (§52.2): mejor LCP del registro de entradas con ids.
+ * Requiere SWA lineal (si no, un prefijo parcial no es restaurable). */
+static int ft_find_prefix(Model *m, const int *ids, int np, char *hit_id, size_t hlen){
+    if(!g_freetoken||!g_ft_linear||!ids||np<1||!m->K) return 0;
+    const char *snap=getenv("SNAP"); const char *model_id=snap?snap:"unknown";
+    int L=kv_cache_best_prefix(model_id,ids,np,hit_id,hlen,NULL);
+    if(L>np) L=np;
+    return L;
 }
 
 static float *step(Model *m, const int *ids, int S, int pos_base){
@@ -2855,11 +2883,6 @@ static void stops_arm(const Cfg *c, int tok_eos, int tok_eos2){
  * all: storia token (capacita' >= kv+n_new+g_draft+2), kv = token gia' in KV.
  * logit = logits della posizione kv-1 (dal prefill); viene liberato qui.
  * emit(tok,ud) per ogni token emesso. Ritorna i token emessi; *kv_out = nuova kv. */
-/* FREETOKEN=1 (issue #7, port del PoC de glm.c): cache KV en RAM host para
- * prefill por prefijo exacto de prompt. FREETOKEN_BENCH=1: self-check tras MISS.
- * Lossless: restore = memcpy exacto; fallback siempre a recomputar. */
-static int g_freetoken=0;
-static int g_ft_bench=0;
 
 /* ---- SpeQ governor (§51, arxiv 2511.14102 adaptado): bandido de dos brazos ----
  * El draft solo paga si el host lo permite; la varianza térmica/disco decide más
@@ -3181,13 +3204,22 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     double t=now_s();
     float *logit=NULL;
     if(g_freetoken){
-        /* FreeToken PoC (issue #7): prefill via cache KV sobre prefijo exacto.
-         * HIT -> restaura K/V y forward solo del último token (mismos logits).
-         * MISS -> prefill lleno + save. Fallback siempre a recomputar. */
+        /* FreeToken PoC (issue #7 + §52.2): prefill via cache KV.
+         * 1) L==np: HIT exacto — restaura y forwarda sólo el último token.
+         * 2) 0<L<np: PREFIJ agéntico — restaura [0,L) y prefill del resto.
+         * 3) L==0: MISS — prefill lleno + save. Fallback siempre a recomputar. */
+        const char *model_id=snap?snap:"unknown";
         double tp=now_s();
-        if(try_restore_kv_from_cache(m,pids,np)){
+        char hid[32]; hid[0]=0;
+        int L=ft_find_prefix(m,pids,np,hid,sizeof hid);
+        if(L==np && do_restore_kv(m,model_id,hid,L)){
             logit=step(m,pids+np-1,1,np-1);
             fprintf(stderr,"[FREETOKEN] HIT: prefill de %d token via cache en %.3fs\n",np,now_s()-tp);
+        } else if(L>0 && do_restore_kv(m,model_id,hid,L)){
+            fprintf(stderr,"[FREETOKEN] PREFIX: %d/%d token via cache en %.3fs\n",L,np,now_s()-tp);
+            logit=step(m,pids+L,np-L,L);
+            if(!try_save_kv_to_cache(m,pids,np))
+                fprintf(stderr,"[FREETOKEN] save post-prefix fallo\n");
         } else {
             logit=step(m,pids,np,0);
             double tm=now_s()-tp;
@@ -4067,12 +4099,21 @@ static void run_serve(Model *m, const char *snap){
         uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
         float *logit;
         if(k>0){
-            /* FreeToken PoC: conversación desde cero (len==0) — HIT si este turno
-             * idéntico ya se prefilló antes (RAM o disco .kvc). Sólo caso fresh:
-             * los turnos con prefijo vivo ya los sirve la KV persistente. */
-            if(len==0 && g_freetoken && try_restore_kv_from_cache(m,hist,k)){
+            /* FreeToken PoC + §52.2: conversación desde cero (len==0).
+             * L==k: HIT exacto (RAM o disco .kvc) — sólo forwarda el último token.
+             * 0<L<k: PREFIJ agéntico — restaura [0,L), prefill del resto.
+             * Turnos con prefijo vivo: la KV persistente ya los sirve. */
+            char hid[32]; int L=0;
+            if(len==0 && g_freetoken){ hid[0]=0; L=ft_find_prefix(m,hist,k,hid,sizeof hid); }
+            const char *model_id=snap?snap:"unknown";
+            if(len==0 && L==k && do_restore_kv(m,model_id,hid,k)){
                 fprintf(stderr,"[FREETOKEN] HIT serve: prefill de %d token via cache\n",k);
                 logit=step(m,hist+k-1,1,k-1); len+=k;
+            } else if(len==0 && L>0 && do_restore_kv(m,model_id,hid,L)){
+                fprintf(stderr,"[FREETOKEN] PREFIX serve: %d/%d token via cache\n",L,k);
+                logit=step(m,hist+L,k-L,L); len+=k;
+                if(!try_save_kv_to_cache(m,hist,len))
+                    fprintf(stderr,"[FREETOKEN] save post-prefix fallo\n");
             } else {
                 logit=step(m,hist+len,k,len); len+=k;
                 if(len==k && g_freetoken && !try_save_kv_to_cache(m,hist,len))
@@ -4582,6 +4623,9 @@ int main(int argc, char **argv){
         double gb=getenv("FREETOKEN_CACHE_GB")?atof(getenv("FREETOKEN_CACHE_GB")):8.0;
         kv_cache_init((size_t)(gb*(double)(1<<30)));
         if(snap) kv_cache_set_dir(snap);
+        /* §52.2: SWA lineal por defecto con FREETOKEN (requisito para restaurar
+         * prefijos parciales agénticos). FREETOKEN_LINEAR=0 vuelve al anillo. */
+        g_ft_linear = getenv("FREETOKEN_LINEAR")?atoi(getenv("FREETOKEN_LINEAR")):1;
     }
     /* SpeQ governor §51: bandido draft on/off por EMA ms/token. SPEC_ADAPT=0
      * vuelve al comportamiento fijo; SPEC_PROBE=n pasos por ventana de sondeo. */

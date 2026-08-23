@@ -28,6 +28,8 @@ typedef struct KVEntry {
     char *model_hash;
     char *prompt_id;
     int n_layer;
+    int *ids;          /* tokens del prefijo guardado (para LCP agénticos) */
+    int n_ids;
     KVLayer *layers;
     struct KVEntry *next;
     size_t bytes;
@@ -63,7 +65,7 @@ int kv_cache_init(size_t max_bytes) {
 
 /* ---- disk backing (warm tier across process restarts) ------------------ */
 
-#define KVC_MAGIC "KVCC0001"
+#define KVC_MAGIC "KVCC0002"
 static char g_dir[2048] = "";
 static size_t g_disk_max = 0;
 
@@ -97,11 +99,13 @@ static int write_entry_file(const KVEntry *e) {
     FILE *f = fopen(path, "wb");
     if (!f) return 0;
     uint32_t ml = (uint32_t)strlen(e->model_hash), pl = (uint32_t)strlen(e->prompt_id);
-    uint32_t nl = (uint32_t)e->n_layer;
+    uint32_t nl = (uint32_t)e->n_layer, ni = (uint32_t)e->n_ids;
     int ok = fwrite(KVC_MAGIC, 1, 8, f) == 8
           && fwrite(&ml, 4, 1, f) == 1 && fwrite(e->model_hash, 1, ml, f) == ml
           && fwrite(&pl, 4, 1, f) == 1 && fwrite(e->prompt_id, 1, pl, f) == pl
-          && fwrite(&nl, 4, 1, f) == 1;
+          && fwrite(&nl, 4, 1, f) == 1
+          && fwrite(&ni, 4, 1, f) == 1;
+    if (ok && ni) ok = fwrite(e->ids, 4, ni, f) == ni;
     for (uint32_t i = 0; ok && i < nl; ++i) {
         uint32_t r = (uint32_t)e->layers[i].rows, hk = (uint32_t)e->layers[i].kvh_k,
                  hv = (uint32_t)e->layers[i].kvh_v;
@@ -171,6 +175,14 @@ static KVEntry *read_entry_file(const char *model_hash, const char *prompt_id) {
     if (fread(e->prompt_id, 1, pl, f) != pl) goto fail;
     e->prompt_id[pl] = 0;
     if (strcmp(e->prompt_id, prompt_id)) goto fail;
+    uint32_t ni = 0;
+    if (fread(&ni, 4, 1, f) != 1 || ni > (1u << 20)) goto fail;
+    if (ni) {
+        e->ids = (int*)malloc(4 * ni);
+        if (!e->ids || fread(e->ids, 4, ni, f) != ni) goto fail;
+        e->n_ids = (int)ni;
+        e->bytes += 4 * ni;
+    }
     if (fread(&nl, 4, 1, f) != 1 || nl > 4096) goto fail;
     e->n_layer = (int)nl;
     e->layers = (KVLayer*)calloc(nl, sizeof(KVLayer));
@@ -201,6 +213,7 @@ static void free_entry(KVEntry *e) {
     if (!e) return;
     free(e->model_hash);
     free(e->prompt_id);
+    free(e->ids);
     if (e->layers) {
         for (int i = 0; i < e->n_layer; ++i) {
             free(e->layers[i].K);
@@ -209,6 +222,43 @@ static void free_entry(KVEntry *e) {
         free(e->layers);
     }
     free(e);
+}
+
+/* attach ids (copia propia) a una entrada existente; idempotente */
+int kv_cache_set_ids(const char *model_hash, const char *prompt_id,
+                     const int *ids, int n) {
+    if (!model_hash || !prompt_id || !ids || n <= 0) return 0;
+    for (KVEntry *cur = g_head; cur; cur = cur->next) {
+        if (!strcmp(cur->model_hash, model_hash) && !strcmp(cur->prompt_id, prompt_id)) {
+            int *cp = (int*)malloc(sizeof(int) * n);
+            if (!cp) return 0;
+            memcpy(cp, ids, sizeof(int) * n);
+            free(cur->ids);
+            g_cur_bytes -= cur->n_ids * 4;
+            cur->ids = cp; cur->n_ids = n;
+            g_cur_bytes += 4 * n;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* longest common prefix contra todas las entradas del modelo que tengan ids.
+ * Devuelve el LCP mayor (>=0) y copia el prompt_id de esa entrada. */
+int kv_cache_best_prefix(const char *model_hash, const int *ids, int n,
+                         char *prompt_id_out, size_t outlen, int *lcp_out) {
+    int best = 0;
+    const char *best_id = NULL;
+    for (KVEntry *cur = g_head; cur; cur = cur->next) {
+        if (!cur->ids || !cur->n_ids || strcmp(cur->model_hash, model_hash)) continue;
+        int m = cur->n_ids < n ? cur->n_ids : n, l = 0;
+        while (l < m && cur->ids[l] == ids[l]) l++;
+        if (l > best) { best = l; best_id = cur->prompt_id; }
+    }
+    if (best > 0 && prompt_id_out && best_id)
+        snprintf(prompt_id_out, outlen, "%s", best_id);
+    if (lcp_out) *lcp_out = best;
+    return best;
 }
 
 int kv_cache_put(const char *model_hash, const char *prompt_id,

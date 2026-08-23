@@ -1824,3 +1824,21 @@ Descartes con datos antes de codificar:
 - Trampa de test detectada: printf de dash no expande `\xNN` — usar octal
   (`\002`) en los scripts de protocolo SERVE, o todos los turnos van a modo
   interactivo y el test mide otra cosa.
+
+#### 52.2 — FREETOKEN_LINEAR: prefix-tree real (prefijos parciales) (2026-08-23)
+
+El descarte de 52.1 (anillo SWA bloquea prefijos parciales) se revirtió con un
+modo opcional: `FREETOKEN_LINEAR=1` (default ON con FREETOKEN) asigna las capas
+SWA a `max_t` en vez del anillo (~+1.6 GB RAM a CTX 4096) y cada entrada de
+cache guarda ademas sus token ids (`kv_cache_set_ids`). El lookup
+`kv_cache_best_prefix` encuentra la entrada con longest common prefix; el serve
+restaura `[0,L)` y prefilla solo `np-L`.
+
+Medido (311B real, cold): turno 1 = prompt base (17 tok); RESET; turno 2 =
+base+sufijo (27 tok) → **[FREETOKEN] PREFIX serve: 18/27 token via cache** —
+solo 9 token prefillados, turno completo ~3x (0.05→0.19 tok/s). Con esto,
+branching/retries/edits/restarts de agentes reutilizan cualquier estado anterior
+de la conversacion, no solo re-envios identicos.
+
+Nota: los ids guardados incluyen la respuesta generada (save al cierre del
+turno), por lo que el LCP puede superar la longitud del prompt original.

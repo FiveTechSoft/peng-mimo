@@ -47,6 +47,14 @@ void kv_cache_set_disk_max(size_t max_bytes);
 size_t kv_cache_cur_bytes(void);
 size_t kv_cache_max_bytes(void);
 
+/* FreeToken prefix-tree (§52.2): attach token ids to an entry and find the
+ * cached entry with the longest common prefix against ids[0..n). The returned
+ * prompt_id_out can be fed to kv_cache_get to restore that prefix length. */
+int kv_cache_set_ids(const char *model_hash, const char *prompt_id,
+                     const int *ids, int n);
+int kv_cache_best_prefix(const char *model_hash, const int *ids, int n,
+                         char *prompt_id_out, size_t outlen, int *lcp_out);
+
 #ifdef __cplusplus
 }
 #endif
