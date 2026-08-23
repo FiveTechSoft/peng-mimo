@@ -2778,11 +2778,50 @@ static void stops_arm(const Cfg *c, int tok_eos, int tok_eos2){
  * all: storia token (capacita' >= kv+n_new+g_draft+2), kv = token gia' in KV.
  * logit = logits della posizione kv-1 (dal prefill); viene liberato qui.
  * emit(tok,ud) per ogni token emesso. Ritorna i token emessi; *kv_out = nuova kv. */
+/* ---- SpeQ governor (§51, arxiv 2511.14102 adaptado): bandido de dos brazos ----
+ * El draft solo paga si el host lo permite; la varianza térmica/disco decide más
+ * que cualquier umbral fijo (§50.2: 0.23-0.50 con draft vs 0.49 sin, mismo día).
+ * En lugar de modelar la física, se miden EMA de ms/token emitido CON y SIN
+ * draft, se sondea el brazo alternativo cada SPEC_PROBE pasos y se queda con
+ * el mejor. Lossless: el verify greedy es determinista; solo cambia CUÁNDO se
+ * especula, no qué tokens salen. */
+static int g_spec_adapt=1;
+static int g_spec_probe=10;
+static double s_ema_ms[2]={-1,-1};   /* [0]=sin draft [1]=con draft */
+static int    s_mode=1;              /* modo asentado (1=draft) */
+static int    s_phase=0, s_left=0;   /* exploración en curso */
+static uint64_t s_switches=0;
+/* fin de ventana de sondeo: comparar EMAs y asentarse en el brazo mejor */
+static void spec_settle(void){
+    if(s_phase!=1) return;
+    s_phase=0; s_left=g_spec_probe*4;
+    int cur=s_mode, alt=!s_mode;
+    if(s_ema_ms[alt]>=0 && (s_ema_ms[cur]<0 || s_ema_ms[alt]<s_ema_ms[cur]*0.95)){
+        s_mode=alt; s_switches++;
+        fprintf(stderr,"[SPEC] cambio a %s (EMA %.1f vs %.1f ms/tok)\n",
+            s_mode?"draft":"secuencial",s_ema_ms[1],s_ema_ms[0]);
+    }
+}
+static void spec_governor_report(void){
+    if(!(g_spec_adapt && g_draft>0)) return;
+    spec_settle();
+    fprintf(stderr,"[SPEC] modo final: %s", s_mode?"draft":"secuencial");
+    if(s_ema_ms[0]>=0) fprintf(stderr," | seq %.1f ms/tok", s_ema_ms[0]);
+    if(s_ema_ms[1]>=0) fprintf(stderr," | draft %.1f ms/tok", s_ema_ms[1]);
+    fprintf(stderr," | switches=%llu\n",(unsigned long long)s_switches);
+}
+
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
                        void (*emit)(int,void*), void *ud, int *kv_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
     int draft[64]; if(g_draft>63) g_draft=63;
     int carry_ban=-1;                    /* token rifiutato dalla verifica: escluso dal resample */
+    int use_draft = g_draft>0;           /* decisión del gobernador (si SPEC_ADAPT) */
+    if(!g_spec_adapt) use_draft = g_draft>0;
+    /* primera ventana: medir el brazo inicial antes de sondear el alternativo */
+    if(g_spec_adapt && g_draft>0 && s_ema_ms[0]<0 && s_ema_ms[1]<0 && s_left==0)
+        s_left=g_spec_probe;
+    double t_step0=now_s(); int emitted_step0=emitted;
     while(emitted<n_new && !done){
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
@@ -2791,11 +2830,25 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         int g = 0;
         /* auto-off adattivo: draft mai accettati = solo tassa di calcolo per forward */
         if(g_draft>0 && m->has_mtp && m->mtp_prop>=24 && m->mtp_acc*10 < m->mtp_prop){
-            g_draft=0;
+            g_draft=0; use_draft=0;
             fprintf(stderr,"[MTP] acceptance %.0f%% dopo %llu proposte: draft disattivati\n",
                 100.0*m->mtp_acc/m->mtp_prop, (unsigned long long)m->mtp_prop);
         }
-        if(g_draft>0){
+        /* SpeQ governor: sondeo del brazo alternativo + asentarse en la EMA mejor */
+        if(g_spec_adapt && g_draft>0){
+            int cur = s_mode;
+            if(s_left>0) s_left--;
+            else if(s_phase==0){                 /* empezar a sondear el otro brazo */
+                s_phase=1; s_left=g_spec_probe; cur=!s_mode;
+                if(g_spec_probe>0)
+                    fprintf(stderr,"[SPEC] sondeando %s (%d pasos)...\n",cur?"draft":"secuencial",g_spec_probe);
+            } else {                             /* fin del sondeo: comparar y asentar */
+                spec_settle();
+                cur=s_mode;
+            }
+            use_draft=cur;
+        }
+        if(use_draft && g_draft>0){
             if(m->has_mtp){ g=mtp_draft(m,next,kv,g_draft,draft); m->mtp_prop+=g; }
             else g=ngram_draft(all,kv+1,g_draft,draft);
         }
@@ -2823,7 +2876,19 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(k<S-1) memcpy(m->hlast, m->h_all+(int64_t)k*c->hidden, c->hidden*sizeof(float));
         kv += 1+k;                                      /* KV oltre kv e' stantia: verra' sovrascritta */
         logit=falloc(V); memcpy(logit, lo+(int64_t)k*V, V*sizeof(float)); free(lo);
+        /* EMA del brazo activo: ms por token emitido en este paso */
+        if(g_spec_adapt && g_draft>0){
+            double dt=(now_s()-t_step0)*1000.0;
+            int toks=emitted-emitted_step0;
+            if(toks>0){
+                double ms=dt/toks;
+                int arm = use_draft?1:0;         /* atribuir al brazo realmente activo */
+                s_ema_ms[arm]= s_ema_ms[arm]<0 ? ms : 0.7*s_ema_ms[arm]+0.3*ms;
+            }
+            t_step0=now_s(); emitted_step0=emitted;
+        }
     }
+    spec_governor_report();
     if(logit) free(logit);
     if(kv_out) *kv_out=kv;
     return emitted;
@@ -4378,6 +4443,10 @@ int main(int argc, char **argv){
     if(getenv("DRAFT")) g_draft=atoi(getenv("DRAFT"));
     else if(tao_mode) g_draft=0;                 /* TAO: do not force MTP draft on cold disk */
     else g_draft=-1;                             /* -1 = auto after load (MTP head -> often 0) */
+    /* SpeQ governor §51: bandido draft on/off por EMA ms/token. SPEC_ADAPT=0
+     * vuelve al comportamiento fijo; SPEC_PROBE=n pasos por ventana de sondeo. */
+    g_spec_adapt = getenv("SPEC_ADAPT")?atoi(getenv("SPEC_ADAPT")):1;
+    if(getenv("SPEC_PROBE")) g_spec_probe=atoi(getenv("SPEC_PROBE"));
     /* CACHE_ROUTE (port colibri upstream): steering del router verso expert residenti.
      * Opt-in, MAI default: cambia il routing — adottare solo dopo gate ppl tipo §40. */
     g_cache_route = getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):0;
