@@ -1842,3 +1842,33 @@ de la conversacion, no solo re-envios identicos.
 
 Nota: los ids guardados incluyen la respuesta generada (save al cierre del
 turno), por lo que el LCP puede superar la longitud del prompt original.
+
+### 53. Gate de calidad del stack nuevo: MM_THREADS bit-exacto; CUDA_DENSE mejora la ppl (2026-08-23)
+
+Cierra las "gates pendientes" de §50. Protocolo: corpus SCORE regenerado
+(prosa README + codigo olmoe.c, 2x768 tokens, ctxlen=1; el score_req.txt
+original se perdio con el WSL), teacher-forcing e2e, mismo dia, 3 configs.
+
+| cfg | ppl prosa | ppl code | acuerdo top-1 vs BASE |
+|---|---|---|---|
+| BASE (CPU int8 denso) | 9.59 | 2.22 | — |
+| + MM_THREADS=8 | **9.59** | **2.22** | **100% / 100%** |
+| paquete CUDA (DENSE+ATTN) | **8.92** | **2.11** | 81.1% / 90.7% |
+
+Hallazgos:
+
+1. **MM_THREADS es bit-exacto e2e**: logprobs identicos al ultimo digito y
+   acuerdo 100%. El knob es gratis en calidad; gate cerrada.
+2. **El paquete CUDA NO degrada: mejora la ppl** (-7.0% prosa, -5.0% code).
+   CUDA_DENSE computa las GEMM densas a mayor precision que el camino CPU
+   (int8) → los logits difieren y por eso el argmax flipa (81-91%), pero la
+   verosimilitud sube en ambos dominios: el ruido numerico int8 costaba ppl.
+   El precedente "opt-in no bit-exacto" de CUDA_ATTN queda revalidado con
+   signo favorable.
+3. Trampa de reproducibilidad: el corpus depende de README.md y olmoe.c
+   actuales → si cambian, la ppl no es comparable con tablas anteriores.
+   score_req.txt vive fuera del repo (/root); regenerarlo con
+   scripts/make_score_corpus.py (requiere transformers) o tokenizers puro.
+
+Veredicto: el stack completo MM_THREADS+DIRECT(frio)+CUDA es quality-neutral
+o mejor. Sin gates abiertas para el stack de produccion actual.
