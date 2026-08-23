@@ -1692,3 +1692,79 @@ ataca el 49%) y residencia real de experts en VRAM (subir REPIN/ENERGY hasta
 llenar los 12 GB, no 32) antes que C/D (async H2D, hidden-state residency).
 Caveat: runs únicos por config; B2 sugiere varianza de scheduling de disco de
 ±30% en las columnas disk/other.
+
+### 50. MM_THREADS + O_DIRECT en REPLAY frío — 0.21 → 0.94 tok/s (2026-08-23)
+
+Protocolo: `REPLAY=1` con `ref_long.json` nuevo (8+113 tokens, prosa tokenizada
+con `tok_mimo_cli`; el ref de §49 no estaba en el repo), drop_caches antes de
+cada run, binario reconstruido hoy. Baseline replicado 2×.
+
+| stack | tok/s | disk | matmul | attn | hit |
+|---|---|---|---|---|---|
+| base COLI_CUDA=0 ×2 | 0.19–0.21 | ~162 s | 263–317 s | 33–39 s | 35% |
+| + `MM_THREADS=8` | 0.34 | 173 s | **67.5 s** | 34 s | 37% |
+| + `DIRECT=1` | 0.49–0.50 | **94–97 s** | 48–49 s | 32 s | 35–37% |
+| + CUDA (`COLI_CUDA=1 CUDA_DENSE=1 CUDA_ATTN=1`) | **0.56** | 78 s | 33 s | 46 s* | 53% |
+| + `SPEED=1` (TOPP=0.55, −calidad §40) | **0.94** | 40 s | 14 s | 32 s | 59% |
+
+*attn sube al bucket por sync-wait contado ahí; el wall es lo que importa.
+
+Hallazgos:
+
+1. **HT hermanos mataban el GEMV AVX2**: 16 hilos HT → 8 núcleos físicos =
+   expert-matmul −74% (27→7 s/12 tok; 317→68 s/105 tok). Nuevo knob
+   **`MM_THREADS=n`**: limita hilos SOLO dentro de los kernels GEMV
+   (`mm_enter/mm_exit`); el I/O paralelo conserva el pool completo (con
+   OMP_NUM_THREADS=8 global el disco empeoraba 11→18 s). Estable entre 4–12
+   hilos; default del wrapper `start_peng.sh` = núcleos físicos vía lscpu.
+2. **`DIRECT=1` (O_DIRECT) gana en frío hoy**: disco −45% (163→94 s). El note
+   antiguo de default-OFF quedaron obsoleto tras los cambios de OVERLAP/prefetch;
+   sigue opt-in en el motor, `start_peng.sh` ya lo exporta.
+3. **CUDA_ATTN=1 suma otro +12-15%** e2e sobre CPU-only incluso en frío
+   (contrasta con §49, donde REPIN=32 solo no pagaba): la diferencia es MM_THREADS
+   quitando el cuello CPU que ocultaba la cola GPU.
+4. **TRAJ=0 en single-shot PROMPT: REFUTADO** (roadmap ítem C). Medido con stack
+   nuevo: TRAJ=1 0.69 tok/s hit 71% vs TRAJ=0 0.65 hit 57% — el warm paga aunque
+   no haya turno siguiente. Revertido; no reintentar sin cambiar el régimen I/O.
+5. Grouped/batched expert GEMV (ítem E): **desestimado por datos** — tras
+   MM_THREADS el matmul queda bound por ancho de banda RAM (~70 GB/s efectivos
+   leyendo pesos), agrupar expertos no reduce bytes ni barreras relevantes
+   (barreras ≈17 ms/token < 1%).
+
+Gates pendientes: matriz ppl §40 para MM_THREADS (es bit-exact: solo cambia el
+equipo de hilos, cada elemento lo calcula un hilo igual que antes — sin riesgo)
+y para el paquete DIRECT+CUDA_ATTN en el contenedor reparado.
+
+#### 50.1 — Protocolo del récord (PROMPT cálido NGEN=24): A/B pareado mismo día
+
+Con el stack nuevo en el protocolo exacto de §46 (TAO + CUDA_ATTN + spin,
+PILOT=0, prompt ~19 tok, sin drop_caches):
+
+| stack (mismo día, 23-ago) | reps | mediana | mejor |
+|---|---|---|---|
+| viejo (sin MM_THREADS) ×3 | 0.32–0.46 | **0.37** | 0.46 |
+| nuevo (+MM_THREADS=8) ×5 | 0.36–0.58 | **0.49** | 0.58 |
+
+- **MM_THREADS: +32% mediana pareada también en generación real caliente.**
+- El récord absoluto **0.89 (20-jul) NO se supera hoy**: el host amanece ~2×
+  más lento (deriva documentada en README; el stack VIEJO que entonces hacia
+  0.72–0.77 hoy hace 0.37). Con la ratio pareada +32%, un día de host normal
+  proyectaría ~0.9–1.0. Reintentar el gate en día bueno.
+- **`DIRECT=1` es malo en régimen CALIENTE**: O_DIRECT bypassa la page cache,
+  que es justamente lo que acelera las repeticiones (medido: 0.66 vs 0.38 con
+  mismo estado). DIRECT ayuda en frío/bench (§50), estorba en chat tibio.
+  `start_peng.sh` debería exportar DIRECT solo para bench/primera pasada.
+
+#### 50.2 — Tres intentos más sobre el stack nuevo (23-ago, REPLAY frío largo)
+
+| intento | resultado | veredicto |
+|---|---|---|
+| `CUDA_EXPERT_GB=11` (llenar VRAM tier) | 0.36 vs 0.56; disk 147 s vs 78 s | **rechazado**: los uploads dinámicos compiten y roban RAM al LRU |
+| `DRAFT=2` (MTP, PROMPT cálido ×3) | aceptación 8–22% (no 64%); 0.27–0.45 vs 0.49 | **rechazado hoy**: verify cuesta más de lo que acepta sin cache totalmente tibia |
+| `LTOPK=6/5` trim estratificado (nuevo knob) | 0.32–0.34 vs 0.34 top-8 completo | **marginal**: queda como knob opt-in; su valor real exigiría matriz ppl vs TOPP |
+
+Lección transversal: con matmul arreglado (MM_THREADS) el régimen frío queda
+**disco-bound puro** (~55-70% del wall según config) — los trims de expertos
+apenas se notan porque la sesión de disco por token ya está saturada; las únicas
+vías restantes son más hit-rate (RAM/UNION179/nativo Linux) o menos bytes/token
+(contenedor int2/zstd-repack, ya medidos en §41/A2).

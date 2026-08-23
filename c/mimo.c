@@ -64,6 +64,94 @@ static double g_energy_gb=-1;                    /* ENERGY: channel→VRAM (-1 a
 static int g_traj_warm_every=1;                  /* decode: run traj_warm every N tokens (2=half cost) */
 static int g_pp_every=4;                         /* rebuild pathpack every N usage_save (not each) */
 static int g_pp_save_i=0;
+/* SILU_HIST=1: |SiLU(gate·x)| on routed experts. Tests whether most intermediate
+ * dims are dead for a given x (neuron-level I/O hypothesis). CUDA fused path
+ * skipped so the gate is visible on the host. */
+#define SILU_NLAY 64
+#define SILU_NTHR 8
+static int g_silu_hist=0;
+static const float silu_thr[SILU_NTHR]={1e-4f,1e-3f,0.01f,0.02f,0.05f,0.10f,0.20f,0.50f};
+static int g_gate_first=7;
+static float g_gf_skip=0.01f;   /* 0.02 changed Rome text; 0.01 only skips nearly-dead L3-class */
+static unsigned long long g_gf_exp=0, g_gf_skipn=0, g_gf_io_skip=0;
+static unsigned long long silu_n=0, silu_below[SILU_NTHR];
+static unsigned long long silu_n_l[SILU_NLAY], silu_below_l[SILU_NLAY][SILU_NTHR];
+static double silu_sum=0, silu_sum2=0;
+static void silu_hist_obs(int layer, float s){
+    float a=s<0.f?-s:s;
+    if(layer<0) layer=0;
+    if(layer>=SILU_NLAY) layer=SILU_NLAY-1;
+    silu_n++; silu_n_l[layer]++;
+    silu_sum+=a; silu_sum2+=(double)a*a;
+    for(int t=0;t<SILU_NTHR;t++) if(a<silu_thr[t]){ silu_below[t]++; silu_below_l[layer][t]++; }
+}
+static void silu_hist_report(void){
+    if(!g_silu_hist) return;
+    if(!silu_n){ fprintf(stderr,"# SILU_HIST n=0 (no routed expert fired)\n"); return; }
+    double mean=silu_sum/(double)silu_n;
+    double var=silu_sum2/(double)silu_n-mean*mean; if(var<0) var=0;
+    fprintf(stderr,"\n# SILU_HIST routed |SiLU(gate·x)|  n=%llu  mean=%.5f  std=%.5f\n",
+            silu_n, mean, sqrt(var));
+    fprintf(stderr,"# thr        dead%%   keep_up_down%%   io_vs_full%%   (gate always + live up/down)\n");
+    for(int t=0;t<SILU_NTHR;t++){
+        double dead=100.0*(double)silu_below[t]/(double)silu_n;
+        double live=1.0-(double)silu_below[t]/(double)silu_n;
+        double io=100.0*(1.0/3.0+(2.0/3.0)*live); /* gate 1/3 + up/down 2/3 */
+        fprintf(stderr,"#  %7.4f   %6.2f        %6.2f         %6.2f\n",
+                silu_thr[t], dead, 100.0*live, io);
+    }
+    fprintf(stderr,"# per-layer dead%% at |SiLU|<0.01 (I/O leftover if we skip those up/down rows):\n");
+    for(int L=0;L<SILU_NLAY;L++){
+        if(!silu_n_l[L]) continue;
+        double d=100.0*(double)silu_below_l[L][2]/(double)silu_n_l[L];
+        double live=1.0-(double)silu_below_l[L][2]/(double)silu_n_l[L];
+        double io=100.0*(1.0/3.0+(2.0/3.0)*live);
+        fprintf(stderr,"#   L%02d  n=%llu  dead@0.01=%.1f%%  io=%.1f%%\n",
+                L, silu_n_l[L], d, io);
+    }
+    fprintf(stderr,"# io_vs_full = 33%% (always-read gate) + 67%% × live rows. Hypothesis holds if dead@0.01 ≳ 50%%.\n");
+}
+static void gate_first_report(void){
+    if(g_gate_first<=0 || !g_gf_exp) return;
+    fprintf(stderr,"[GATE_FIRST] experts=%llu skipped=%llu (%.1f%%) io_not_read=%.2f MB\n",
+            g_gf_exp, g_gf_skipn, 100.0*g_gf_skipn/(double)g_gf_exp,
+            g_gf_io_skip/(1024.0*1024.0));
+}
+/* RESID_DUMP=<dir>: append residual stream x (S x D float32) after each main layer.
+ * PCA later: is late-layer x a thin sheet? Need n_tokens ≳ 128 or the test is vacuous. */
+static int g_resid_on=0;
+static char g_resid_dir[1024];
+static FILE *g_resid_fp[SILU_NLAY];
+static unsigned g_resid_rows[SILU_NLAY];
+static int g_resid_D=0;
+static void resid_dump_layer(int li, const float *x, int S, int D){
+    if(!g_resid_on || S<1 || D<1 || li<0 || li>=SILU_NLAY) return;
+    if(!g_resid_fp[li]){
+        char p[1200];
+        snprintf(p,sizeof(p),"%s/L%02d.bin",g_resid_dir,li);
+        g_resid_fp[li]=fopen(p,"ab");
+        if(!g_resid_fp[li]){ fprintf(stderr,"RESID_DUMP: cannot write %s\n",p); return; }
+    }
+    if(!g_resid_D) g_resid_D=D;
+    fwrite(x,sizeof(float),(size_t)S*(size_t)D,g_resid_fp[li]);
+    g_resid_rows[li]+=(unsigned)S;
+}
+static void resid_dump_close(void){
+    if(!g_resid_on) return;
+    FILE *m=NULL;
+    char p[1200];
+    snprintf(p,sizeof(p),"%s/meta.txt",g_resid_dir);
+    m=fopen(p,"w");
+    if(m){
+        fprintf(m,"D=%d\n",g_resid_D);
+        for(int i=0;i<SILU_NLAY;i++){
+            if(g_resid_fp[i]) fprintf(m,"L%02d rows=%u\n",i,g_resid_rows[i]);
+        }
+        fclose(m);
+    }
+    for(int i=0;i<SILU_NLAY;i++) if(g_resid_fp[i]){ fclose(g_resid_fp[i]); g_resid_fp[i]=NULL; }
+    fprintf(stderr,"[RESID_DUMP] wrote %s (D=%d)\n",g_resid_dir,g_resid_D);
+}
 #include "st.h"
 #include "tok.h"
 #include "tier.h"
@@ -142,7 +230,8 @@ typedef struct {
  * slab_cap/fslab_cap: capienza allocata — gli slot ws[] sono riusati TRA layer
  * (in MiMo tutti gli expert hanno la stessa taglia; il buffer resta dimensionato al max). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
-                 int64_t slab_cap, fslab_cap; uint64_t used; } ESlot;
+                 int64_t slab_cap, fslab_cap; uint64_t used;
+                 int have; } ESlot;   /* bit0=gate bit1=up bit2=down */
 
 typedef struct {
     Cfg c; shards S;
@@ -343,6 +432,22 @@ static float *falloc(int64_t n){
     if(n<0 || (uint64_t)n > SIZE_MAX/sizeof(float)){ fprintf(stderr,"falloc: n=%lld fuori range\n",(long long)n); exit(1); }
     float *p=malloc((size_t)n*sizeof(float)); if(!p){fprintf(stderr,"OOM\n");exit(1);} return p; }
 
+/* MM_THREADS=n: cap de hilos OpenMP SOLO dentro de los kernels GEMV de expertos.
+ * Medido (2026-08-23, Xeon W-2140B 8c/16t): con 16 hilos HT el GEMV AVX2 pierde
+ * ~4x (hermanos HT compiten por puertos shuffle/FMA); con los 8 nucleos fisicos
+ * expert-matmul cae 27.1s -> 7.0s en 12 tokens. El resto (I/O paralelo de loads)
+ * sigue usando el pool completo: solo estos kernels reducen su equipo. */
+static int g_mm_threads=0;
+static inline int mm_enter(void){
+    if(g_mm_threads>0 && !omp_in_parallel()){
+        int sv=omp_get_max_threads();
+        omp_set_num_threads(g_mm_threads<sv?g_mm_threads:sv);
+        return sv;
+    }
+    return -1;
+}
+static inline void mm_exit(int sv){ if(sv>0) omp_set_num_threads(sv); }
+
 /* y[S,O] = x[S,I] @ W^T, W[O,I] f32 */
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
     #pragma omp parallel for schedule(static)
@@ -351,6 +456,7 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
 }
 /* y[S,O] = x[S,I] @ W^T con W quantizzato int8 per-riga + scala[O] (dequant-on-use) */
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int S, int I, int O){
+    int sv=mm_enter();
     #pragma omp parallel for schedule(static)
     for (int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
@@ -367,6 +473,7 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
             a=vaddvq_f32(vaddq_f32(ac0,ac1));
 #endif
             for(;i<I;i++) a+=xs[i]*(float)w[i]; y[(int64_t)s*O+o]=a*sc; } }
+    mm_exit(sv);
 }
 /* y[S,O] = x[S,I] @ W^T con W int4 impacchettato (2 valori/byte) + scala[O]. */
 /* ---- Accumulatore int4->float a 512 bit (porting colibri #95 / 4b1d0e3) ----
@@ -412,6 +519,7 @@ static int i4_acc512_selftest(void){
 
 static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *scale, int S, int I, int O){
     int rb=(I+1)/2;
+    int sv=mm_enter();
     #pragma omp parallel for schedule(static)
     for (int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
@@ -450,10 +558,12 @@ static void matmul_i4(float *y, const float *x, const uint8_t *q4, const float *
                 a += xs[i]*(float)lo + xs[i+1]*(float)hi; }
             if(i<I){ uint8_t byte=w[i>>1]; int lo=(int)(byte&0xF)-8; a += xs[i]*(float)lo; }
             y[(int64_t)s*O+o]=a*sc; } }
+    mm_exit(sv);
 }
 /* y[S,O] = x[S,I] @ W^T con W int2 impacchettato (4 valori/byte) + scala[O]. nibble 2-bit -> [-2,1]. */
 static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *scale, int S, int I, int O){
     int rb=(I+3)/4;
+    int sv=mm_enter();
     #pragma omp parallel for schedule(static)
     for (int o=0;o<O;o++){ const uint8_t *w=q2+(int64_t)o*rb; float sc=scale[o];
         for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
@@ -488,6 +598,7 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #endif
             for(;i<I;i++){ uint8_t byte=w[i>>2]; int sh=(i&3)*2; a += xs[i]*(float)((int)((byte>>sh)&3)-2); }
             y[(int64_t)s*O+o]=a*sc; } }
+    mm_exit(sv);
 }
 /* ---- KERNEL INTERI (IDOT): attivazioni quantizzate a int8 per riga (absmax/127,
  * stile Q8_0), prodotto scalare INTERO via maddubs/madd AVX2 — niente conversione
@@ -636,16 +747,20 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
 }
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
                           const float *scale, int S, int I, int O){
+    int sv=mm_enter();
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+    mm_exit(sv);
 }
 static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
                            const float *scale, int S, int I, int O){
     int rb=(I+1)/2;
+    int sv=mm_enter();
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+    mm_exit(sv);
 }
 
 /* LOSSLESS SPEC (bugfix col gate MTP "DRAFT=0 vs 2 byte-identici"): la scelta del
@@ -874,6 +989,8 @@ static float g_temp=-1;  /* TEMP: temperatura di sampling sui TOKEN. <0 = auto (
 static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (0.95 = generation_config di
                           * MiMo-V2.5, verificato: temperature=1.0, top_p=0.95) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
+static int g_ltopk=0;    /* LTOPK=n[,e] -> trim estratificado: top-n en capas medias, borde completo */
+static int g_ltopk_e=4;  /* capas de borde (primeras/últimas) que conservan top-K completo */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
 /* CACHE_ROUTE=1 (port da colibri upstream; max-rank, paper 2412.00099): steering del
  * router verso expert gia' residenti — top-J sacri sempre, gli slot restanti del top-K
@@ -1335,7 +1452,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
         qt_from_disk(m,nm[0],I,D,b,g_drop,&s->g);
         qt_from_disk(m,nm[1],I,D,b,g_drop,&s->u);
         qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
-        s->eid=eid; return;
+        s->eid=eid; s->have=7; return;
     }
     st_tensor *tw[3], *tq[3];
     for(int k=0;k<3;k++){
@@ -1403,7 +1520,7 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
         }
         __sync_fetch_and_add(&m->io_bytes, zo);          /* bytes comprimidos leídos */
         if(m->xp_disk) __sync_fetch_and_add(&m->xp_disk[(size_t)layer*c->n_experts+eid], (uint64_t)zo);
-        s->eid=eid; return;
+        s->eid=eid; s->have=7; return;
     }
     int contig = tw[ord[0]]->fd==tw[ord[1]]->fd && tw[ord[1]]->fd==tw[ord[2]]->fd
               && tw[ord[0]]->off+tw[ord[0]]->nbytes==tw[ord[1]]->off
@@ -1449,7 +1566,59 @@ static void expert_load(Model *m, int layer, int eid, ESlot *s){
     }
     __sync_fetch_and_add(&m->io_bytes, wtot);
     if(m->xp_disk) __sync_fetch_and_add(&m->xp_disk[(size_t)layer*c->n_experts+eid], (uint64_t)wtot);
-    s->eid=eid;
+    s->eid=eid; s->have=7;
+}
+
+/* Partial expert I/O (GATE_FIRST): load only requested tensors. zstd/unquantized
+ * fall back to a full expert_load (those containers are one frame). */
+static void expert_ensure(Model *m, int layer, int eid, ESlot *s, int parts){
+#ifdef COLI_CUDA
+    if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); s->have=0; }
+#endif
+    if(s->eid!=eid) s->have=0;
+    if((s->have&parts)==parts && s->eid==eid) return;
+    Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
+    char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
+    char qn[300]; snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
+    if(!st_has(&m->S,qn)){ expert_load(m,layer,eid,s); return; }
+    st_tensor *tw[3], *tq[3];
+    for(int k=0;k<3;k++){
+        tw[k]=st_find(&m->S,nm[k]);
+        snprintf(qn,sizeof(qn),"%s.qs",nm[k]); tq[k]=st_find(&m->S,qn);
+        if(!tw[k]||!tq[k]){ fprintf(stderr,"manca %s\n",nm[k]); exit(1); }
+    }
+    if(tw[0]->znbytes>0){ expert_load(m,layer,eid,s); return; }
+    int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
+    int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
+    if(!s->slab || wtot+8192 > s->slab_cap){
+        free(s->slab);
+        if(posix_memalign((void**)&s->slab,4096,wtot+8192)){fprintf(stderr,"OOM slab\n");exit(1);}
+        s->slab_cap=wtot+8192; s->have=0;
+    }
+    if(!s->fslab || ftot > s->fslab_cap){ free(s->fslab); s->fslab=falloc(ftot); s->fslab_cap=ftot; s->have=0; }
+    int64_t wpos[3]={0, tw[0]->nbytes, tw[0]->nbytes+tw[1]->nbytes};
+    int64_t fpos[3]={0, tq[0]->nbytes/4, tq[0]->nbytes/4+tq[1]->nbytes/4};
+    int need=parts & ~s->have;
+    int64_t got=0;
+    for(int k=0;k<3;k++) if(need&(1<<k)){
+        if(pread(tw[k]->fd, s->slab+wpos[k], tw[k]->nbytes, tw[k]->off)!=tw[k]->nbytes){
+            perror("pread expert part"); exit(1); }
+        if(pread(tq[k]->fd, (char*)(s->fslab+fpos[k]), tq[k]->nbytes, tq[k]->off)!=tq[k]->nbytes){
+            perror("pread qs part"); exit(1); }
+        got+=tw[k]->nbytes;
+    }
+    QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D}, II[3]={D,D,I};
+    for(int k=0;k<3;k++) if((s->have|need)&(1<<k)){
+        int64_t nb=tw[k]->nbytes;
+        int fmt = (nb==(int64_t)OO[k]*II[k])?1 : (nb==(int64_t)OO[k]*((II[k]+1)/2))?2 : 3;
+        qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->qf=NULL;
+        qt[k]->q8=(int8_t*)(s->slab+wpos[k]); qt[k]->q4=s->slab+wpos[k]; qt[k]->s=s->fslab+fpos[k];
+    }
+    __sync_fetch_and_add(&m->io_bytes, got);
+    if(m->xp_disk) __sync_fetch_and_add(&m->xp_disk[(size_t)layer*c->n_experts+eid], (uint64_t)got);
+    s->eid=eid; s->have |= need;
+    (void)b;
 }
 
 /* Free host slabs after weights live on the GPU (complementary VRAM tier).
@@ -1594,7 +1763,7 @@ static void expert_prefetch_list(Model *m, int layer, const int *eids, int ne){
  * Measured on the WSL2/VHDX reference host: stall drops 43s->26s but expert-matmul
  * inflates 17s->30s (host-side I/O CPU shares the cores) -> wall-clock break-even
  * with T=4; the win materializes where I/O is DMA/latency-bound, not CPU-bound. */
-typedef struct { Model *m; int layer, eid; ESlot *slot; } OvJob;
+typedef struct { Model *m; int layer, eid, parts; ESlot *slot; } OvJob;
 static OvJob ov_job[64];
 static volatile int ov_done[64];
 static volatile unsigned ov_next=0, ov_total=0;   /* indici monotoni sul ring (1P/NC) */
@@ -1607,7 +1776,8 @@ static int ov_claim(unsigned idx_max){
     if(n>=t || n>idx_max) return 0;
     if(!__atomic_compare_exchange_n(&ov_next,&n,n+1,0,__ATOMIC_ACQ_REL,__ATOMIC_RELAXED)) return 1;
     OvJob *j=&ov_job[n&63];
-    expert_load(j->m,j->layer,j->eid,j->slot);
+    if(j->parts && j->parts!=7) expert_ensure(j->m,j->layer,j->eid,j->slot,j->parts);
+    else expert_load(j->m,j->layer,j->eid,j->slot);
     __atomic_store_n(&ov_done[n&63],1,__ATOMIC_RELEASE);
     return 1;
 }
@@ -1631,6 +1801,7 @@ static void *ov_worker(void *a){ (void)a;
  * Chiamato SOLO dal thread principale, e solo dopo che il blocco precedente e' stato
  * interamente consumato (ov_wait su tutti i suoi job) -> il ring non si sovrascrive. */
 static unsigned ov_submit(Model *m,int layer,const int *eids,const int *missk,int nmiss){
+    int ov_parts = (g_gate_first>0 && layer>=1 && layer<=g_gate_first) ? 1 : 7;
     if(!ov_started){
         for(int i=0;i<g_overlap_t;i++){ pthread_t t;
             if(pthread_create(&t,NULL,ov_worker,NULL)==0) pthread_detach(t); }
@@ -1644,7 +1815,7 @@ static unsigned ov_submit(Model *m,int layer,const int *eids,const int *missk,in
     }
     unsigned b=ov_total;
     for(int q=0;q<nmiss;q++){
-        OvJob j={m,layer,eids[missk[q]],&m->ws[q]};
+        OvJob j={m,layer,eids[missk[q]],ov_parts,&m->ws[q]};
         ov_job[(b+(unsigned)q)&63]=j;
         __atomic_store_n(&ov_done[(b+(unsigned)q)&63],0,__ATOMIC_RELAXED);
     }
@@ -1891,7 +2062,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         /* in-place sigmoid (colibri #43): reuse logit[], drop separate sig[] buffer */
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
+        /* LTOPK=n[,e]: trim estratificado (roadmap A0) — top-n solo en las capas
+         * MoE del medio; primeras/últimas `e` capas (default 4) conservan el top-K
+         * completo. §42: las capas tempranas comparten componente común y las del
+         * borde deciden el rumbo del residual; §40: speed ~lineal en experts/token. */
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
+        if(g_ltopk>0 && g_ltopk<Ksel && !(layer<=g_ltopk_e || layer>=c->n_layers-1-g_ltopk_e))
+            Ksel=g_ltopk;
         const uint8_t *km = g_ekeep_mask ? g_ekeep_mask+(size_t)layer*E : NULL;
         if(g_cache_route){
             /* Ranking completo dei top-Mwin per choice (EKEEP rispettato). */
@@ -1979,7 +2156,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     float *gpu_layer=NULL;   /* host buffer for moe_end result */
     if(g_cuda_enabled && g_cuda_ndev>0) coli_cuda_x_invalidate(g_cuda_devices[0]);
     /* S=1 + no contrib (normal decode): open device accumulate once with layer x. */
-    if(g_cuda_enabled && S==1 && !contrib && !omp_in_parallel()){
+    if(g_cuda_enabled && S==1 && !contrib && !omp_in_parallel() && !g_silu_hist){
         moe_dev = g_cuda_devices[0];
         if(coli_cuda_moe_begin(moe_dev, x, 1, D)){
             moe_open=1;
@@ -2012,7 +2189,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                                                   * consumano in ordine nel loop di calcolo */
             else { double t0=now_s();
                 #pragma omp parallel for schedule(dynamic,1)
-                for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q]);
+                for(int q=0;q<nmiss;q++){
+                    int lp=(g_gate_first>0 && layer>=1 && layer<=g_gate_first)?1:7;
+                    if(lp==1) expert_ensure(m,layer,uniq[base+missk[q]],&m->ws[q],1);
+                    else expert_load(m,layer,uniq[base+missk[q]],&m->ws[q]);
+                }
                 m->t_edisk += now_s()-t0; } }
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
          * questo — il kernel legge in background, le pread dopo trovano cache calda */
@@ -2075,8 +2256,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
             double t0=now_s();
 #ifdef COLI_CUDA
             { int fl=0;
+              int gf=g_gate_first>0 && layer>=1 && layer<=g_gate_first;
               if(cuda_x_live && (S==1 || nr==S)) fl=COLI_CUDA_SWIGLU_REUSE_X;
-              if(swiglu_qt(hh, xg, &e->g, &e->u, &e->d, nr, fl)){
+              if(!g_silu_hist && !gf && swiglu_qt(hh, xg, &e->g, &e->u, &e->d, nr, fl)){
                   if(S==1 || nr==S) cuda_x_live=1;
               } else
 #endif
@@ -2084,9 +2266,43 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
 #ifdef COLI_CUDA
               cuda_x_live=0;
 #endif
+              int gf=g_gate_first>0 && layer>=1 && layer<=g_gate_first;
+              if(gf){
+                  if((e->have&1)==0) expert_ensure(m,layer,uniq[base+j],e,1);
+                  matmul_qt(gg, xg, &e->g, nr);
+                  int live=0, tot=nr*I;
+                  for(int64_t z=0;z<(int64_t)tot;z++){
+                      float s=siluf(gg[z]);
+                      if(g_silu_hist) silu_hist_obs(layer,s);
+                      gg[z]=s;
+                      if(s<0) s=-s;
+                      if(s>=0.01f) live++;
+                  }
+                  g_gf_exp++;
+                  if(tot>0 && (float)live < g_gf_skip*(float)tot){
+                      g_gf_skipn++;
+                      g_gf_io_skip += (unsigned long long)(e->u.O>0 && (e->have&6)==6 ? 0 :
+                          (size_t)c->moe_inter*((c->hidden+1)/2)*2); /* ~up+down int4 bytes */
+                      memset(hh,0,(size_t)nr*(size_t)D*sizeof(float));
+                  } else {
+                      expert_ensure(m,layer,uniq[base+j],e,7);
+                      matmul_qt(uu, xg, &e->u, nr);
+                      for(int64_t z=0;z<(int64_t)tot;z++) gg[z]*=uu[z];
+                      matmul_qt(hh, gg, &e->d, nr);
+                  }
+              } else {
               gate_up_qt(gg, uu, xg, &e->g, &e->u, nr);
-              for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-              matmul_qt(hh, gg, &e->d, nr); }
+              if(g_silu_hist){
+                  for(int64_t z=0;z<(int64_t)nr*I;z++){
+                      float s=siluf(gg[z]);
+                      silu_hist_obs(layer, s);
+                      gg[z]=s*uu[z];
+                  }
+              } else
+                  for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+              matmul_qt(hh, gg, &e->d, nr);
+              }
+            }
 #ifdef COLI_CUDA
             }
 #endif
@@ -2230,6 +2446,7 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
     for(int s=0;s<S;s++) rmsnorm(nrm+(int64_t)s*D, x+(int64_t)s*D, l->post_ln, D, c->eps);
     if(l->sparse) moe(m,l,li,nrm,S,tmp); else dense_mlp(l,nrm,S,D,c->dense_inter,tmp);
     for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
+    if(g_resid_on && l!=&m->mtpL) resid_dump_layer(li,x,S,D);
 }
 static void layers_forward(Model *m, float *x, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
@@ -4108,6 +4325,18 @@ int main(int argc, char **argv){
     }
     if(g_i4_acc512) fprintf(stderr,"[I4_ACC512] kernel int4 AVX-512 attivo (non bit-identico all'ordine AVX2; §43)\n");
 #endif
+    g_silu_hist = getenv("SILU_HIST") && atoi(getenv("SILU_HIST"))!=0;
+    if(g_silu_hist) fprintf(stderr,"[SILU_HIST] |SiLU(gate·x)| on routed experts (CUDA fused SwiGLU off)\n");
+    if(getenv("GATE_FIRST")) g_gate_first=atoi(getenv("GATE_FIRST"));
+    if(getenv("GATE_SKIP")) g_gf_skip=(float)atof(getenv("GATE_SKIP"));
+    if(g_gate_first>0) fprintf(stderr,"[GATE_FIRST] L1-L%d skip up/down if live|SiLU| < %.3f\n",
+            g_gate_first, g_gf_skip);
+    { const char *rd=getenv("RESID_DUMP");
+      if(rd && *rd){
+          g_resid_on=1;
+          snprintf(g_resid_dir,sizeof(g_resid_dir),"%s",rd);
+          fprintf(stderr,"[RESID_DUMP] residual stream -> %s\n",g_resid_dir);
+      } }
     const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
     /* SERVE/chat: speed-oriented defaults (override with env). Oracle/TF keep exact path. */
     int serve_mode = getenv("SERVE") && atoi(getenv("SERVE"));
@@ -4134,6 +4363,14 @@ int main(int argc, char **argv){
     else g_prefetch = (serve_mode || (getenv("PILOT") && atoi(getenv("PILOT")))) ? 1 : 0;
     if(getenv("TOPK")) g_topk=atoi(getenv("TOPK"));
     else g_topk = 0;                             /* full topk; TOPK=6 optional (quality trade) */
+    if(getenv("LTOPK")){                         /* LTOPK=n[,edges] */
+        const char *e=getenv("LTOPK");
+        g_ltopk=atoi(e);
+        const char *comma=strchr(e,',');
+        if(comma) g_ltopk_e=atoi(comma+1);
+        if(g_ltopk<1) g_ltopk=0;
+        if(g_ltopk_e<0) g_ltopk_e=0;
+    }
     if(getenv("TOPP")) g_topp=atof(getenv("TOPP"));
     else g_topp = speed_mode ? 0.55 : 0;         /* SPEED: nucleus trim (measured stack) */
     g_mlock  = getenv("MLOCK")?atoi(getenv("MLOCK")):-1;   /* -1 auto (ON macOS), 0 off, 1 force / auto (ON macOS), 0 off, 1 force */
@@ -4164,8 +4401,13 @@ int main(int argc, char **argv){
     }
     /* REPIN: SERVE/SPEED 32; TAO Fibonacci 55 (softer thrash, sacred growth) */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):(tao_mode?55:(serve_mode||speed_mode?32:0));
+    /* MM_THREADS: cap de hilos solo en kernels GEMV (HT siblings penalizan AVX2 GEMV). */
+    if(getenv("MM_THREADS")) g_mm_threads=atoi(getenv("MM_THREADS"));
     g_memwatch = getenv("MEMWATCH")?atoi(getenv("MEMWATCH")):1;  /* #71: adapt ecap each SERVE turn */
-    /* Trajectory bulk WILLNEED: default ON for SERVE (multi-turn hit); off for oracle/TF */
+    /* Trajectory bulk WILLNEED: default ON for SERVE (multi-turn hit); off for oracle/TF.
+     * NOTA (2026-08-23): saltarlo en single-shot PROMPT se midió y PERDIÓ (0.65 vs
+     * 0.69 tok/s, hit 57% vs 71% con O_DIRECT+MM_THREADS): el warm paga aunque no haya
+     * turno siguiente. No reintentar sin cambiar el régimen de disco. */
     if(getenv("TRAJ")) g_traj=atoi(getenv("TRAJ"));
     else g_traj = (serve_mode || speed_mode || tao_mode) ? 1 : 0;
     if(getenv("TRAJ_K")){ g_traj_k=atoi(getenv("TRAJ_K")); if(g_traj_k<1)g_traj_k=1; if(g_traj_k>8)g_traj_k=8; }
@@ -4392,15 +4634,18 @@ int main(int argc, char **argv){
     const char *stats=getenv("STATS");   /* STATS=<file> -> istogramma uso expert a fine run */
 
     /* modo scoring per benchmark: SCORE=<requests.txt> -> log-likelihood per riga */
-    if(getenv("SCORE")){ run_score(&m, getenv("SCORE")); if(stats) stats_dump(&m,stats); return 0; }
+    if(getenv("SCORE")){ run_score(&m, getenv("SCORE")); silu_hist_report(); gate_first_report(); resid_dump_close(); if(stats) stats_dump(&m,stats); return 0; }
 
     /* modo serve persistente per la CLI 'coli': SERVE=1 */
-    if(getenv("SERVE")){ run_serve(&m, snap); if(stats) stats_dump(&m,stats); return 0; }
+    if(getenv("SERVE")){ run_serve(&m, snap); silu_hist_report(); gate_first_report(); resid_dump_close(); if(stats) stats_dump(&m,stats); return 0; }
 
     /* modo testo reale: PROMPT="..." [NGEN=n] -> tokenizza, genera, detokenizza */
     if(getenv("PROMPT")){
         int ngen=getenv("NGEN")?atoi(getenv("NGEN")):64;
         run_text(&m, snap, getenv("PROMPT"), ngen);
+        silu_hist_report();
+        gate_first_report();
+        resid_dump_close();
         if(stats) stats_dump(&m,stats);
         return 0;
     }

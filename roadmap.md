@@ -63,6 +63,25 @@ Even at **0.60 tok/s**:
 3. **traj_warm ~3.8 s** (AUX) — still non-trivial; try `TRAJ_WARM_EVERY=3` or off on single-shot.
 4. **WSL2 I/O CPU tax** (`findings` §18) — native Linux still on the path to 1.0.
 
+### §50 update (2026-08-23): MM_THREADS + DIRECT — REPLAY frío 0.21 → 0.56 (CPU→CUDA), 0.94 con SPEED
+
+- [x] **`MM_THREADS=n` landed** (mimo.c): cap de hilos solo en kernels GEMV.
+  HT siblings penalizaban el GEMV AVX2 ~4×; físico=8 → matmul −79% e2e.
+  Default en `start_peng.sh` vía lscpu. Bit-exact.
+- [x] **`DIRECT=1` re-medido: gana en frío** (disco −45%). Opt-in motor,
+  wrapper ya lo exporta. El note antiguo default-OFF está obsoleto.
+- [x] **CUDA_ATTN=1 vuelve a pagar e2e en frío** (+12-15% sobre CPU-only con
+  MM_THREADS+DIRECT): el cuello CPU que lo ocultaba desapareció. 0.56 tok/s.
+- [x] **SPEED=1 sobre ese stack: 0.94 tok/s frío** (REPLAY largo, TOPP=0.55,
+  costo ppl §40). Puerta 1.0 a un paso en este protocolo.
+- [x] **A/B pareado protocolo récord (§50.1): MM_THREADS +32% mediana también
+  caliente** (0.49 vs 0.37 mismo día). Récord 0.89 no superado hoy por deriva
+  de host (~2× lento); reintentar gate en día bueno.
+- [x] **DIRECT=1 malo en caliente** (page-cache bypass): solo frío/bench.
+- [x] **TRAJ off single-shot: REFUTADO** (0.65 vs 0.69; warm paga). Cerrado.
+- [x] **Grouped/batched expert GEMV (ítem E): desestimado** — tras MM_THREADS
+  el matmul es RAM-bandwidth-bound; agrupar no reduce bytes (§50.5).
+
 ## Next experiments (priority)
 
 ### A0. Quality-aware trim (from §40 matrix)

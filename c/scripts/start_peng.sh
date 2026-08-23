@@ -90,6 +90,13 @@ fi
 # High: room for DRAFT if user opts in; larger pin frac
 export SNAP
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc 2>/dev/null || echo 4)}"
+# MM_THREADS: cap hilos SOLO en kernels GEMV. HT siblings penalizan el GEMV AVX2
+# (~4x, medido 2026-08-23 en 8c/16t: matmul 27->7 s/12tok); I/O paralelo conserva
+# todos los hilos. Default: núcleos físicos.
+if [ -z "${MM_THREADS:-}" ]; then
+    PHYS=$(lscpu 2>/dev/null | awk -F: '/^Core\(s\) per socket/{c=$2} /^Socket\(s\)/{s=$2} END{print c*s}' | tr -d ' ')
+    export MM_THREADS="${MM_THREADS:-${PHYS:-}}"
+fi
 export OMP_WAIT_POLICY="${OMP_WAIT_POLICY:-passive}"
 export DIRECT="${DIRECT:-1}"
 export OVERLAP="${OVERLAP:-1}"
@@ -173,6 +180,7 @@ cmd_env() {
   cat <<EOF
 export SNAP=$(printf %q "$SNAP")
 export OMP_NUM_THREADS=$OMP_NUM_THREADS OMP_WAIT_POLICY=$OMP_WAIT_POLICY
+export MM_THREADS=$MM_THREADS
 export DIRECT=$DIRECT OVERLAP=$OVERLAP I4S=$I4S
 export COLI_CUDA=$COLI_CUDA CUDA_DENSE=$CUDA_DENSE
 export PILOT=$PILOT PILOT_DEPTH=$PILOT_DEPTH PREFETCH=$PREFETCH

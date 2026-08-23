@@ -58,3 +58,11 @@ c/tests/test_topp_heap
 c/tests/attn_bench
 c/tests/bench_topp
 
+
+# artefactos de runs / dirs de agente (2026-08-23)
+resid_out/
+resid_score.txt
+hive_score.txt
+hive_stats.txt
+.codebase-memory/
+.freetoken-wt/
