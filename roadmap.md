@@ -144,7 +144,10 @@ Even at **0.60 tok/s**:
   Blocked on finalist validation below.
 - [x] **Speed measured: UNION179 mask = median +16% tok/s** (0.51 vs 0.44
   same-day §37 pairs; best 0.55) — cache coverage of the smaller pool, exactly
-  in the predicted band. Quality-neutral speedup, stacks with everything.
+  in the predicted band. **OBSOLETO sobre el stack actual (§53.2):** con
+  MM_THREADS + tier VRAM + traj_warm, la máscara reconstruida (169 exp/capa,
+  calidad +7.3% prosa / +3.3% code) NO da ganancia e2e — hit-rate ya lo cubre
+  gpu_pin. Knob reservado para el play 128 GB / contenedor físico podado.
 - [ ] Finalist gates before physical container: broad 10–20k-token corpus,
   agreement@5/KL, router entropy stats, HumanEval subset; then pruned+zstd
   container (~75 GB)

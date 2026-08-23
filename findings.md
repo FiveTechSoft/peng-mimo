@@ -1898,3 +1898,31 @@ precedente que LTOPK; la copia PCIe pura domina el H2D, no los mallocs.
 
 Leccion: en dia de disco x2.4 lento, rechazar cualquier optimizacion cuya
 ganancia esperada sea <30% del wall - el ruido la sepulta.
+
+### 53.2 - UNION reconstruida: calidad OK pero YA no paga velocidad en el stack actual (2026-08-23)
+
+Los perfiles de dominio de §42 se perdieron con el WSL; reconstruidos con
+tokenizers puro (prose/code_c/code_py del script original + 4o perfil nuevo
+agent_chat = docs tecnicos). Union top-96 x4: **169.1 expertos/capa
+(97.8 GB equiv.)**, 7947 lineas de mascara.
+
+| gate ppl (corpus §53) | BASE | MASKED | delta |
+|---|---|---|---|
+| prosa | 9.82 | 10.54 | **+7.3%** (§42: +7.8% - consistente) |
+| codigo | 2.21 | 2.28 | **+3.3%** (§42: -1.8%; perfiles reconstruidos != originales) |
+| acuerdo top-1 | " | 78.2% / 90.5% | flips por poda |
+
+**Velocidad (A/B pareado tibio, stack completo CUDA): SIN ganancia** -
+BASE 0.30/0.32 vs MASK 0.31/0.31 tok/s; hit-rate 54-57% en ambos brazos.
+El +16% de §37/§42 se media sobre el stack viejo (sin MM_THREADS ni tier
+VRAM); hoy el gpu_pin (534 expertos residentes) + traj_warm ya cubren el
+conjunto caliente que la mascara redirige.
+
+Veredicto: EKEEP_MASK queda como knob para escenarios con presupuesto de
+RAM/disco (contenedor podado fisco, caja futura 128 GB full-RAM) o cargas
+donde el pin no alcance. NO se activa por defecto en start_peng.sh: costo de
+calidad seguro (+7.3% prosa) sin retorno medido en esta hardware.
+
+Leccion transversal reforzada: cada palanca del stack viejo hay que re-medirla
+despues de cambiar el regimen I/O; tres ya no pagan (DIRECT en tibio §50.1,
+grouped GEMV §50, UNION mask §53.2).
