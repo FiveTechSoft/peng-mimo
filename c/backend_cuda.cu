@@ -26,6 +26,7 @@ enum ProfKind { PK_GATE_UP = 0, PK_GEMV, PK_AXPY, PK_ATTN, PK_OTHER,
                 PK_H2D, PK_D2H, PK_NKIND };
 #define PROF_RING 8192                     /* covers a full 48-layer decode token */
 typedef struct { cudaEvent_t a, b; int kind; } ProfSeg;
+typedef struct { void *ptr; size_t bytes; int live; } DevPoolEnt;
 
 struct ColiCudaTensor {
     void *weights;
@@ -63,6 +64,11 @@ typedef struct {
     int pinned;
     float *pin_x, *pin_y;
     size_t pin_x_cap, pin_y_cap;
+    /* device memory pool (§53.1): el churn del LRU de expertos hacia
+     * cudaMalloc/cudaFree por subida (ambos sincronizan el device y miden ms).
+     * Free-list por puntero: reusar buffers liberados en vez de devolverlos. */
+    DevPoolEnt *pool;
+    int pool_n, pool_cap;
 } DeviceContext;
 
 static DeviceContext g_ctx[COLI_CUDA_MAX_DEVICES];
@@ -527,6 +533,50 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
     return 1;
 }
 
+/* ---- device memory pool (§53.1): free-list por puntero --------------------
+ * El LRU de expertos evicta con cudaFree y re-subida hace cudaMalloc: ambas
+ * sincronizan el device y aparecen dentro del tiempo H2D medido. Pool simple:
+ * dev_palloc devuelve un buffer liberado del tamaño pedido (o el menor que
+ * cubra); dev_pfree lo guarda. Sin expiración: los tamaños de experto son
+ * fijos por geometría, el pool converge a unos pocos buffers vivos.
+ * COLI_CUDA_NO_POOL=1 para comparar contra el camino antiguo. */
+static int pool_disabled(void) {
+    static int dis = -1;
+    if (dis < 0) {
+        const char *e = getenv("COLI_CUDA_NO_POOL");
+        dis = (e && atoi(e)) ? 1 : 0;
+    }
+    return dis;
+}
+static void *dev_palloc(DeviceContext *ctx, size_t bytes) {
+    if (pool_disabled()) { void *p = nullptr;
+        if (!cuda_ok(cudaMalloc(&p, bytes), "tensor allocation")) return nullptr;
+        return p; }
+    int best = -1;
+    for (int i = 0; i < ctx->pool_n; i++)
+        if (!ctx->pool[i].live && ctx->pool[i].bytes >= bytes &&
+            (best < 0 || ctx->pool[i].bytes < ctx->pool[best].bytes)) best = i;
+    if (best >= 0) { ctx->pool[best].live = 1; return ctx->pool[best].ptr; }
+    void *p = nullptr;
+    if (!cuda_ok(cudaMalloc(&p, bytes), "tensor allocation")) return nullptr;
+    if (ctx->pool_n == ctx->pool_cap) {
+        int nc = ctx->pool_cap ? ctx->pool_cap * 2 : 64;
+        DevPoolEnt *np = static_cast<DevPoolEnt *>(std::realloc(ctx->pool, (size_t)nc * sizeof(*np)));
+        if (!np) return p;                       /* buffer usable; solo no queda registrado */
+        ctx->pool = np; ctx->pool_cap = nc;
+    }
+    ctx->pool[ctx->pool_n].ptr = p; ctx->pool[ctx->pool_n].bytes = bytes;
+    ctx->pool[ctx->pool_n].live = 1; ctx->pool_n++;
+    return p;
+}
+static void dev_pfree(DeviceContext *ctx, void *ptr) {
+    if (!ptr) return;
+    if (!ctx || pool_disabled()) { cudaFree(ptr); return; }
+    for (int i = 0; i < ctx->pool_n; i++)
+        if (ctx->pool[i].ptr == ptr && ctx->pool[i].live) { ctx->pool[i].live = 0; return; }
+    cudaFree(ptr);                               /* no registrado (p.ej. pool lleno al registrar) */
+}
+
 static int reserve_pin(float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) return 1;
     if (*ptr) cudaFreeHost(*ptr);
@@ -728,6 +778,11 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->yacc) cudaFree(ctx->yacc);
         ctx->x = ctx->y = ctx->ma = ctx->mb = ctx->yacc = nullptr;
         ctx->x_cap = ctx->y_cap = ctx->ma_cap = ctx->mb_cap = ctx->yacc_cap = 0;
+        /* pool: liberar los libres; los vivos los liberará su tensor_free
+         * posterior (find_ctx falla -> cudaFree directo, sin doble free). */
+        for (int pi = 0; pi < ctx->pool_n; pi++)
+            if (ctx->pool[pi].ptr && !ctx->pool[pi].live) cudaFree(ctx->pool[pi].ptr);
+        std::free(ctx->pool); ctx->pool = nullptr; ctx->pool_n = ctx->pool_cap = 0;
         ctx->stream = nullptr;
         ctx->sticky_valid = 0;
         ctx->moe_active = 0;
@@ -772,10 +827,11 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
     ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
     if (!t) return 0;
     t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->weight_bytes = rb * (size_t)O;
-    /* Synchronous uploads (pin-time residency): host time ~= copy time. */
+    /* Synchronous uploads (pin-time residency): host time ~= copy time.
+     * El buffer device viene del pool (§53.1): sin cudaMalloc por re-subida. */
     double up_t0 = ctx->prof ? now_s() : 0.0;
-    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation") ||
-        !cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
+    t->weights = dev_palloc(ctx, t->weight_bytes);
+    if (!t->weights || !cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
         coli_cuda_tensor_free(t);
         return 0;
     }
@@ -785,7 +841,8 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         ctx->p_h2d_bytes += t->weight_bytes;
     }
     if (fmt) {
-        if (!cuda_ok(cudaMalloc(&t->scales, (size_t)O * sizeof(float)), "scale allocation") ||
+        t->scales = static_cast<float *>(dev_palloc(ctx, (size_t)O * sizeof(float)));
+        if (!t->scales ||
             !cuda_ok(cudaMemcpy(t->scales, scales, (size_t)O * sizeof(float), cudaMemcpyHostToDevice), "scale upload")) {
             coli_cuda_tensor_free(t);
             return 0;
@@ -1005,8 +1062,8 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
-    if (tensor->weights) cudaFree(tensor->weights);
-    if (tensor->scales) cudaFree(tensor->scales);
+    if (tensor->weights) dev_pfree(ctx, tensor->weights);
+    if (tensor->scales) dev_pfree(ctx, tensor->scales);
     std::free(tensor);
 }
 

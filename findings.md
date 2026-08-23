@@ -1872,3 +1872,29 @@ Hallazgos:
 
 Veredicto: el stack completo MM_THREADS+DIRECT(frio)+CUDA es quality-neutral
 o mejor. Sin gates abiertas para el stack de produccion actual.
+
+### 53.1 - Perfil tibio del camino GPU + experimento pool device (2026-08-23)
+
+Datos (COLI_CUDA_PROF=1, 16 tok, tibio, stack completo):
+
+- **A/B pareado CPU vs GPU mismo minuto: GPU gana +63%** (0.335 vs 0.205
+  tok/s mediana). El mecanismo no es solo compute: el tier VRAM duplica el
+  hit-rate (36% -> 60%) y corta expert-disk a la mitad (30-36 s -> 14.5 s).
+  CUDA confirmado para chat tibio tambien en dia lento.
+- H2D: ~11.5 GB por 16 tokens en ~4700 transfers de ~2 MB a **1.07-1.49 GB/s
+  efectivos** - la copia PCIe es el piso del camino GPU (~9-11 s/run). D2H:
+  micro-copias por capa (0.14 GB, ~1 s) - item D sigue siendo pequeno.
+- **Deriva del host cuantificada**: NVMe random 19 MB hoy = 1.06-1.18 GB/s vs
+  2.75 GB/s documentados (x2.4 lento). Runs absolutos de hoy inutilizables;
+  solo comparaciones pareadas mismo-minuto cuentan. Wall mismo config oscilo
+  47-82 s.
+
+Experimento pool de memoria device (backend_cuda): cudaMalloc/cudaFree por
+eviction/re-subida del LRU reemplazados por free-list por puntero
+(COLI_CUDA_NO_POOL=1 para comparar). Bit-exacto verificado (texto greedy
+identico). **Ganancia NO medible sobre el ruido de hoy** (medianas 0.265 vs
+0.24) - se conserva como infraestructura neutral con knob de escape, mismo
+precedente que LTOPK; la copia PCIe pura domina el H2D, no los mallocs.
+
+Leccion: en dia de disco x2.4 lento, rechazar cualquier optimizacion cuya
+ganancia esperada sea <30% del wall - el ruido la sepulta.
