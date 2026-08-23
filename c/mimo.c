@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kv_cache.h"                            /* FreeToken PoC: cache KV en host (issue #7) */
 #include <stdarg.h>
 #include <math.h>
 #include <time.h>
@@ -2578,6 +2579,82 @@ static void attn_dev_sync_rows(Model *m, int layer, int p0, int p1){
 }
 
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
+
+/* --- FreeToken PoC port (issue #7): cache KV en host para MiMo ------------
+ * Igual que glm.c pero con KV GQA: K[layer][max_t, kvh*hd], V[layer][max_t,
+ * kvh*vd]; full lineal por posición, SWA anillo vía kv_phys. Convención de
+ * rango guardado: la capa i guarda las posiciones lógicas [upto-rows_i, upto)
+ * en orden; rows_i = upto (full) o min(upto, sliding_window) (SWA).
+ * La fila KV del MTP (índice n_layers) se excluye: nace en decode.
+ * Lossless: restore = memcpy de lo que el propio prefill escribió. */
+static void prompt_hash(const int *ids, int n, char *out, size_t outlen){
+    uint64_t h=14695981039346656037ULL;
+    for(int i=0;i<n;i++){ uint32_t v=(uint32_t)ids[i];
+        for(int b=0;b<4;b++){ uint8_t ch=(v>>(b*8))&0xFF; h^=ch; h*=1099511628211ULL; } }
+    snprintf(out,outlen,"%016llx",(unsigned long long)h);
+}
+static int try_save_kv_to_cache(Model *m, const int *ids, int n){
+    if(!ids||n<=0||!m->K||!m->V) return 0;
+    Cfg *c=&m->c; int NL=c->n_layers;
+    int upto=n; if(upto>m->max_t) upto=m->max_t;
+    int rows[128],wk[128],wv[128];
+    const float *Ks[128],*Vs[128];
+    float *swak[128]={0},*swav[128]={0};
+    const char *snap=getenv("SNAP"); const char *model_id=snap?snap:"unknown";
+    char prompt_id[32]; prompt_hash(ids,upto,prompt_id,sizeof(prompt_id));
+    for(int i=0;i<NL;i++){
+        int W=c->is_swa[i]&&c->sliding_window>0 ? c->sliding_window : 0;
+        int from=W? (upto>W? upto-W:0) : 0;
+        rows[i]=upto-from;
+        wk[i]=lyr_kvh(c,i)*lyr_hd(c,i); wv[i]=lyr_kvh(c,i)*lyr_vd(c,i);
+        if(from==0){                            /* full: layout lineal ya contiguo */
+            Ks[i]=m->K[i]; Vs[i]=m->V[i];
+        } else {                                /* SWA: recopilar el rango lógico */
+            swak[i]=falloc((int64_t)rows[i]*wk[i]); swav[i]=falloc((int64_t)rows[i]*wv[i]);
+            for(int p=from;p<upto;p++){
+                int pp=kv_phys(c,i,p,m->max_t);
+                memcpy(swak[i]+(int64_t)(p-from)*wk[i], m->K[i]+(int64_t)pp*wk[i], wk[i]*sizeof(float));
+                memcpy(swav[i]+(int64_t)(p-from)*wv[i], m->V[i]+(int64_t)pp*wv[i], wv[i]*sizeof(float));
+            }
+            Ks[i]=swak[i]; Vs[i]=swav[i];
+        }
+    }
+    int ok=kv_cache_put(model_id,prompt_id,NL,rows,wk,wv,Ks,Vs);
+    for(int i=0;i<NL;i++){ free(swak[i]); free(swav[i]); }
+    return ok;
+}
+static int try_restore_kv_from_cache(Model *m, const int *ids, int n){
+    if(!ids||n<=0||!m->K||!m->V) return 0;
+    Cfg *c=&m->c; int NL=c->n_layers;
+    int upto=n; if(upto>m->max_t) upto=m->max_t;
+    char prompt_id[32]; prompt_hash(ids,upto,prompt_id,sizeof(prompt_id));
+    const char *snap=getenv("SNAP"); const char *model_id=snap?snap:"unknown";
+    int n_layer=0,*rows=NULL,*wk=NULL,*wv=NULL; float **Ks=NULL,**Vs=NULL;
+    if(!kv_cache_get(model_id,prompt_id,&n_layer,&rows,&wk,&wv,&Ks,&Vs)){
+        free(rows);free(wk);free(wv);free(Ks);free(Vs); return 0; }
+    int ok=n_layer>=NL;
+    for(int i=0;ok&&i<NL;i++){
+        int W=c->is_swa[i]&&c->sliding_window>0 ? c->sliding_window : 0;
+        int need=W? (upto>W? W:upto) : upto;
+        ok = rows[i]>=need && wk[i]==lyr_kvh(c,i)*lyr_hd(c,i) && wv[i]==lyr_kvh(c,i)*lyr_vd(c,i);
+    }
+    if(ok) for(int i=0;i<NL;i++){
+        int W=c->is_swa[i]&&c->sliding_window>0 ? c->sliding_window : 0;
+        int from=W? (upto>W? upto-W:0) : 0;
+        /* la cache guarda [upto-rows_i, upto); copiar desde donde empieza a servirnos */
+        int off=rows[i]-(upto-from);
+        for(int p=from;p<upto;p++){
+            int pp=kv_phys(c,i,p,m->max_t), src=p-from+off;
+            memcpy(m->K[i]+(int64_t)pp*wk[i], Ks[i]+(int64_t)src*wk[i], wk[i]*sizeof(float));
+            memcpy(m->V[i]+(int64_t)pp*wv[i], Vs[i]+(int64_t)src*wv[i], wv[i]*sizeof(float));
+        }
+        m->kv_start[i]=from;                    /* KV válida desde aquí */
+        attn_dev_sync_rows(m,i,from,upto);      /* espejo CUDA_ATTN si está activo */
+    }
+    free(rows);free(wk);free(wv);free(Ks);free(Vs);
+    return ok;
+}
+
 static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
@@ -2778,6 +2855,12 @@ static void stops_arm(const Cfg *c, int tok_eos, int tok_eos2){
  * all: storia token (capacita' >= kv+n_new+g_draft+2), kv = token gia' in KV.
  * logit = logits della posizione kv-1 (dal prefill); viene liberato qui.
  * emit(tok,ud) per ogni token emesso. Ritorna i token emessi; *kv_out = nuova kv. */
+/* FREETOKEN=1 (issue #7, port del PoC de glm.c): cache KV en RAM host para
+ * prefill por prefijo exacto de prompt. FREETOKEN_BENCH=1: self-check tras MISS.
+ * Lossless: restore = memcpy exacto; fallback siempre a recomputar. */
+static int g_freetoken=0;
+static int g_ft_bench=0;
+
 /* ---- SpeQ governor (§51, arxiv 2511.14102 adaptado): bandido de dos brazos ----
  * El draft solo paga si el host lo permite; la varianza térmica/disco decide más
  * que cualquier umbral fijo (§50.2: 0.23-0.50 con draft vs 0.49 sin, mismo día).
@@ -3096,7 +3179,37 @@ static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     m->t_edisk=m->t_emm=m->t_attn=m->t_head=0;
     m->t_traj_warm=m->t_pathpack=m->t_persist=0;
     double t=now_s();
-    float *logit=step(m,pids,np,0);
+    float *logit=NULL;
+    if(g_freetoken){
+        /* FreeToken PoC (issue #7): prefill via cache KV sobre prefijo exacto.
+         * HIT -> restaura K/V y forward solo del último token (mismos logits).
+         * MISS -> prefill lleno + save. Fallback siempre a recomputar. */
+        double tp=now_s();
+        if(try_restore_kv_from_cache(m,pids,np)){
+            logit=step(m,pids+np-1,1,np-1);
+            fprintf(stderr,"[FREETOKEN] HIT: prefill de %d token via cache en %.3fs\n",np,now_s()-tp);
+        } else {
+            logit=step(m,pids,np,0);
+            double tm=now_s()-tp;
+            int saved=try_save_kv_to_cache(m,pids,np);
+            fprintf(stderr,"[FREETOKEN] MISS: prefill lleno %.3fs (save=%d)\n",tm,saved);
+            if(g_ft_bench && saved){            /* self-check: repetir via cache y comparar */
+                float *ref=falloc(c->vocab); memcpy(ref,logit,c->vocab*sizeof(float));
+                kv_alloc(m,np+ngen+g_draft+2);  /* buffers frescos: la prueba es la cache */
+                double th=now_s();
+                int hit=try_restore_kv_from_cache(m,pids,np);
+                free(logit); logit=step(m,pids+np-1,1,np-1);
+                double dmax=0; int am_ref=0, am_hit=0;
+                for(int i=0;i<c->vocab;i++){ double d=fabs(logit[i]-ref[i]); if(d>dmax)dmax=d;
+                    if(ref[i]>ref[am_ref])am_ref=i; if(logit[i]>logit[am_hit])am_hit=i; }
+                fprintf(stderr,"[FREETOKEN] BENCH: miss %.3fs | hit %.3fs (restore=%d) | speedup %.2fx | "
+                               "max|logit diff| %.3g sobre %d | argmax %s (%d vs %d)\n",
+                               tm,now_s()-th,hit, tm/(now_s()-th),dmax,c->vocab,
+                               am_ref==am_hit?"OK":"DIFERENTE",am_hit,am_ref);
+                free(ref);
+            }
+        }
+    } else logit=step(m,pids,np,0);
     EmitStream es={&T,m,t,0,0};
     int produced=spec_decode(m,all,np,ngen,eos,logit,emit_stream,&es,NULL);
     double dt=now_s()-t;
@@ -3953,7 +4066,19 @@ static void run_serve(Model *m, const char *snap){
         int cur=req_ngen; if(len+k+cur+g_draft+2>=maxctx) cur=maxctx-len-k-g_draft-2;
         uint64_t h0=m->hits, ms0=m->miss; double tt0=now_s();
         float *logit;
-        if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
+        if(k>0){
+            /* FreeToken PoC: conversación desde cero (len==0) — HIT si este turno
+             * idéntico ya se prefilló antes (RAM o disco .kvc). Sólo caso fresh:
+             * los turnos con prefijo vivo ya los sirve la KV persistente. */
+            if(len==0 && g_freetoken && try_restore_kv_from_cache(m,hist,k)){
+                fprintf(stderr,"[FREETOKEN] HIT serve: prefill de %d token via cache\n",k);
+                logit=step(m,hist+k-1,1,k-1); len+=k;
+            } else {
+                logit=step(m,hist+len,k,len); len+=k;
+                if(len==k && g_freetoken && !try_save_kv_to_cache(m,hist,len))
+                    fprintf(stderr,"[FREETOKEN] MISS serve: save fallo\n");
+            }
+        }
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;
@@ -4443,6 +4568,16 @@ int main(int argc, char **argv){
     if(getenv("DRAFT")) g_draft=atoi(getenv("DRAFT"));
     else if(tao_mode) g_draft=0;                 /* TAO: do not force MTP draft on cold disk */
     else g_draft=-1;                             /* -1 = auto after load (MTP head -> often 0) */
+    /* FreeToken PoC (issue #7): cache KV host-side. FREETOKEN_CACHE_GB cap en RAM
+     * (default 8); el tier disco vive bajo SNAP (.kvc), persiste entre procesos. */
+    g_freetoken = getenv("FREETOKEN")?atoi(getenv("FREETOKEN")):0;
+    g_ft_bench  = getenv("FREETOKEN_BENCH")?atoi(getenv("FREETOKEN_BENCH")):0;
+    if(g_ft_bench) g_freetoken=1;
+    if(g_freetoken){
+        double gb=getenv("FREETOKEN_CACHE_GB")?atof(getenv("FREETOKEN_CACHE_GB")):8.0;
+        kv_cache_init((size_t)(gb*(double)(1<<30)));
+        if(snap) kv_cache_set_dir(snap);
+    }
     /* SpeQ governor §51: bandido draft on/off por EMA ms/token. SPEC_ADAPT=0
      * vuelve al comportamiento fijo; SPEC_PROBE=n pasos por ventana de sondeo. */
     g_spec_adapt = getenv("SPEC_ADAPT")?atoi(getenv("SPEC_ADAPT")):1;

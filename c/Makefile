@@ -55,8 +55,8 @@ all: mimo
 glm: glm.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
 	$(CC) $(CFLAGS) glm.c $(CUDA_OBJ) -o glm $(LDFLAGS)
 
-mimo: mimo.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
-	$(CC) $(CFLAGS) $(CPPFLAGS) mimo.c $(CUDA_OBJ) -o mimo $(LDFLAGS)
+mimo: mimo.c kv_cache.c st.h json.h tok.h tok_unicode.h compat.h $(CUDA_OBJ)
+	$(CC) $(CFLAGS) $(CPPFLAGS) mimo.c kv_cache.c $(CUDA_OBJ) -o mimo $(LDFLAGS)
 
 backend_cuda.o: backend_cuda.cu backend_cuda.h
 	@command -v $(NVCC) >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }

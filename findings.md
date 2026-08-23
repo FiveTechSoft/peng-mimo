@@ -1768,3 +1768,38 @@ Lección transversal: con matmul arreglado (MM_THREADS) el régimen frío queda
 apenas se notan porque la sesión de disco por token ya está saturada; las únicas
 vías restantes son más hit-rate (RAM/UNION179/nativo Linux) o menos bytes/token
 (contenedor int2/zstd-repack, ya medidos en §41/A2).
+
+### 52. FreeToken KV-cache portado a mimo — prefill repetido 21.6× (2026-08-23)
+
+Puerto del PoC de `feature/freetoken-poc` (issue #7, glm.c) al motor MiMo.
+`FREETOKEN=1` (default OFF): cache KV host-side con tier disco (.kvc bajo SNAP);
+prompt con prefijo exacto repetido → HIT restaura K/V y forwarda solo el último
+token. `FREETOKEN_BENCH=1`: self-check MISS→HIT con comparación de logits.
+
+Adaptación GLM→MiMo: KV GQA por capa (K[max_t,kvh·hd], V[max_t,kvh·vd]), full
+lineal / SWA anillo vía kv_phys; convención de rango [upto−rows_i, upto); fila
+KV del MTP excluida; espejo CUDA_ATTN resincronizado tras restore
+(attn_dev_sync_rows). Makefile compila kv_cache.c.
+
+Medido (311B real, CPU, cold):
+
+| prompt | MISS prefill | HIT (restore+1 fw) | speedup | argmax |
+|---|---|---|---|---|
+| 32 tok | 28.9 s | 17.9 s | 1.6× | idem texto |
+| 289 tok | **92.8 s** | **4.3 s** | **21.6×** | OK |
+
+Notas honestas:
+
+1. **No bit-exact a nivel de logit**: max|diff| ~1–3/152576 por el orden de
+   acumulación batch-union del MoE (S=np vs S=1) y el skip GATE_FIRST — mismo
+   fenómeno que el PoC GLM (~0.45). El argmax puede flipar en near-ties
+   (visto 1 vez en 2 tests). Opt-in, precedentemente igual que CUDA_ATTN.
+2. La victoria escala con la longitud del prompt: con prompts cortos el
+   batch-union del propio prefill ya amortiza; con prompts de agente (500-4000
+   tokens re-enviados cada turno) es donde paga — exactamente el caso de uso
+   "agentic state reuse" del paper (2608.16157).
+3. Capas SWA: sólo se restauran las últimas min(n,W=128) posiciones (el resto
+   del anillo es historia que la ventana nunca consulta); kv_start ajustado.
+
+Pendiente: capa semántica ANN (near-duplicate prompts) — tools/kv_index_build.py
+ya existe en la rama PoC; wire al runtime como paso siguiente.
