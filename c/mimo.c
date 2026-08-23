@@ -4091,6 +4091,11 @@ static void run_serve(Model *m, const char *snap){
             (dh+dm)>0?100.0*dh/(dh+dm):0.0, rss_gb(), prompt_tokens, prod>=cur);
         fflush(stdout);
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
+        /* FreeToken PoC: guardar KV al cierre de CADA turno (no sólo fresh).
+         * Reiniciar el proceso o hacer RESET y repetir el contexto = HIT
+         * instantáneo. Lossless: entrada claveada por hist[0..len). */
+        if(g_freetoken && len>0 && try_save_kv_to_cache(m,hist,len))
+            fprintf(stderr,"[FREETOKEN] turno guardado en cache (%d token)\n",len);
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
         mem_watch_pass(m);               /* #71: dynamic LRU to free/grow RAM between turns */
         repin_pass(m);                   /* also re-pin after full turns (was MORE-only) */

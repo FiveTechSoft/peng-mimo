@@ -1803,3 +1803,24 @@ Notas honestas:
 
 Pendiente: capa semántica ANN (near-duplicate prompts) — tools/kv_index_build.py
 ya existe en la rama PoC; wire al runtime como paso siguiente.
+
+#### 52.1 — SERVE: guardado por turno + HIT cross-restart/cross-process
+
+Extensión del puerto: `run_serve` ahora guarda el KV al cierre de CADA turno
+(no sólo conversación fresca). Casos que quedan cubiertos:
+
+| escenario | resultado medido (311B real, cold) |
+|---|---|
+| mismo proceso: `\x02PROMPT` + RESET + reenvío idéntico | **HIT serve** — turno 0.07→0.30 tok/s (~4×) |
+| **proceso nuevo** (restart), primer turno idéntico | **HIT serve desde disco (.kvc)** — cero prefill |
+
+Descartes con datos antes de codificar:
+
+- **Capa semántica ANN inválida para KV**: restaurar K/V de un prompt *parecido*
+  pero no igual es incorrecto (las posiciones corresponden a tokens concretos);
+  y un prefijo parcial choca con el anillo SWA (sólo retiene las últimas W=128
+  posiciones → no puede servir prefijos más cortos que el guardado). Lo lossless
+  es prefijo EXACTO completo — que ya cubre el caso agente (re-envío de contexto).
+- Trampa de test detectada: printf de dash no expande `\xNN` — usar octal
+  (`\002`) en los scripts de protocolo SERVE, o todos los turnos van a modo
+  interactivo y el test mide otra cosa.
