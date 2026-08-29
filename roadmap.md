@@ -63,6 +63,25 @@ Even at **0.60 tok/s**:
 3. **traj_warm ~3.8 s** (AUX) — still non-trivial; try `TRAJ_WARM_EVERY=3` or off on single-shot.
 4. **WSL2 I/O CPU tax** (`findings` §18) — native Linux still on the path to 1.0.
 
+### §50 update (2026-08-23): MM_THREADS + DIRECT — REPLAY frío 0.21 → 0.56 (CPU→CUDA), 0.94 con SPEED
+
+- [x] **`MM_THREADS=n` landed** (mimo.c): cap de hilos solo en kernels GEMV.
+  HT siblings penalizaban el GEMV AVX2 ~4×; físico=8 → matmul −79% e2e.
+  Default en `start_peng.sh` vía lscpu. Bit-exact.
+- [x] **`DIRECT=1` re-medido: gana en frío** (disco −45%). Opt-in motor,
+  wrapper ya lo exporta. El note antiguo default-OFF está obsoleto.
+- [x] **CUDA_ATTN=1 vuelve a pagar e2e en frío** (+12-15% sobre CPU-only con
+  MM_THREADS+DIRECT): el cuello CPU que lo ocultaba desapareció. 0.56 tok/s.
+- [x] **SPEED=1 sobre ese stack: 0.94 tok/s frío** (REPLAY largo, TOPP=0.55,
+  costo ppl §40). Puerta 1.0 a un paso en este protocolo.
+- [x] **A/B pareado protocolo récord (§50.1): MM_THREADS +32% mediana también
+  caliente** (0.49 vs 0.37 mismo día). Récord 0.89 no superado hoy por deriva
+  de host (~2× lento); reintentar gate en día bueno.
+- [x] **DIRECT=1 malo en caliente** (page-cache bypass): solo frío/bench.
+- [x] **TRAJ off single-shot: REFUTADO** (0.65 vs 0.69; warm paga). Cerrado.
+- [x] **Grouped/batched expert GEMV (ítem E): desestimado** — tras MM_THREADS
+  el matmul es RAM-bandwidth-bound; agrupar no reduce bytes (§50.5).
+
 ## Next experiments (priority)
 
 ### A0. Quality-aware trim (from §40 matrix)
@@ -100,6 +119,16 @@ Even at **0.60 tok/s**:
 - [x] **Expert redundancy measured (§42.1): no near-duplicate experts** (mid/late
   layers orthogonal, cos < 0.07) — intra-layer merging is out. Early layers share
   a common component (delta-coding candidate, marginal).
+- [x] **Shared-basis/low-rank SVD measured (§48, issue #4): REJECTED with data.**
+  Expert deltas are near full-rank (k95 ≈ 225-241/256, layers 1/24/46),
+  functional SwiGLU error 96-100% at affordable ranks, 39-81% even at rank-128,
+  and rank ≥ 32 costs more bytes than int4. No compression knee. Clustering
+  equally flat. Only the early-layer centroid is real — zstd already gets it.
+  Tools: `scripts/expert_svd.py`, `c/tools/analyze_experts.py` (PR #5).
+- [x] **Markov predictability measured (§48.4, issue #6):** real `.coli_traj`
+  top-4 coverage ≈ 77-80%, ~5.5 effective successors — useful complement
+  (already exploited by TRAJ), not the simulated regime-change. Tool:
+  `scripts/traj_analysis.py`.
 - [x] **Usage long-tail measured (§42.2):** only 2.5% of experts unused (3.7 GB);
   Gini 0.615. Keep-192 covers 98.4% of historical calls.
 - [x] **EKEEP=n runtime prune landed** (mask by usage rank, zero disk, reversible)
@@ -115,7 +144,10 @@ Even at **0.60 tok/s**:
   Blocked on finalist validation below.
 - [x] **Speed measured: UNION179 mask = median +16% tok/s** (0.51 vs 0.44
   same-day §37 pairs; best 0.55) — cache coverage of the smaller pool, exactly
-  in the predicted band. Quality-neutral speedup, stacks with everything.
+  in the predicted band. **OBSOLETO sobre el stack actual (§53.2):** con
+  MM_THREADS + tier VRAM + traj_warm, la máscara reconstruida (169 exp/capa,
+  calidad +7.3% prosa / +3.3% code) NO da ganancia e2e — hit-rate ya lo cubre
+  gpu_pin. Knob reservado para el play 128 GB / contenedor físico podado.
 - [ ] Finalist gates before physical container: broad 10–20k-token corpus,
   agreement@5/KL, router entropy stats, HumanEval subset; then pruned+zstd
   container (~75 GB)
@@ -181,13 +213,22 @@ Cycle-based; each cycle gated by the profiler data of the previous one.
 - [x] **B4 scales warp-shuffle / B5 `xg` indexed input: measured, closed as
   non-actionable** in decode S=1 (GEMV is weight-traffic-bound; `xg` is one
   16 KB memcpy vs ~2–4 ms CPU GEMV)
-- [ ] **REPLAY e2e baseline + benchmark matrix: BLOCKED** — model snapshot
-  (~152 GB) not on this box since the OS reinstall; needs mount/download
+- [x] **REPLAY e2e baseline + benchmark matrix (§49, 2026-08-22):** model
+  mounted in WSL. Cold-regime pole split: CPU expert matmul 49%, disk 37%,
+  attn 5%, other 8%. CUDA+REPIN=32 does NOT pay e2e when cold (0.18 vs 0.20
+  CPU); SPEED=1 (TOPP=0.55) is the big lever (0.38, +90-110%). Trap found:
+  REPIN=0 outside SERVE/SPEED → empty GPU tier; kernel comparisons need
+  explicit REPIN/ENERGY.
 
 ### Cycle 2 — next (needs the model mounted)
 
-- [ ] REPLAY baseline with profiler: per-layer CSV audit, find the real pole
-  split (disk vs CPU-expert-matmul vs GPU vs sync)
+- [ ] **REORDERED per §49 pole split:** E first (grouped/batched expert GEMV
+  attacks the 49% CPU matmul), then real VRAM residency (fill the 12 GB, not
+  REPIN=32), then C/D (async H2D / hidden-state residency only touch the ~8%
+  sync overhead in cold regime).
+
+- [x] REPLAY baseline with profiler: per-layer CSV audit, find the real pole
+  split — done in §49 (CPU matmul 49% / disk 37% / attn 5% / other 8% cold)
 - [ ] C: async expert H2D — upload stream + compute stream + CUDA events +
   residency state machine (UNLOADED→UPLOADING→READY→IN_USE); re-test the
   multi-stream non-goal with pinned buffers (§27 test predates them)

@@ -1,0 +1,24 @@
+{"id": "c-mem-001", "prompt": "Write a C function that implements a simple arena allocator: arena_create(capacity), arena_alloc(arena, size) with alignment, arena_reset, arena_destroy. Only standard library.", "tags": ["memory"]}
+{"id": "c-mem-002", "prompt": "Write a C function that detects a memory leak pattern: given a log of malloc/free pointer events (as an array of structs), report pointers never freed.", "tags": ["memory", "debug"]}
+{"id": "c-str-001", "prompt": "Write a C function that tokenizes a string by whitespace into an array of strings, without modifying the input, with proper cleanup function.", "tags": ["strings"]}
+{"id": "c-str-002", "prompt": "Write a C function that converts between UTF-8 and UTF-32 codepoints (encode and decode a single codepoint), handling invalid sequences safely.", "tags": ["strings", "unicode"]}
+{"id": "c-ds-001", "prompt": "Write a C hash table with open addressing, linear probing, string keys and void* values: create, set, get, delete, destroy.", "tags": ["datastructures"]}
+{"id": "c-ds-002", "prompt": "Write a C dynamic array (vector) of ints with push, pop, reserve, and amortized O(1) growth. Include shrink_to_fit.", "tags": ["datastructures"]}
+{"id": "c-io-001", "prompt": "Write a C function that memory-maps a file read-only (POSIX mmap) with a fallback to fread, exposing the same interface.", "tags": ["io"]}
+{"id": "c-io-002", "prompt": "Write a C function that reads a little-endian uint64 and a varint from a byte buffer with bounds checking, advancing a cursor.", "tags": ["io", "binary"]}
+{"id": "c-num-001", "prompt": "Write a C function that multiplies a float matrix (row-major) by a float vector, with a cache-friendly loop order and comments explaining why.", "tags": ["math", "perf"]}
+{"id": "c-num-002", "prompt": "Write a C function that computes softmax over a float array in a numerically stable way (subtract max), in place.", "tags": ["math"]}
+{"id": "c-gguf-001", "prompt": "Write a C struct and parser for a binary file header: magic (4 bytes), version (uint32), count (uint64), with endianness checks and error reporting.", "tags": ["binary", "parsing"]}
+{"id": "c-parse-001", "prompt": "Write a minimal JSON tokenizer in C (no dependencies) that produces an array of tokens with type, start, and length.", "tags": ["parsing"]}
+{"id": "c-thr-001", "prompt": "Write a C thread pool skeleton with pthreads: fixed workers, a task queue with mutex+cond, submit and shutdown.", "tags": ["threads"]}
+{"id": "c-thr-002", "prompt": "Write a C function that parallelizes an independent loop over N items across T threads using pthreads, joining all before return.", "tags": ["threads"]}
+{"id": "c-err-001", "prompt": "Write a C error-handling pattern for a function that opens a file, allocates a buffer, reads, and must clean up all resources on every failure path. Show the goto-based cleanup idiom.", "tags": ["errors", "idioms"]}
+{"id": "c-ptr-001", "prompt": "Explain and implement in C: a function that swaps two int* contents, and a function that swaps two int** pointers, and why both are different.", "tags": ["pointers"]}
+{"id": "c-ub-001", "prompt": "Write C code demonstrating three common undefined behaviors (signed overflow, use-after-free, strict aliasing violation) and next to each, the corrected version, with comments.", "tags": ["debug", "ub"]}
+{"id": "c-alg-001", "prompt": "Write a C implementation of binary search over a sorted int array that returns the insertion point when the value is missing, with no overflow in the midpoint computation.", "tags": ["algorithms"]}
+{"id": "c-alg-002", "prompt": "Write a C implementation of a LRU cache: fixed capacity, O(1) get/put using a hash table plus a doubly linked list.", "tags": ["algorithms", "datastructures"]}
+{"id": "c-net-001", "prompt": "Write a minimal blocking TCP echo server in C (POSIX sockets) that handles one client at a time, with proper close on all paths.", "tags": ["network"]}
+{"id": "c-simd-001", "prompt": "Write a C dot product of two float arrays: a scalar version and an SSE/AVX intrinsics version guarded by #ifdef __AVX__, with identical results.", "tags": ["simd", "perf"]}
+{"id": "c-quant-001", "prompt": "Write a C function that quantizes a float array to 4-bit values packed in bytes (two nibbles per byte, offset 8), plus the dequantize function using a per-block float scale.", "tags": ["quantization", "binary"]}
+{"id": "c-tok-001", "prompt": "Write a C function that greedily matches the longest token from a vocabulary (array of strings) at the start of a text buffer, returning token id and length consumed.", "tags": ["tokenizer", "parsing"]}
+{"id": "c-kv-001", "prompt": "Write a C ring buffer for floats with fixed capacity: push overwrites oldest, and a view function that copies the last N entries in order. Used for a KV cache window.", "tags": ["datastructures", "inference"]}

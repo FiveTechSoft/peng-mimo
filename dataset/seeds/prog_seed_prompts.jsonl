@@ -1,0 +1,14 @@
+{"id": "py-001", "prompt": "Write a Python function that parses a GGUF binary file header: magic, version, tensor count, and metadata key-value pairs (uint32/uint64/strings), using struct. No external libraries.", "tags": ["python", "binary", "parsing"]}
+{"id": "py-002", "prompt": "Write a Python generator that streams a large JSONL file and yields records matching a filter, with memory bounded regardless of file size.", "tags": ["python", "io"]}
+{"id": "py-003", "prompt": "Write a Python function that computes cosine similarity between two numpy arrays, then a batch version comparing one vector against a matrix efficiently.", "tags": ["python", "numpy", "math"]}
+{"id": "py-004", "prompt": "Write a Python script that watches a directory for new .jsonl files and processes each exactly once, surviving restarts (state file).", "tags": ["python", "io", "robustness"]}
+{"id": "py-005", "prompt": "Write a Python dataclass-based implementation of a LRU cache with O(1) operations, no functools.lru_cache.", "tags": ["python", "datastructures"]}
+{"id": "py-006", "prompt": "Write a Python function that retries an HTTP request with exponential backoff and jitter, honoring Retry-After headers, using only urllib.", "tags": ["python", "network"]}
+{"id": "hb-001", "prompt": "Write a Harbour function that reads an INI-style config file into a hash, with default values and type coercion for numbers and booleans.", "tags": ["harbour", "xbase", "config"]}
+{"id": "hb-002", "prompt": "Write a Harbour function that sends an HTTP POST with a JSON body using winhttp or curl, parses the JSON response, and handles errors with BEGIN SEQUENCE.", "tags": ["harbour", "xbase", "http"]}
+{"id": "hb-003", "prompt": "Write a Harbour class for a simple logger with levels (debug/info/warn/error), file output with rotation by size, and timestamps.", "tags": ["harbour", "xbase", "oop"]}
+{"id": "hb-004", "prompt": "Write a Harbour function that converts an array of hashes to a JSON array string, escaping strings correctly (quotes, backslashes, control chars).", "tags": ["harbour", "xbase", "json"]}
+{"id": "js-001", "prompt": "Write a JavaScript function that debounces another function, with immediate-leading-edge and trailing-edge options, plain ES6.", "tags": ["javascript", "idioms"]}
+{"id": "js-002", "prompt": "Write a Node.js function that reads a large file line by line with readline and counts JSON parse errors without loading it into memory.", "tags": ["javascript", "node", "io"]}
+{"id": "rs-001", "prompt": "Write a Rust function that parses a little-endian uint64 and a varint from a byte slice with bounds checking, returning Result with a custom error enum.", "tags": ["rust", "binary"]}
+{"id": "sql-001", "prompt": "Write a SQL query that finds duplicate rows across three columns, keeps the newest by timestamp, and deletes the rest, portable between MySQL and SQLite.", "tags": ["sql", "data"]}

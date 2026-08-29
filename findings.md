@@ -1595,3 +1595,334 @@ Artifacts: `c/tests/fused_down_bench.cu` (+ target `fused-bench`), test
 bit-exact en `tests/test_backend_cuda.cu`, envs `COLI_CUDA_PROF`, `PROF_TRACE`,
 `PROF_EXPERTS`, `COLI_CUDA_NO_FUSED_DOWN`, `COLI_CUDA_PINNED`, fix
 `-U_GNU_SOURCE`.
+
+### 48. Issue #4 real: SVD/clustering de expertos DESCARTADO con datos; Markov TRAJ medido (2026-08-22)
+
+El modelo está ahora disponible en WSL (`/root/mimo25_i4`) — el bloqueo del §47
+("snapshot no está en esta caja") queda resuelto. Tools nuevos en PR #5:
+`c/tools/analyze_experts.py` (script propuesto en el issue) y
+`scripts/expert_svd.py` (SVD por proyección vía matriz de Gram 256×256, ~9 GB
+RAM, 256 expertos completos; clustering k-means numpy-only en espacio de
+coeficientes; error funcional SwiGLU con activaciones reales `resid_out/`;
+`--selftest`). `scripts/traj_analysis.py` mide la predictibilidad Markov real
+de `.coli_traj`.
+
+**48.1 Espectro efectivo de los deltas de expertos (capas 1/24/46, 256
+expertos, gate/up/down por separado):** k95 = 225-241 de 256 direcciones en las
+tres capas — el delta (tras quitar el centroide) es **casi de rango completo**.
+No existe el subespacio de dimensión 32-64 que hipotetizaba el issue #4.
+
+**48.2 Error funcional SwiGLU (activaciones reales, no solo ||ΔW||):**
+
+| rank | capa 1 | capa 24 | capa 46 |
+|---|---|---|---|
+| 8 | 0.96 | 1.00 | 1.00 |
+| 32 | 0.83 | 0.96 | 1.00 |
+| 64 | 0.82 | 0.95 | 0.98 |
+| 128 | 0.39 | 0.81 | 0.61 |
+
+**48.3 Contabilidad de bytes perdedora:** con coeficientes f32 + base
+amortizada, rank-32 ya cuesta 12.98 MB/experto (> 12.6 MB int4). La única
+config que ahorra (rank-8, 3.54 MB → 1.33 GB/token teórico) tiene 96-100% de
+error funcional. Clustering k=64 (8.4 MB/experto amort.): rel_frob 0.83-0.87
+sobre el delta — igual de plano. **La curva compresión/calidad no tiene
+rodilla: hipótesis "deltas de 2-3 MB" refutada.** Lo único real sigue siendo
+el centroide compartido de capas tempranas (§42.1), que zstd ya captura (§41).
+
+**48.4 Predictibilidad Markov real de `.coli_traj` (173k transiciones):**
+cobertura top-1 = 29%, top-2 ≈ 50%, top-4 ≈ 77-80% (cota superior por
+truncamiento TRAJ_SUC=8); sucesores efectivos ≈ 5.5; sticky self-transition
+solo 9.4%. Comparable al 71% de PILOT sin coste de cómputo — útil como
+complemento (ya lo usa TRAJ/traj_warm), no como ruptura. Refuta las
+simulaciones del issue #6 (transiciones intra-grupo 0.25 inventadas).
+
+Nota de tooling: `analyze_experts.py` con ≥32 expertos OOM en WSL 25 GB
+(matriz aplanada + SVD densa LAPACK tumban la VM); con ≤16 expertos la SVD es
+degenerada (rank ≥ n-1 ⇒ error 0 trivial). Para el análisis real usar
+`expert_svd.py`.
+
+### 49. CUDA MoE v2 ciclo 2 — REPLAY e2e baseline + benchmark matrix desbloqueado (2026-08-22)
+
+El snapshot está en WSL (`/root/mimo25_i4`, corrección del bloqueo de §47).
+Método: `REPLAY=1` (decode teacher-forced determinista) con `COLI_CUDA_PROF=1`
++ `PROF_TRACE=<csv>` por (forward, layer). Dos refs: `ref.json` (oráculo, 5+12
+tokens) y `ref_long.json` (prosa real tokenizada con `tools/tok_mimo_cli`,
+8+112 tokens). Mismo binario del 19-ago (post-§47). Caché fría en todos los
+runs (expert hit 32-41%), sin DRAFT/MTP.
+
+**Matrix corta (12 tokens):**
+
+| config | tok/s | disk | matmul | attn | other |
+|---|---|---|---|---|---|
+| COLI_CUDA=0 (CPU) | 0.28 | 12.5 | 21.3 | 2.7 | 5.0 |
+| REPIN=32 (fused+pinned) | 0.31 | 12.5 | 18.0 | 2.1 | 4.7 |
+| REPIN=32 NO_FUSED_DOWN | 0.18 | 20.1 | 28.8 | 3.6 | 12.9 |
+| REPIN=32 PINNED=0 | 0.30 | 10.7 | 20.5 | 2.7 | 4.8 |
+| SPEED=1 | 0.45 | 8.1 | 9.9 | 2.6 | 4.8 |
+
+**Trampa de la matrix 1 (sin REPIN):** fuera de SERVE/SPEED, `REPIN=0` → GPU
+expert tier VACÍO (gpu_kernel_ms=0 en los 624 rows del CSV); CUDA solo añade
+overhead (CPU 0.28 vs CUDA-sin-REPIN 0.20). Toda comparación de kernels CUDA
+exige REPIN/ENERGY explícito.
+
+**Confirmación larga (112 tokens):**
+
+| config | tok/s | disk | matmul | attn | other |
+|---|---|---|---|---|---|
+| REPIN=32 | 0.18 | 223.5 | 300.3 | 32.2 | 48.3 |
+| COLI_CUDA=0 | 0.20 | 200.1 | 285.6 | 32.4 | 36.5 |
+| SPEED=1 | **0.38** | 111.4 | 102.9 | 30.2 | 41.1 |
+
+**Veredictos:**
+
+1. **En régimen frío (34% hit), CUDA+REPIN=32 NO paga e2e** (0.18 vs 0.20
+   CPU): con solo 32 expertos residentes, la mayoría de expert-call cae al
+   camino CPU y el tier GPU añade syncs/H2D encima. La ganancia de
+   `fused_down_acc` visible en corto (0.31→0.18 al quitarlo) no sobrevive al
+   run largo frío. Pinned staging: ruido (ya esperado, §47).
+2. **El pole real del sistema frío:** matmul CPU de experts ≈ 49% del wall,
+   disco ≈ 37%, atención ≈ 5%, other ≈ 8%. Atacar syncs (ciclo C/D) toca el
+   8% como mucho; los polos son bytes+GEMV.
+3. **SPEED=1 (TOPP=0.55) es la palanca grande medida:** 0.38 vs 0.18-0.20
+   (+90-110%) por leer menos experts/token — confirma §40 (TOPK/TOPP) como
+   el knob dominante en régimen frío.
+
+Implicación para el ciclo 2 del roadmap: reordenar — E (grouped/batched GEMV,
+ataca el 49%) y residencia real de experts en VRAM (subir REPIN/ENERGY hasta
+llenar los 12 GB, no 32) antes que C/D (async H2D, hidden-state residency).
+Caveat: runs únicos por config; B2 sugiere varianza de scheduling de disco de
+±30% en las columnas disk/other.
+
+### 50. MM_THREADS + O_DIRECT en REPLAY frío — 0.21 → 0.94 tok/s (2026-08-23)
+
+Protocolo: `REPLAY=1` con `ref_long.json` nuevo (8+113 tokens, prosa tokenizada
+con `tok_mimo_cli`; el ref de §49 no estaba en el repo), drop_caches antes de
+cada run, binario reconstruido hoy. Baseline replicado 2×.
+
+| stack | tok/s | disk | matmul | attn | hit |
+|---|---|---|---|---|---|
+| base COLI_CUDA=0 ×2 | 0.19–0.21 | ~162 s | 263–317 s | 33–39 s | 35% |
+| + `MM_THREADS=8` | 0.34 | 173 s | **67.5 s** | 34 s | 37% |
+| + `DIRECT=1` | 0.49–0.50 | **94–97 s** | 48–49 s | 32 s | 35–37% |
+| + CUDA (`COLI_CUDA=1 CUDA_DENSE=1 CUDA_ATTN=1`) | **0.56** | 78 s | 33 s | 46 s* | 53% |
+| + `SPEED=1` (TOPP=0.55, −calidad §40) | **0.94** | 40 s | 14 s | 32 s | 59% |
+
+*attn sube al bucket por sync-wait contado ahí; el wall es lo que importa.
+
+Hallazgos:
+
+1. **HT hermanos mataban el GEMV AVX2**: 16 hilos HT → 8 núcleos físicos =
+   expert-matmul −74% (27→7 s/12 tok; 317→68 s/105 tok). Nuevo knob
+   **`MM_THREADS=n`**: limita hilos SOLO dentro de los kernels GEMV
+   (`mm_enter/mm_exit`); el I/O paralelo conserva el pool completo (con
+   OMP_NUM_THREADS=8 global el disco empeoraba 11→18 s). Estable entre 4–12
+   hilos; default del wrapper `start_peng.sh` = núcleos físicos vía lscpu.
+2. **`DIRECT=1` (O_DIRECT) gana en frío hoy**: disco −45% (163→94 s). El note
+   antiguo de default-OFF quedaron obsoleto tras los cambios de OVERLAP/prefetch;
+   sigue opt-in en el motor, `start_peng.sh` ya lo exporta.
+3. **CUDA_ATTN=1 suma otro +12-15%** e2e sobre CPU-only incluso en frío
+   (contrasta con §49, donde REPIN=32 solo no pagaba): la diferencia es MM_THREADS
+   quitando el cuello CPU que ocultaba la cola GPU.
+4. **TRAJ=0 en single-shot PROMPT: REFUTADO** (roadmap ítem C). Medido con stack
+   nuevo: TRAJ=1 0.69 tok/s hit 71% vs TRAJ=0 0.65 hit 57% — el warm paga aunque
+   no haya turno siguiente. Revertido; no reintentar sin cambiar el régimen I/O.
+5. Grouped/batched expert GEMV (ítem E): **desestimado por datos** — tras
+   MM_THREADS el matmul queda bound por ancho de banda RAM (~70 GB/s efectivos
+   leyendo pesos), agrupar expertos no reduce bytes ni barreras relevantes
+   (barreras ≈17 ms/token < 1%).
+
+Gates pendientes: matriz ppl §40 para MM_THREADS (es bit-exact: solo cambia el
+equipo de hilos, cada elemento lo calcula un hilo igual que antes — sin riesgo)
+y para el paquete DIRECT+CUDA_ATTN en el contenedor reparado.
+
+#### 50.1 — Protocolo del récord (PROMPT cálido NGEN=24): A/B pareado mismo día
+
+Con el stack nuevo en el protocolo exacto de §46 (TAO + CUDA_ATTN + spin,
+PILOT=0, prompt ~19 tok, sin drop_caches):
+
+| stack (mismo día, 23-ago) | reps | mediana | mejor |
+|---|---|---|---|
+| viejo (sin MM_THREADS) ×3 | 0.32–0.46 | **0.37** | 0.46 |
+| nuevo (+MM_THREADS=8) ×5 | 0.36–0.58 | **0.49** | 0.58 |
+
+- **MM_THREADS: +32% mediana pareada también en generación real caliente.**
+- El récord absoluto **0.89 (20-jul) NO se supera hoy**: el host amanece ~2×
+  más lento (deriva documentada en README; el stack VIEJO que entonces hacia
+  0.72–0.77 hoy hace 0.37). Con la ratio pareada +32%, un día de host normal
+  proyectaría ~0.9–1.0. Reintentar el gate en día bueno.
+- **`DIRECT=1` es malo en régimen CALIENTE**: O_DIRECT bypassa la page cache,
+  que es justamente lo que acelera las repeticiones (medido: 0.66 vs 0.38 con
+  mismo estado). DIRECT ayuda en frío/bench (§50), estorba en chat tibio.
+  `start_peng.sh` debería exportar DIRECT solo para bench/primera pasada.
+
+#### 50.2 — Tres intentos más sobre el stack nuevo (23-ago, REPLAY frío largo)
+
+| intento | resultado | veredicto |
+|---|---|---|
+| `CUDA_EXPERT_GB=11` (llenar VRAM tier) | 0.36 vs 0.56; disk 147 s vs 78 s | **rechazado**: los uploads dinámicos compiten y roban RAM al LRU |
+| `DRAFT=2` (MTP, PROMPT cálido ×3) | aceptación 8–22% (no 64%); 0.27–0.45 vs 0.49 | **rechazado hoy**: verify cuesta más de lo que acepta sin cache totalmente tibia |
+| `LTOPK=6/5` trim estratificado (nuevo knob) | 0.32–0.34 vs 0.34 top-8 completo | **marginal**: queda como knob opt-in; su valor real exigiría matriz ppl vs TOPP |
+
+Lección transversal: con matmul arreglado (MM_THREADS) el régimen frío queda
+**disco-bound puro** (~55-70% del wall según config) — los trims de expertos
+apenas se notan porque la sesión de disco por token ya está saturada; las únicas
+vías restantes son más hit-rate (RAM/UNION179/nativo Linux) o menos bytes/token
+(contenedor int2/zstd-repack, ya medidos en §41/A2).
+
+### 52. FreeToken KV-cache portado a mimo — prefill repetido 21.6× (2026-08-23)
+
+Puerto del PoC de `feature/freetoken-poc` (issue #7, glm.c) al motor MiMo.
+`FREETOKEN=1` (default OFF): cache KV host-side con tier disco (.kvc bajo SNAP);
+prompt con prefijo exacto repetido → HIT restaura K/V y forwarda solo el último
+token. `FREETOKEN_BENCH=1`: self-check MISS→HIT con comparación de logits.
+
+Adaptación GLM→MiMo: KV GQA por capa (K[max_t,kvh·hd], V[max_t,kvh·vd]), full
+lineal / SWA anillo vía kv_phys; convención de rango [upto−rows_i, upto); fila
+KV del MTP excluida; espejo CUDA_ATTN resincronizado tras restore
+(attn_dev_sync_rows). Makefile compila kv_cache.c.
+
+Medido (311B real, CPU, cold):
+
+| prompt | MISS prefill | HIT (restore+1 fw) | speedup | argmax |
+|---|---|---|---|---|
+| 32 tok | 28.9 s | 17.9 s | 1.6× | idem texto |
+| 289 tok | **92.8 s** | **4.3 s** | **21.6×** | OK |
+
+Notas honestas:
+
+1. **No bit-exact a nivel de logit**: max|diff| ~1–3/152576 por el orden de
+   acumulación batch-union del MoE (S=np vs S=1) y el skip GATE_FIRST — mismo
+   fenómeno que el PoC GLM (~0.45). El argmax puede flipar en near-ties
+   (visto 1 vez en 2 tests). Opt-in, precedentemente igual que CUDA_ATTN.
+2. La victoria escala con la longitud del prompt: con prompts cortos el
+   batch-union del propio prefill ya amortiza; con prompts de agente (500-4000
+   tokens re-enviados cada turno) es donde paga — exactamente el caso de uso
+   "agentic state reuse" del paper (2608.16157).
+3. Capas SWA: sólo se restauran las últimas min(n,W=128) posiciones (el resto
+   del anillo es historia que la ventana nunca consulta); kv_start ajustado.
+
+Pendiente: capa semántica ANN (near-duplicate prompts) — tools/kv_index_build.py
+ya existe en la rama PoC; wire al runtime como paso siguiente.
+
+#### 52.1 — SERVE: guardado por turno + HIT cross-restart/cross-process
+
+Extensión del puerto: `run_serve` ahora guarda el KV al cierre de CADA turno
+(no sólo conversación fresca). Casos que quedan cubiertos:
+
+| escenario | resultado medido (311B real, cold) |
+|---|---|
+| mismo proceso: `\x02PROMPT` + RESET + reenvío idéntico | **HIT serve** — turno 0.07→0.30 tok/s (~4×) |
+| **proceso nuevo** (restart), primer turno idéntico | **HIT serve desde disco (.kvc)** — cero prefill |
+
+Descartes con datos antes de codificar:
+
+- **Capa semántica ANN inválida para KV**: restaurar K/V de un prompt *parecido*
+  pero no igual es incorrecto (las posiciones corresponden a tokens concretos);
+  y un prefijo parcial choca con el anillo SWA (sólo retiene las últimas W=128
+  posiciones → no puede servir prefijos más cortos que el guardado). Lo lossless
+  es prefijo EXACTO completo — que ya cubre el caso agente (re-envío de contexto).
+- Trampa de test detectada: printf de dash no expande `\xNN` — usar octal
+  (`\002`) en los scripts de protocolo SERVE, o todos los turnos van a modo
+  interactivo y el test mide otra cosa.
+
+#### 52.2 — FREETOKEN_LINEAR: prefix-tree real (prefijos parciales) (2026-08-23)
+
+El descarte de 52.1 (anillo SWA bloquea prefijos parciales) se revirtió con un
+modo opcional: `FREETOKEN_LINEAR=1` (default ON con FREETOKEN) asigna las capas
+SWA a `max_t` en vez del anillo (~+1.6 GB RAM a CTX 4096) y cada entrada de
+cache guarda ademas sus token ids (`kv_cache_set_ids`). El lookup
+`kv_cache_best_prefix` encuentra la entrada con longest common prefix; el serve
+restaura `[0,L)` y prefilla solo `np-L`.
+
+Medido (311B real, cold): turno 1 = prompt base (17 tok); RESET; turno 2 =
+base+sufijo (27 tok) → **[FREETOKEN] PREFIX serve: 18/27 token via cache** —
+solo 9 token prefillados, turno completo ~3x (0.05→0.19 tok/s). Con esto,
+branching/retries/edits/restarts de agentes reutilizan cualquier estado anterior
+de la conversacion, no solo re-envios identicos.
+
+Nota: los ids guardados incluyen la respuesta generada (save al cierre del
+turno), por lo que el LCP puede superar la longitud del prompt original.
+
+### 53. Gate de calidad del stack nuevo: MM_THREADS bit-exacto; CUDA_DENSE mejora la ppl (2026-08-23)
+
+Cierra las "gates pendientes" de §50. Protocolo: corpus SCORE regenerado
+(prosa README + codigo olmoe.c, 2x768 tokens, ctxlen=1; el score_req.txt
+original se perdio con el WSL), teacher-forcing e2e, mismo dia, 3 configs.
+
+| cfg | ppl prosa | ppl code | acuerdo top-1 vs BASE |
+|---|---|---|---|
+| BASE (CPU int8 denso) | 9.59 | 2.22 | — |
+| + MM_THREADS=8 | **9.59** | **2.22** | **100% / 100%** |
+| paquete CUDA (DENSE+ATTN) | **8.92** | **2.11** | 81.1% / 90.7% |
+
+Hallazgos:
+
+1. **MM_THREADS es bit-exacto e2e**: logprobs identicos al ultimo digito y
+   acuerdo 100%. El knob es gratis en calidad; gate cerrada.
+2. **El paquete CUDA NO degrada: mejora la ppl** (-7.0% prosa, -5.0% code).
+   CUDA_DENSE computa las GEMM densas a mayor precision que el camino CPU
+   (int8) → los logits difieren y por eso el argmax flipa (81-91%), pero la
+   verosimilitud sube en ambos dominios: el ruido numerico int8 costaba ppl.
+   El precedente "opt-in no bit-exacto" de CUDA_ATTN queda revalidado con
+   signo favorable.
+3. Trampa de reproducibilidad: el corpus depende de README.md y olmoe.c
+   actuales → si cambian, la ppl no es comparable con tablas anteriores.
+   score_req.txt vive fuera del repo (/root); regenerarlo con
+   scripts/make_score_corpus.py (requiere transformers) o tokenizers puro.
+
+Veredicto: el stack completo MM_THREADS+DIRECT(frio)+CUDA es quality-neutral
+o mejor. Sin gates abiertas para el stack de produccion actual.
+
+### 53.1 - Perfil tibio del camino GPU + experimento pool device (2026-08-23)
+
+Datos (COLI_CUDA_PROF=1, 16 tok, tibio, stack completo):
+
+- **A/B pareado CPU vs GPU mismo minuto: GPU gana +63%** (0.335 vs 0.205
+  tok/s mediana). El mecanismo no es solo compute: el tier VRAM duplica el
+  hit-rate (36% -> 60%) y corta expert-disk a la mitad (30-36 s -> 14.5 s).
+  CUDA confirmado para chat tibio tambien en dia lento.
+- H2D: ~11.5 GB por 16 tokens en ~4700 transfers de ~2 MB a **1.07-1.49 GB/s
+  efectivos** - la copia PCIe es el piso del camino GPU (~9-11 s/run). D2H:
+  micro-copias por capa (0.14 GB, ~1 s) - item D sigue siendo pequeno.
+- **Deriva del host cuantificada**: NVMe random 19 MB hoy = 1.06-1.18 GB/s vs
+  2.75 GB/s documentados (x2.4 lento). Runs absolutos de hoy inutilizables;
+  solo comparaciones pareadas mismo-minuto cuentan. Wall mismo config oscilo
+  47-82 s.
+
+Experimento pool de memoria device (backend_cuda): cudaMalloc/cudaFree por
+eviction/re-subida del LRU reemplazados por free-list por puntero
+(COLI_CUDA_NO_POOL=1 para comparar). Bit-exacto verificado (texto greedy
+identico). **Ganancia NO medible sobre el ruido de hoy** (medianas 0.265 vs
+0.24) - se conserva como infraestructura neutral con knob de escape, mismo
+precedente que LTOPK; la copia PCIe pura domina el H2D, no los mallocs.
+
+Leccion: en dia de disco x2.4 lento, rechazar cualquier optimizacion cuya
+ganancia esperada sea <30% del wall - el ruido la sepulta.
+
+### 53.2 - UNION reconstruida: calidad OK pero YA no paga velocidad en el stack actual (2026-08-23)
+
+Los perfiles de dominio de �42 se perdieron con el WSL; reconstruidos con
+tokenizers puro (prose/code_c/code_py del script original + 4o perfil nuevo
+agent_chat = docs tecnicos). Union top-96 x4: **169.1 expertos/capa
+(97.8 GB equiv.)**, 7947 lineas de mascara.
+
+| gate ppl (corpus �53) | BASE | MASKED | delta |
+|---|---|---|---|
+| prosa | 9.82 | 10.54 | **+7.3%** (�42: +7.8% - consistente) |
+| codigo | 2.21 | 2.28 | **+3.3%** (�42: -1.8%; perfiles reconstruidos != originales) |
+| acuerdo top-1 | " | 78.2% / 90.5% | flips por poda |
+
+**Velocidad (A/B pareado tibio, stack completo CUDA): SIN ganancia** -
+BASE 0.30/0.32 vs MASK 0.31/0.31 tok/s; hit-rate 54-57% en ambos brazos.
+El +16% de �37/�42 se media sobre el stack viejo (sin MM_THREADS ni tier
+VRAM); hoy el gpu_pin (534 expertos residentes) + traj_warm ya cubren el
+conjunto caliente que la mascara redirige.
+
+Veredicto: EKEEP_MASK queda como knob para escenarios con presupuesto de
+RAM/disco (contenedor podado fisco, caja futura 128 GB full-RAM) o cargas
+donde el pin no alcance. NO se activa por defecto en start_peng.sh: costo de
+calidad seguro (+7.3% prosa) sin retorno medido en esta hardware.
+
+Leccion transversal reforzada: cada palanca del stack viejo hay que re-medirla
+despues de cambiar el regimen I/O; tres ya no pagan (DIRECT en tibio �50.1,
+grouped GEMV �50, UNION mask �53.2).

@@ -25,7 +25,8 @@ if [[ "${TAO:-0}" == "1" ]]; then
   export PILOT="${PILOT:-1}"
   export PILOT_DEPTH="${PILOT_DEPTH:-1}"
   export PREFETCH="${PREFETCH:-1}"
-  export DIRECT="${DIRECT:-1}"
+  # DIRECT: ver nota abajo — malo en chat tibio (§50.1); bench lo activa solo
+  export DIRECT="${DIRECT:-0}"
 fi
 
 CODE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -90,8 +91,18 @@ fi
 # High: room for DRAFT if user opts in; larger pin frac
 export SNAP
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc 2>/dev/null || echo 4)}"
+# MM_THREADS: cap hilos SOLO en kernels GEMV. HT siblings penalizan el GEMV AVX2
+# (~4x, medido 2026-08-23 en 8c/16t: matmul 27->7 s/12tok); I/O paralelo conserva
+# todos los hilos. Default: núcleos físicos.
+if [ -z "${MM_THREADS:-}" ]; then
+    PHYS=$(lscpu 2>/dev/null | awk -F: '/^Core\(s\) per socket/{c=$2} /^Socket\(s\)/{s=$2} END{print c*s}' | tr -d ' ')
+    export MM_THREADS="${MM_THREADS:-${PHYS:-}}"
+fi
 export OMP_WAIT_POLICY="${OMP_WAIT_POLICY:-passive}"
-export DIRECT="${DIRECT:-1}"
+# DIRECT (O_DIRECT): -45% disco en FRÍO (§50) pero ESTORBA en chat tibio
+# (bypassa la page cache que acelera las repeticiones; medido 0.66 vs 0.38,
+# §50.1). Default OFF para chat; cmd_prompt lo activa salvo override explícito.
+export DIRECT="${DIRECT:-0}"
 export OVERLAP="${OVERLAP:-1}"
 export I4S="${I4S:-1}"
 export PREFETCH="${PREFETCH:-1}"
@@ -105,6 +116,11 @@ export ENERGY="${ENERGY:--1}"
 export REPIN="${REPIN:-32}"
 export THINK="${THINK:-0}"
 export DRAFT="${DRAFT:-0}"
+# FreeToken KV-cache (§52): prefill repetido instantáneo para agentes.
+# Cap RAM según tier; el tier disco (.kvc bajo SNAP) es gratis en I/O de sobra.
+FT_GB=6; (( MEM_I < 28 )) && FT_GB=4; (( MEM_I >= 48 )) && FT_GB=10
+export FREETOKEN="${FREETOKEN:-1}"
+export FREETOKEN_CACHE_GB="${FREETOKEN_CACHE_GB:-$FT_GB}"
 
 if (( MEM_I < 28 )); then
   # ~16–24 GB class (this box): PILOT pays; keep DRAFT off
@@ -160,6 +176,7 @@ print_banner() {
   echo " PILOT=$PILOT PREFETCH=$PREFETCH TRAJ=$TRAJ FLOW=$FLOW ENERGY=$ENERGY SPEED=$SPEED"
   echo " TOPP=$TOPP TEMP=$TEMP DRAFT=$DRAFT REPIN=$REPIN"
   echo " OMP_NUM_THREADS=$OMP_NUM_THREADS DIRECT=$DIRECT"
+  echo " FREETOKEN=$FREETOKEN FREETOKEN_CACHE_GB=$FREETOKEN_CACHE_GB"
   if [[ -s "$USAGE" ]]; then
     echo " usage history: $USAGE ($(wc -l <"$USAGE") lines)"
   else
@@ -173,12 +190,14 @@ cmd_env() {
   cat <<EOF
 export SNAP=$(printf %q "$SNAP")
 export OMP_NUM_THREADS=$OMP_NUM_THREADS OMP_WAIT_POLICY=$OMP_WAIT_POLICY
+export MM_THREADS=$MM_THREADS
 export DIRECT=$DIRECT OVERLAP=$OVERLAP I4S=$I4S
 export COLI_CUDA=$COLI_CUDA CUDA_DENSE=$CUDA_DENSE
 export PILOT=$PILOT PILOT_DEPTH=$PILOT_DEPTH PREFETCH=$PREFETCH
 export TRAJ=$TRAJ TRAJ_K=$TRAJ_K TRAJ_DEPTH=$TRAJ_DEPTH FLOW=$FLOW FLOW_R=$FLOW_R ENERGY=$ENERGY
 export SPEED=$SPEED TOPP=$TOPP TEMP=$TEMP DRAFT=$DRAFT
 export REPIN=$REPIN MEMWATCH=$MEMWATCH PIN_FRAC=$PIN_FRAC THINK=$THINK
+export FREETOKEN=$FREETOKEN FREETOKEN_CACHE_GB=$FREETOKEN_CACHE_GB
 EOF
 }
 
@@ -207,6 +226,8 @@ cmd_prompt() {
     fi
   fi
   export PROMPT="$prompt" NGEN="$ngen"
+  # Bench/single-shot: O_DIRECT sí paga en frío (§50) — actívalo salvo override
+  export DIRECT="${DIRECT:-1}"
   exec ./mimo 64 4 8
 }
 
