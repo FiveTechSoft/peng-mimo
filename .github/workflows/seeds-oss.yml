@@ -1,0 +1,45 @@
+name: seeds-oss
+
+# Weekly OSS-Instruct seed growth: derive new task seeds from real source
+# code in this repo (c/*.c, c/*.h) via the Zen free API, dedup against
+# existing seeds, commit new seeds to dataset/seeds/.
+# The nightly dataset.yml picks them up automatically (globs seeds/*.jsonl).
+
+on:
+  schedule:
+    - cron: "41 4 * * 1"          # weekly, Mondays, off-peak minute
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "max fragments to process (0 = all)"
+        default: "60"
+
+permissions:
+  contents: write
+
+jobs:
+  oss-instruct:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: generate seeds from repo C sources
+        run: |
+          python scripts/oss_instruct.py \
+            --src "c/*.c" \
+            --out dataset/seeds/oss_c.jsonl \
+            --limit "${{ inputs.limit || 60 }}"
+      - name: commit new seeds
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dataset/seeds/oss_c.jsonl
+          if git diff --cached --quiet; then
+            echo "no new seeds"
+          else
+            N=$(wc -l < dataset/seeds/oss_c.jsonl)
+            git commit -m "seeds: oss-instruct growth (${N} total)"
+            git push
+          fi
