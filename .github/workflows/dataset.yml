@@ -1,0 +1,83 @@
+name: dataset
+
+# C dataset pipeline: generate with OpenCode Zen free API (direct calls,
+# no gateway), verify per language (gcc / py_compile / node --check),
+# commit verified records to dataset/verified/.
+#
+# Nightly schedule + manual dispatch. Courteous pacing is enforced inside
+# zen_generate.py (delay + backoff); keep batches modest.
+
+on:
+  schedule:
+    - cron: "23 3 * * *"          # nightly, off-peak minute
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "max seeds per batch (0 = all)"
+        default: "0"
+
+permissions:
+  contents: write                  # to commit verified dataset back
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        batch: [0, 1, 2, 3]          # 4 parallel batches, strided seeds
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: generate candidates (batch ${{ matrix.batch }})
+        run: |
+          python scripts/zen_generate.py \
+            --seeds "dataset/seeds/*.jsonl" \
+            --out "candidates-${{ matrix.batch }}.jsonl" \
+            --batch "${{ matrix.batch }}" --of 4 \
+            --limit "${{ inputs.limit || 0 }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidates-${{ matrix.batch }}
+          path: candidates-${{ matrix.batch }}.jsonl
+          retention-days: 14
+
+  verify:
+    needs: generate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: candidates-*
+          merge-multiple: true
+      - name: verify candidates
+        run: |
+          gcc --version | head -1
+          python scripts/verify_dataset.py \
+            --in "candidates-*.jsonl" \
+            --out verified.jsonl --keep-errors
+      - name: commit verified records
+        run: |
+          mkdir -p dataset/verified
+          DATE=$(date -u +%Y-%m-%d)
+          cp verified.jsonl "dataset/verified/prog-${DATE}.jsonl"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "dataset/verified/prog-${DATE}.jsonl"
+          if git diff --cached --quiet; then
+            echo "nothing new to commit"
+          else
+            git commit -m "dataset: verified prog batch ${DATE}"
+            git push
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-dataset
+          path: verified.jsonl*
+          retention-days: 30
