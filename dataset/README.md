@@ -11,7 +11,9 @@ dataset/seeds/*.jsonl          seed prompts (hand-curated + grown)
         │
         ▼  .github/workflows/dataset.yml  (nightly or manual)
 scripts/zen_generate.py        calls OpenCode Zen free API directly
-        │                      (mimo-v2.5-free, no key, no gateway)
+        │                      (fallback chain: mimo-v2.5-free ->
+        │                       nemotron-3.5-lightning-free -> hy3-free,
+        │                       no key, no gateway)
         ▼  candidates-*.jsonl
 scripts/verify_dataset.py      per-language check:
         │                      C→gcc, Python→py_compile, JS→node --check
@@ -27,6 +29,11 @@ dataset/verified/prog-<date>.jsonl   committed back by the workflow
 - **Courteous use**: pacing + exponential backoff in `zen_generate.py`.
   This is a free API — we stay well inside fair use; bulk volume belongs
   to paid APIs, peng handles the local premium slice.
+- **Resilience**: `--model` accepts a comma-separated fallback chain.
+  Default: `mimo-v2.5-free,nemotron-3.5-lightning-free,hy3-free` (all
+  verified free on Zen without API key). A model that disappears or starts
+  requiring auth (4xx) is skipped immediately; rate limits (429) back off
+  first, then rotate. Each record stores which model produced it.
 - **Verification is the quality bar**: compiler acceptance, not teacher
   reputation, decides what enters the dataset. Languages without a checker
   (harbour, rust, sql) are kept but flagged `skipped` for manual review.
