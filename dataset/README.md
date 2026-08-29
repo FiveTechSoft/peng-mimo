@@ -7,8 +7,9 @@ a small local student (QLoRA on a consumer GPU).
 ## Pipeline
 
 ```
-dataset/seeds/*.jsonl          seed prompts (hand-curated + grown)
-        │
+dataset/seeds/*.jsonl          seed prompts (hand-curated + grown weekly
+        │                      by .github/workflows/seeds-oss.yml, which
+        │                      derives tasks from real code via oss_instruct.py)
         ▼  .github/workflows/dataset.yml  (nightly or manual)
 scripts/zen_generate.py        calls OpenCode Zen free API directly
         │                      (fallback chain: mimo-v2.5-free ->
@@ -51,7 +52,7 @@ python scripts/verify_dataset.py --in "/tmp/cand.jsonl" --out /tmp/verified.json
 
 ## Next steps
 
-- grow `dataset/seeds/` (OSS-instruct style: derive prompts from real code
-  in this repo and dreaming)
+- grow `dataset/seeds/` (oss_instruct.py runs weekly; point --src at more
+  repos, e.g. dreaming's *.c, for wider coverage)
 - extend verification beyond syntax: compile+link+run for examples with tests
 - merge verified batches into a training-ready SFT format (chat template)
